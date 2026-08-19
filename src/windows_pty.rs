@@ -8,6 +8,7 @@ use std::{
     io,
     os::windows::ffi::OsStrExt,
     ptr::null_mut,
+    sync::{Arc, Mutex},
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -49,7 +50,7 @@ unsafe extern "system" {
 
 pub struct PtySession {
     input: OwnedHandle,
-    pseudoconsole: OwnedPseudoConsole,
+    pseudoconsole: Arc<SharedPseudoConsole>,
     process: OwnedHandle,
     shutdown: Option<flume::Sender<()>>,
 }
@@ -61,10 +62,14 @@ struct Pipe {
 
 struct OwnedHandle(HANDLE);
 
-struct OwnedPseudoConsole(HPCON);
+struct SharedPseudoConsole(Mutex<Option<HPCON>>);
 
 // Each wrapper uniquely owns its handle and may move to the reader thread.
 unsafe impl Send for OwnedHandle {}
+// Access and close are serialized, and HPCON is an opaque Windows handle
+// whose operations may be called from the process-waiter thread.
+unsafe impl Send for SharedPseudoConsole {}
+unsafe impl Sync for SharedPseudoConsole {}
 
 impl PtySession {
     pub fn spawn(
@@ -87,15 +92,24 @@ impl PtySession {
             return Err(last_error("create ConPTY"));
         }
 
-        let pseudoconsole = OwnedPseudoConsole(pseudoconsole);
-        let process = spawn_shell(pseudoconsole.raw())?;
+        let pseudoconsole = Arc::new(SharedPseudoConsole::new(pseudoconsole));
+        let process = spawn_shell(pseudoconsole.raw()?)?;
 
         // ConPTY duplicated the host-facing ends. Keeping only the application
         // input/output ends avoids retaining an accidental EOF reference.
         drop(input.read);
         drop(output.write);
 
-        let process_wait_handle = process.try_clone()?;
+        let process_wait_handle = match process.try_clone() {
+            Ok(handle) => handle,
+            Err(error) => {
+                unsafe { TerminateProcess(process.raw(), 0) };
+                drop(output.read);
+                drop(input.write);
+                pseudoconsole.close();
+                return Err(error);
+            }
+        };
         let (output_tx, output_rx) = flume::bounded(256);
         let (shutdown_tx, shutdown_rx) = flume::bounded(1);
         let mut output_handle = output.read;
@@ -107,7 +121,14 @@ impl PtySession {
                 let mut buffer = [0_u8; 16 * 1024];
                 loop {
                     match read_handle(output_handle.raw(), &mut buffer) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            let _ = send_or_shutdown(
+                                &reader_events,
+                                &reader_shutdown,
+                                TerminalEvent::Exited,
+                            );
+                            break;
+                        }
                         Ok(read)
                             if !send_or_shutdown(
                                 &output_tx,
@@ -119,7 +140,14 @@ impl PtySession {
                         }
                         Ok(_) if reader_events.try_send(TerminalEvent::Changed).is_err() => {}
                         Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                            let _ = send_or_shutdown(
+                                &reader_events,
+                                &reader_shutdown,
+                                TerminalEvent::Exited,
+                            );
+                            break;
+                        }
                         Err(error) => {
                             let _ = send_or_shutdown(
                                 &reader_events,
@@ -137,6 +165,7 @@ impl PtySession {
             return Err(format!("spawn ConPTY reader thread: {error}"));
         }
 
+        let waiter_pseudoconsole = Arc::clone(&pseudoconsole);
         if let Err(error) = std::thread::Builder::new()
             .name("terminal-conpty-process-waiter".into())
             .spawn(move || {
@@ -144,7 +173,9 @@ impl PtySession {
                     unsafe { WaitForSingleObject(process_wait_handle.raw(), INFINITE) };
                 match wait_result {
                     WAIT_OBJECT_0 => {
-                        let _ = send_or_shutdown(&events, &shutdown_rx, TerminalEvent::Exited);
+                        // Closing ConPTY lets the reader drain its final bytes
+                        // and publish Exited only after it observes EOF.
+                        waiter_pseudoconsole.close();
                     }
                     WAIT_FAILED => {
                         let _ = send_or_shutdown(
@@ -188,7 +219,7 @@ impl PtySession {
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
-        let result = unsafe { ResizePseudoConsole(self.pseudoconsole.raw(), size.coord()) };
+        let result = unsafe { ResizePseudoConsole(self.pseudoconsole.raw()?, size.coord()) };
         if result == S_OK {
             Ok(())
         } else {
@@ -207,6 +238,7 @@ impl Drop for PtySession {
         unsafe {
             TerminateProcess(self.process.raw(), 0);
         }
+        self.pseudoconsole.close();
     }
 }
 
@@ -284,15 +316,34 @@ impl Drop for OwnedHandle {
     }
 }
 
-impl OwnedPseudoConsole {
-    fn raw(&self) -> HPCON {
+impl SharedPseudoConsole {
+    fn new(handle: HPCON) -> Self {
+        Self(Mutex::new(Some(handle)))
+    }
+
+    fn raw(&self) -> Result<HPCON, String> {
         self.0
+            .lock()
+            .map_err(|_| "lock ConPTY handle".to_string())?
+            .as_ref()
+            .copied()
+            .ok_or_else(|| "ConPTY process has exited".into())
+    }
+
+    fn close(&self) {
+        let handle = self.0.lock().ok().and_then(|mut handle| handle.take());
+        if let Some(handle) = handle {
+            unsafe { ClosePseudoConsole(handle) };
+        }
     }
 }
 
-impl Drop for OwnedPseudoConsole {
+impl Drop for SharedPseudoConsole {
     fn drop(&mut self) {
-        unsafe { ClosePseudoConsole(self.0) };
+        let handle = self.0.get_mut().ok().and_then(Option::take);
+        if let Some(handle) = handle {
+            unsafe { ClosePseudoConsole(handle) };
+        }
     }
 }
 
