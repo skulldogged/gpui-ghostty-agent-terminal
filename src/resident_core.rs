@@ -136,12 +136,7 @@ impl CoreClient {
             ) {
                 Ok(stream) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    stream
-                        .set_recv_timeout(Some(remaining.max(Duration::from_millis(1))))
-                        .map_err(|error| format!("set Resident Core receive timeout: {error}"))?;
-                    stream
-                        .set_send_timeout(Some(remaining.max(Duration::from_millis(1))))
-                        .map_err(|error| format!("set Resident Core send timeout: {error}"))?;
+                    configure_stream_timeouts(&stream, remaining.max(Duration::from_millis(1)))?;
                     let mut client = Self {
                         connection: BufReader::new(stream),
                     };
@@ -225,6 +220,28 @@ impl CoreClient {
             .map_err(|error| format!("receive Resident Core response: {error}"))?
             .ok_or_else(|| "Resident Core disconnected before responding".into())
     }
+}
+
+#[cfg(unix)]
+fn configure_stream_timeouts(stream: &LocalSocketStream, timeout: Duration) -> Result<(), String> {
+    stream
+        .set_recv_timeout(Some(timeout))
+        .map_err(|error| format!("set Resident Core receive timeout: {error}"))?;
+    stream
+        .set_send_timeout(Some(timeout))
+        .map_err(|error| format!("set Resident Core send timeout: {error}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_stream_timeouts(
+    _stream: &LocalSocketStream,
+    _timeout: Duration,
+) -> Result<(), String> {
+    // Windows named pipes do not support the socket-style I/O timeouts exposed
+    // by interprocess. The deadline still bounds retries while waiting for the
+    // named pipe to appear; once connected, protocol requests are blocking.
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
