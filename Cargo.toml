@@ -1,0 +1,17 @@
+[package]
+name = "gpui-ghostty-foundation-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["gui"]
+gui = ["dep:flume", "dep:gpui", "dep:portable-pty"]
+
+[dependencies]
+flume = { version = "0.12", optional = true }
+gpui = { version = "0.2", optional = true }
+portable-pty = { version = "0.9", optional = true }
+
+[build-dependencies]
+cc = "1"
