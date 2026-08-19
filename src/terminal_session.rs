@@ -221,7 +221,9 @@ mod tests {
     fn normal_shell_exit_is_reported_as_exited() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
-        session.input(b"exit\r").expect("write shell exit command");
+        session
+            .input(b"echo TERMINAL_SESSION_EXIT_OUTPUT; exit\r")
+            .expect("write shell exit command");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -229,7 +231,14 @@ mod tests {
                 Ok(TerminalEvent::Changed) => {
                     session.snapshot().expect("drain terminal output");
                 }
-                Ok(TerminalEvent::Exited) => return,
+                Ok(TerminalEvent::Exited) => {
+                    let snapshot = session.snapshot().expect("drain final terminal output");
+                    assert!(
+                        snapshot_text(&snapshot).contains("TERMINAL_SESSION_EXIT_OUTPUT"),
+                        "shell exit was reported before final output was available"
+                    );
+                    return;
+                }
                 Ok(TerminalEvent::Failed(error)) => {
                     panic!("normal shell exit was reported as failure: {error}")
                 }
