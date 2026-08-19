@@ -687,10 +687,18 @@ impl ResidentCore {
                                 WorkerRequest::Input(bytes) => {
                                     session.input(&bytes).map(|()| WorkerResponse::Ack)
                                 }
-                                WorkerRequest::Resize(size) => session.resize(size).map(|()| {
-                                    revision = revision.saturating_add(1);
-                                    WorkerResponse::Ack
-                                }),
+                                WorkerRequest::Resize(size) => match size.validate() {
+                                    Err(error) => Err(error),
+                                    Ok(size) if size == session.size() => Ok(WorkerResponse::Ack),
+                                    Ok(size) => {
+                                        let result = session.resize(size);
+                                        // Resize drains bytes accepted at the old geometry before
+                                        // touching the transport. Advance even when the transport
+                                        // resize fails so those consumed bytes remain observable.
+                                        revision = revision.saturating_add(1);
+                                        result.map(|()| WorkerResponse::Ack)
+                                    }
+                                },
                                 WorkerRequest::Snapshot { since } if since == Some(revision) => {
                                     Ok(WorkerResponse::Snapshot(None))
                                 }

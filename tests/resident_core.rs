@@ -1,4 +1,4 @@
-use agent_terminal::{CoreClient, CoreEndpoint, TerminalLifecycle};
+use agent_terminal::{CoreClient, CoreEndpoint, TerminalLifecycle, TerminalSize};
 use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -54,6 +54,21 @@ fn snapshots_report_revisions_and_terminal_exit() {
     let initial = client.snapshot().expect("take initial snapshot");
     let initial = wait_for_idle_snapshot(&mut client, initial);
     assert_eq!(initial.lifecycle, TerminalLifecycle::Running);
+
+    client
+        .resize(TerminalSize::default())
+        .expect("repeat the current terminal size");
+    assert!(
+        client
+            .snapshot_since(initial.revision)
+            .expect("check unchanged resize revision")
+            .is_none(),
+        "an unchanged resize must not advance the terminal revision"
+    );
+    assert!(
+        client.resize(TerminalSize::new(400, 200, 10, 20)).is_err(),
+        "oversized grids must be rejected before reaching libghostty-vt"
+    );
 
     client.input(b"exit\r").expect("exit terminal shell");
     let exited = wait_for_snapshot_after(&mut client, initial.revision);

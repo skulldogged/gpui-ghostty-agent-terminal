@@ -1,6 +1,8 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+pub(crate) const SNAPSHOT_CELL_CAPACITY: usize = 65_536;
+
 #[repr(C)]
 #[derive(Default)]
 struct RawCell {
@@ -108,7 +110,9 @@ impl Terminal {
 
     pub fn snapshot(&mut self) -> Result<Snapshot, String> {
         let mut raw_snapshot = RawSnapshot::default();
-        let mut raw_cells: Vec<RawCell> = (0..65_536).map(|_| RawCell::default()).collect();
+        let mut raw_cells: Vec<RawCell> = (0..SNAPSHOT_CELL_CAPACITY)
+            .map(|_| RawCell::default())
+            .collect();
         let result = unsafe {
             spike_terminal_snapshot(
                 self.raw.as_ptr(),

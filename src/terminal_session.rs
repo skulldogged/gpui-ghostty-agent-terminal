@@ -23,12 +23,18 @@ impl TerminalSize {
         }
     }
 
-    fn validate(self) -> Result<Self, String> {
+    pub(crate) fn validate(self) -> Result<Self, String> {
         if self.cols == 0 || self.rows == 0 {
             return Err("terminal grid must contain at least one row and column".into());
         }
         if self.cell_width_px == 0 || self.cell_height_px == 0 {
             return Err("terminal cells must have non-zero pixel dimensions".into());
+        }
+        if usize::from(self.cols) * usize::from(self.rows) > ghostty::SNAPSHOT_CELL_CAPACITY {
+            return Err(format!(
+                "terminal grid exceeds the {}-cell snapshot capacity",
+                ghostty::SNAPSHOT_CELL_CAPACITY
+            ));
         }
         Ok(self)
     }
@@ -126,6 +132,10 @@ impl TerminalSession {
 
     pub fn input(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.process.write(bytes)
+    }
+
+    pub(crate) fn size(&self) -> TerminalSize {
+        self.size
     }
 
     #[allow(dead_code)] // The renderer stack adds the first live geometry caller.
@@ -282,6 +292,12 @@ mod tests {
         assert!(TerminalSize::new(80, 0, 10, 20).validate().is_err());
         assert!(TerminalSize::new(80, 24, 0, 20).validate().is_err());
         assert!(TerminalSize::new(80, 24, 10, 0).validate().is_err());
+    }
+
+    #[test]
+    fn terminal_size_rejects_grids_larger_than_snapshot_capacity() {
+        assert!(TerminalSize::new(256, 256, 10, 20).validate().is_ok());
+        assert!(TerminalSize::new(400, 200, 10, 20).validate().is_err());
     }
 
     #[test]
