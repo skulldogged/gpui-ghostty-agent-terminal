@@ -13,6 +13,13 @@ impl CellMetrics {
     }
 }
 
+pub fn measured_cell_height(font_size_px: f32, ascent_px: f32, descent_px: f32) -> u16 {
+    font_size_px
+        .max(ascent_px.max(0.0) + descent_px.max(0.0))
+        .ceil()
+        .clamp(1.0, f32::from(u16::MAX)) as u16
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridDimensions {
     pub cols: u16,
@@ -47,7 +54,7 @@ pub fn cell_offset(cols: u16, x: u16, y: u16) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CellMetrics, GridDimensions, cell_offset};
+    use super::{CellMetrics, GridDimensions, cell_offset, measured_cell_height};
 
     #[test]
     fn grid_dimensions_fit_whole_cells_inside_the_viewport() {
@@ -68,5 +75,11 @@ mod tests {
         assert_eq!(cell_offset(80, 0, 0), Some(0));
         assert_eq!(cell_offset(80, 79, 23), Some(1_919));
         assert_eq!(cell_offset(80, 80, 0), None);
+    }
+
+    #[test]
+    fn cell_height_contains_the_selected_fonts_vertical_metrics() {
+        assert_eq!(measured_cell_height(14.0, 16.25, 5.25), 22);
+        assert_eq!(measured_cell_height(14.0, 9.0, 3.0), 14);
     }
 }

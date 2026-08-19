@@ -1,6 +1,6 @@
 use crate::{
     CoreClient, TerminalLifecycle, TerminalSize, TerminalSnapshot,
-    terminal_grid::{CellMetrics, GridDimensions, cell_offset},
+    terminal_grid::{CellMetrics, GridDimensions, cell_offset, measured_cell_height},
 };
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Pixels, Render,
@@ -35,6 +35,7 @@ pub fn run() {
                         refresh_task: Task::ready(()),
                         terminal_error,
                         terminal_font,
+                        requested_size: None,
                     });
                     view.update(cx, |view, cx| {
                         view.start_refresh_task(cx);
@@ -59,6 +60,7 @@ struct TerminalView {
     refresh_task: Task<()>,
     terminal_error: Option<String>,
     terminal_font: TerminalFont,
+    requested_size: Option<TerminalSize>,
 }
 
 #[derive(Clone)]
@@ -112,7 +114,9 @@ impl TerminalFont {
             .map(|advance| f32::from(advance.width))
             .unwrap_or(font_size * 0.6);
         let cell_width = advance.ceil().max(1.0) as u16;
-        let cell_height = (font_size * 1.4).ceil().max(1.0) as u16;
+        let ascent = f32::from(cx.text_system().ascent(font_id, size));
+        let descent = f32::from(cx.text_system().descent(font_id, size));
+        let cell_height = measured_cell_height(font_size, ascent, descent);
 
         Ok(Self {
             family,
@@ -261,8 +265,11 @@ impl Render for TerminalView {
             self.terminal_font.cells.width_px,
             self.terminal_font.cells.height_px,
         );
-        if let Err(error) = self.core.resize(desired_size) {
-            self.terminal_error = Some(error);
+        if self.requested_size != Some(desired_size) {
+            match self.core.resize(desired_size) {
+                Ok(()) => self.requested_size = Some(desired_size),
+                Err(error) => self.terminal_error = Some(error),
+            }
         }
 
         let snapshot = &self.snapshot;

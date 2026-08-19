@@ -22,6 +22,9 @@ use std::{
 
 mod wire;
 
+// Version 2 replaces JSON with binary dirty-row updates and carries each
+// cell's display width. An old core must fail the handshake rather than let a
+// new UI interpret an incompatible terminal grid.
 const PROTOCOL_VERSION: u16 = 2;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_TICK: Duration = Duration::from_millis(10);
