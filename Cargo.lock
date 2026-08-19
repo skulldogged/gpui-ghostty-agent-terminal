@@ -21,6 +21,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-terminal"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "flume 0.12.0",
+ "gpui",
+ "portable-pty",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2165,16 +2175,6 @@ dependencies = [
  "zed-font-kit",
  "zed-scap",
  "zed-xim",
-]
-
-[[package]]
-name = "gpui-ghostty-foundation-spike"
-version = "0.0.0"
-dependencies = [
- "cc",
- "flume 0.12.0",
- "gpui",
- "portable-pty",
 ]
 
 [[package]]

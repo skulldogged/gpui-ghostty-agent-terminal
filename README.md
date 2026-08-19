@@ -1,14 +1,23 @@
-# GPUI + libghostty-vt foundation spike
+# Agent Terminal
 
-> THROWAWAY PROTOTYPE for the architecture decision tracked by
-> [Prove the GPUI and libghostty-vt foundation on all three platforms](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/8).
+Cross-platform graphical terminal-multiplexer foundation built with GPUI and
+the supported `libghostty-vt` C interface.
 
-This branch answers one question: can a pinned Rust application consume the
-supported `libghostty-vt` C API, render its state through GPUI, and attach the
-same terminal model to Unix PTY and Windows ConPTY transports?
+The cross-platform proof is tracked by
+[#8](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/8).
+The production-oriented Terminal Session seam is tracked by
+[#11](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/11).
 
-It is deliberately not the production application. The useful output is the
-compatibility verdict and the seams exposed by the experiment.
+## Terminal Session interface
+
+GPUI interacts with one deep `TerminalSession` module. That module owns the
+live shell, the platform process transport, Ghostty terminal state, input,
+resize, snapshots, events, and cleanup. Neither PTY bytes nor raw Ghostty C
+types escape to the view.
+
+The current transport implementation uses Unix PTYs on macOS/Linux and ConPTY
+on Windows through `portable-pty`. That dependency remains an internal adapter
+so Windows can move to a dedicated implementation without changing callers.
 
 ## Pinned inputs
 
@@ -25,7 +34,7 @@ nix develop
 # ABI/parser/render-state smoke test without GPUI
 cargo run --no-default-features
 
-# Native GPUI + PTY prototype
+# Native GPUI terminal
 cargo run
 ```
 
@@ -47,10 +56,11 @@ lifecycle protocol; platform adapters own Unix PTY or ConPTY details. T3 Code
 uses the same broad split (`libghostty-vt` semantics plus an independently
 owned PTY layer), while mightty is the closest native Rust/GPUI precedent.
 
-## Deliberately not production-ready
+## Remaining vertical-slice work
 
-- The GPUI renderer creates one element per cell and is only a correctness
-  probe. A production renderer should batch runs and cache shaped text.
+- The GPUI renderer remains the correctness probe from #8. Fixed-cell font
+  metrics, live grid geometry, and more efficient cell lookup are tracked by
+  [#12](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/12).
 - Keyboard input covers text, control keys, and arrows. Full IME support needs
   a GPUI `InputHandler`, not only key-down events.
 - Resize is proven at the Ghostty ABI and PTY interface levels, but the spike

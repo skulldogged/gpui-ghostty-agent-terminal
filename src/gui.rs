@@ -1,4 +1,4 @@
-use crate::{ghostty, pty::PtySession};
+use crate::terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Task,
     Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
@@ -6,12 +6,7 @@ use gpui::{
 #[cfg(windows)]
 use std::time::Duration;
 
-const COLS: u16 = 80;
-const ROWS: u16 = 24;
-#[cfg(not(windows))]
-const STARTUP_BANNER: &[u8] = b"\x1b[1;32mGPUI + libghostty-vt\x1b[0m\r\nUnix PTY live\r\n";
-#[cfg(windows)]
-const STARTUP_BANNER: &[u8] = b"\x1b[1;32mGPUI + libghostty-vt\x1b[0m\r\nWindows ConPTY probe starting...\r\n";
+const INITIAL_SIZE: TerminalSize = TerminalSize::new(80, 24, 10, 20);
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -23,20 +18,18 @@ pub fn run() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let (session, output) = PtySession::spawn().expect("spawn cross-platform PTY");
-                    let mut terminal =
-                        ghostty::Terminal::new(COLS, ROWS).expect("create Ghostty VT");
-                    terminal.feed(STARTUP_BANNER);
+                    let (session, events) =
+                        TerminalSession::spawn(INITIAL_SIZE).expect("spawn Terminal Session");
                     let focus = cx.focus_handle();
                     focus.focus(window);
                     let view = cx.new(|_| TerminalView {
-                        terminal,
                         session,
                         focus,
-                        output_task: Task::ready(()),
+                        event_task: Task::ready(()),
+                        terminal_error: None,
                     });
                     view.update(cx, |view, cx| {
-                        view.start_output_task(output, cx);
+                        view.start_event_task(events, cx);
                         #[cfg(windows)]
                         view.start_windows_probe(cx);
                     });
@@ -52,10 +45,10 @@ pub fn run() {
 }
 
 struct TerminalView {
-    terminal: ghostty::Terminal,
-    session: PtySession,
+    session: TerminalSession,
     focus: FocusHandle,
-    output_task: Task<()>,
+    event_task: Task<()>,
+    terminal_error: Option<String>,
 }
 
 impl TerminalView {
@@ -66,7 +59,9 @@ impl TerminalView {
             timer.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |view, _cx| {
-                    view.session.write(b"echo WINDOWS_CONPTY_LIVE\r");
+                    if let Err(error) = view.session.input(b"echo WINDOWS_CONPTY_LIVE\r") {
+                        view.terminal_error = Some(error);
+                    }
                 })
                 .ok();
             }
@@ -74,27 +69,23 @@ impl TerminalView {
         .detach();
     }
 
-    fn start_output_task(
-        &mut self,
-        output: flume::Receiver<Vec<u8>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.output_task = cx.spawn(async move |this, cx| {
-            while let Ok(first) = output.recv_async().await {
-                let mut chunks = vec![first];
-                while let Ok(next) = output.try_recv() {
-                    chunks.push(next);
-                }
-
+    fn start_event_task(&mut self, events: TerminalEvents, cx: &mut Context<Self>) {
+        self.event_task = cx.spawn(async move |this, cx| {
+            while let Some(event) = events.recv().await {
                 let Some(this) = this.upgrade() else {
                     break;
                 };
                 if this
-                    .update(cx, |view, cx| {
-                        for chunk in chunks {
-                            view.terminal.feed(&chunk);
+                    .update(cx, |view, cx| match event {
+                        TerminalEvent::Changed => cx.notify(),
+                        TerminalEvent::Exited => {
+                            view.terminal_error = Some("Terminal Session exited".into());
+                            cx.notify();
                         }
-                        cx.notify();
+                        TerminalEvent::Failed(error) => {
+                            view.terminal_error = Some(error);
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -126,7 +117,10 @@ impl TerminalView {
         };
 
         if let Some(bytes) = bytes {
-            self.session.write(&bytes);
+            if let Err(error) = self.session.input(&bytes) {
+                self.terminal_error = Some(error);
+                cx.notify();
+            }
             cx.stop_propagation();
         }
     }
@@ -134,13 +128,16 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let snapshot = self.terminal.snapshot().expect("snapshot Ghostty terminal");
+        let snapshot = self.session.snapshot().expect("snapshot Terminal Session");
         let cursor = snapshot.cursor;
         let default_bg = color(snapshot.default_bg);
 
         let rows = (0..snapshot.rows).map(|y| {
             let cells = (0..snapshot.cols).map(|x| {
-                let cell = snapshot.cells.iter().find(|cell| cell.x == x && cell.y == y);
+                let cell = snapshot
+                    .cells
+                    .iter()
+                    .find(|cell| cell.x == x && cell.y == y);
                 let text = cell
                     .map(|cell| cell.text.as_str())
                     .filter(|text| !text.is_empty())
@@ -175,21 +172,25 @@ impl Render for TerminalView {
         div()
             .id("terminal")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|view, event, _window, cx| {
-                view.on_key_down(event, cx)
-            }))
+            .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
             .size_full()
             .overflow_hidden()
             .bg(default_bg)
             .p(px(12.))
             .children(rows)
+            .when_some(self.terminal_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(8.))
+                        .left(px(12.))
+                        .text_color(rgb(0xff6b6b))
+                        .child(error),
+                )
+            })
     }
 }
 
 fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
-    rgb(
-        (u32::from(rgb_bytes[0]) << 16)
-            | (u32::from(rgb_bytes[1]) << 8)
-            | u32::from(rgb_bytes[2]),
-    )
+    rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
 }
