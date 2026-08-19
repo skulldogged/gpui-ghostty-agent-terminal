@@ -48,6 +48,7 @@ pub struct PtySession {
     input: OwnedHandle,
     pseudoconsole: OwnedPseudoConsole,
     process: OwnedHandle,
+    shutdown: Option<flume::Sender<()>>,
 }
 
 struct Pipe {
@@ -93,29 +94,35 @@ impl PtySession {
 
         let process_wait_handle = process.try_clone()?;
         let (output_tx, output_rx) = flume::bounded(256);
+        let (shutdown_tx, shutdown_rx) = flume::bounded(1);
         let mut output_handle = output.read;
         let reader_events = events.clone();
+        let reader_shutdown = shutdown_rx.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("terminal-conpty-reader".into())
             .spawn(move || {
                 let mut buffer = [0_u8; 16 * 1024];
                 loop {
                     match read_handle(output_handle.raw(), &mut buffer) {
-                        Ok(0) => {
-                            let _ = reader_events.send(TerminalEvent::Exited);
+                        Ok(0) => break,
+                        Ok(read)
+                            if !send_or_shutdown(
+                                &output_tx,
+                                &reader_shutdown,
+                                buffer[..read].to_vec(),
+                            ) =>
+                        {
                             break;
                         }
-                        Ok(read) if output_tx.send(buffer[..read].to_vec()).is_err() => break,
                         Ok(_) if reader_events.try_send(TerminalEvent::Changed).is_err() => {}
                         Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                            let _ = reader_events.send(TerminalEvent::Exited);
-                            break;
-                        }
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
                         Err(error) => {
-                            let _ = reader_events.send(TerminalEvent::Failed(format!(
-                                "ConPTY read stopped: {error}"
-                            )));
+                            let _ = send_or_shutdown(
+                                &reader_events,
+                                &reader_shutdown,
+                                TerminalEvent::Failed(format!("ConPTY read stopped: {error}")),
+                            );
                             break;
                         }
                     }
@@ -134,18 +141,26 @@ impl PtySession {
                     unsafe { WaitForSingleObject(process_wait_handle.raw(), INFINITE) };
                 match wait_result {
                     WAIT_OBJECT_0 => {
-                        let _ = events.send(TerminalEvent::Exited);
+                        let _ = send_or_shutdown(&events, &shutdown_rx, TerminalEvent::Exited);
                     }
                     WAIT_FAILED => {
-                        let _ = events.send(TerminalEvent::Failed(format!(
-                            "wait for ConPTY process: {}",
-                            io::Error::last_os_error()
-                        )));
+                        let _ = send_or_shutdown(
+                            &events,
+                            &shutdown_rx,
+                            TerminalEvent::Failed(format!(
+                                "wait for ConPTY process: {}",
+                                io::Error::last_os_error()
+                            )),
+                        );
                     }
                     unexpected => {
-                        let _ = events.send(TerminalEvent::Failed(format!(
-                            "wait for ConPTY process returned unexpected status {unexpected}"
-                        )));
+                        let _ = send_or_shutdown(
+                            &events,
+                            &shutdown_rx,
+                            TerminalEvent::Failed(format!(
+                                "wait for ConPTY process returned unexpected status {unexpected}"
+                            )),
+                        );
                     }
                 }
             })
@@ -159,6 +174,7 @@ impl PtySession {
                 input: input.write,
                 pseudoconsole,
                 process,
+                shutdown: Some(shutdown_tx),
             },
             output_rx,
         ))
@@ -180,11 +196,26 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        // Disconnect every shutdown receiver before closing ConPTY. Any
+        // worker blocked while publishing output or a lifecycle event then
+        // cancels its send and releases its pipe handle.
+        drop(self.shutdown.take());
         let _ = self.input.close();
         unsafe {
             TerminateProcess(self.process.raw(), 0);
         }
     }
+}
+
+fn send_or_shutdown<T>(
+    sender: &flume::Sender<T>,
+    shutdown: &flume::Receiver<()>,
+    value: T,
+) -> bool {
+    flume::Selector::new()
+        .send(sender, value, |result| result.is_ok())
+        .recv(shutdown, |_| false)
+        .wait()
 }
 
 impl PtySize {
@@ -515,4 +546,17 @@ fn write_handle(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
 
 fn last_error(operation: &str) -> String {
     format!("{operation}: {}", io::Error::last_os_error())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shutdown_cancels_a_blocked_worker_send() {
+        let (events, _event_receiver) = flume::bounded(1);
+        events.send(()).expect("fill worker queue");
+        let (shutdown, shutdown_receiver) = flume::bounded::<()>(1);
+        drop(shutdown);
+
+        assert!(!super::send_or_shutdown(&events, &shutdown_receiver, ()));
+    }
 }
