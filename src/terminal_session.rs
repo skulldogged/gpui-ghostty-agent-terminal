@@ -2,9 +2,10 @@ use crate::{
     ghostty,
     pty::{PtyOutput, PtySession, PtySize},
 };
+use serde::{Deserialize, Serialize};
 
 /// The complete geometry shared by the VT engine and the platform PTY.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSize {
     pub cols: u16,
     pub rows: u16,
@@ -56,8 +57,8 @@ pub struct TerminalEvents {
 }
 
 impl TerminalEvents {
-    pub async fn recv(&self) -> Option<TerminalEvent> {
-        self.receiver.recv_async().await.ok()
+    pub(crate) fn try_recv(&self) -> Option<TerminalEvent> {
+        self.receiver.try_recv().ok()
     }
 }
 
@@ -68,7 +69,7 @@ pub enum TerminalEvent {
     Failed(String),
 }
 
-trait TerminalTransport {
+trait TerminalTransport: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
@@ -177,6 +178,10 @@ impl TerminalSession {
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
         self.drain_output()?;
         self.terminal.snapshot()
+    }
+
+    pub(crate) fn drain_pending_output(&mut self) -> Result<(), String> {
+        self.drain_output()
     }
 
     fn drain_output(&mut self) -> Result<(), String> {

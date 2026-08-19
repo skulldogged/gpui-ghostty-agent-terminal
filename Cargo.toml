@@ -9,14 +9,20 @@ default = ["gui"]
 gui = [
     "dep:flume",
     "dep:gpui",
+    "dep:interprocess",
     "dep:libc",
     "dep:portable-pty",
+    "dep:serde",
+    "dep:serde_json",
     "dep:windows-sys",
 ]
 
 [dependencies]
 flume = { version = "0.12", optional = true }
 gpui = { version = "0.2", optional = true }
+interprocess = { version = "2.4.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
@@ -33,3 +39,7 @@ windows-sys = { version = "0.61", optional = true, features = [
 
 [build-dependencies]
 cc = "1"
+
+[[test]]
+name = "resident_core"
+required-features = ["gui"]

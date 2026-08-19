@@ -1,15 +1,14 @@
-use crate::terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize};
+use crate::{CoreClient, TerminalSnapshot};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Task,
     Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
-#[cfg(windows)]
 use std::time::Duration;
-
-const INITIAL_SIZE: TerminalSize = TerminalSize::new(80, 24, 10, 20);
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
+        let mut core = CoreClient::connect_or_spawn().expect("attach to Resident Core");
+        let snapshot = core.snapshot().expect("snapshot Terminal Session");
         let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
         let window = cx
             .open_window(
@@ -17,19 +16,18 @@ pub fn run() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |window, cx| {
-                    let (session, events) =
-                        TerminalSession::spawn(INITIAL_SIZE).expect("spawn Terminal Session");
+                move |window, cx| {
                     let focus = cx.focus_handle();
                     focus.focus(window);
                     let view = cx.new(|_| TerminalView {
-                        session,
+                        core,
+                        snapshot,
                         focus,
                         event_task: Task::ready(()),
                         terminal_error: None,
                     });
                     view.update(cx, |view, cx| {
-                        view.start_event_task(events, cx);
+                        view.start_refresh_task(cx);
                         #[cfg(windows)]
                         view.start_windows_probe(cx);
                     });
@@ -45,7 +43,8 @@ pub fn run() {
 }
 
 struct TerminalView {
-    session: TerminalSession,
+    core: CoreClient,
+    snapshot: TerminalSnapshot,
     focus: FocusHandle,
     event_task: Task<()>,
     terminal_error: Option<String>,
@@ -59,7 +58,7 @@ impl TerminalView {
             timer.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |view, _cx| {
-                    if let Err(error) = view.session.input(b"echo WINDOWS_CONPTY_LIVE\r") {
+                    if let Err(error) = view.core.input(b"echo WINDOWS_CONPTY_LIVE\r") {
                         view.terminal_error = Some(error);
                     }
                 })
@@ -69,23 +68,24 @@ impl TerminalView {
         .detach();
     }
 
-    fn start_event_task(&mut self, events: TerminalEvents, cx: &mut Context<Self>) {
+    fn start_refresh_task(&mut self, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
         self.event_task = cx.spawn(async move |this, cx| {
-            while let Some(event) = events.recv().await {
+            loop {
+                executor.timer(Duration::from_millis(16)).await;
                 let Some(this) = this.upgrade() else {
                     break;
                 };
                 if this
-                    .update(cx, |view, cx| match event {
-                        TerminalEvent::Changed => cx.notify(),
-                        TerminalEvent::Exited => {
-                            view.terminal_error = Some("Terminal Session exited".into());
-                            cx.notify();
+                    .update(cx, |view, cx| {
+                        match view.core.snapshot() {
+                            Ok(snapshot) => {
+                                view.snapshot = snapshot;
+                                view.terminal_error = None;
+                            }
+                            Err(error) => view.terminal_error = Some(error),
                         }
-                        TerminalEvent::Failed(error) => {
-                            view.terminal_error = Some(error);
-                            cx.notify();
-                        }
+                        cx.notify();
                     })
                     .is_err()
                 {
@@ -117,7 +117,7 @@ impl TerminalView {
         };
 
         if let Some(bytes) = bytes {
-            if let Err(error) = self.session.input(&bytes) {
+            if let Err(error) = self.core.input(&bytes) {
                 self.terminal_error = Some(error);
                 cx.notify();
             }
@@ -128,7 +128,7 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let snapshot = self.session.snapshot().expect("snapshot Terminal Session");
+        let snapshot = &self.snapshot;
         let cursor = snapshot.cursor;
         let default_bg = color(snapshot.default_bg);
 
