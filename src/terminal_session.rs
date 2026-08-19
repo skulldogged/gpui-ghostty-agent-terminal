@@ -109,15 +109,27 @@ impl TerminalSession {
             return Ok(());
         }
 
-        // Resize the terminal model first. If the process resize fails, the
-        // caller receives the error and can retry the complete operation.
+        let previous_size = self.size;
         self.terminal.resize(
             size.cols,
             size.rows,
             u32::from(size.cell_width_px),
             u32::from(size.cell_height_px),
         )?;
-        self.process.resize(size.pty_size())?;
+        if let Err(process_error) = self.process.resize(size.pty_size()) {
+            let rollback = self.terminal.resize(
+                previous_size.cols,
+                previous_size.rows,
+                u32::from(previous_size.cell_width_px),
+                u32::from(previous_size.cell_height_px),
+            );
+            return match rollback {
+                Ok(()) => Err(process_error),
+                Err(rollback_error) => Err(format!(
+                    "{process_error}; also failed to restore terminal geometry: {rollback_error}"
+                )),
+            };
+        }
         self.size = size;
         Ok(())
     }
