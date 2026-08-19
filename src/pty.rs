@@ -6,6 +6,17 @@ pub struct PtySize {
     pub pixel_height: u16,
 }
 
+pub(crate) enum PtyOutput {
+    Bytes(Vec<u8>),
+    Paused,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReaderControl {
+    Pause,
+    Resume,
+}
+
 pub(crate) fn send_or_shutdown<T>(
     sender: &flume::Sender<T>,
     shutdown: &flume::Receiver<()>,
@@ -17,12 +28,35 @@ pub(crate) fn send_or_shutdown<T>(
         .wait()
 }
 
+pub(crate) fn reader_checkpoint(
+    control: &flume::Receiver<ReaderControl>,
+    output: &flume::Sender<PtyOutput>,
+    shutdown: &flume::Receiver<()>,
+) -> bool {
+    match control.try_recv() {
+        Ok(ReaderControl::Pause) => {
+            if !send_or_shutdown(output, shutdown, PtyOutput::Paused) {
+                return false;
+            }
+            flume::Selector::new()
+                .recv(control, |message| {
+                    matches!(message, Ok(ReaderControl::Resume))
+                })
+                .recv(shutdown, |_| false)
+                .wait()
+        }
+        Ok(ReaderControl::Resume) => false,
+        Err(flume::TryRecvError::Empty) => true,
+        Err(flume::TryRecvError::Disconnected) => false,
+    }
+}
+
 #[cfg(windows)]
 pub use crate::windows_pty::PtySession;
 
 #[cfg(unix)]
 mod unix {
-    use super::{PtySize, send_or_shutdown};
+    use super::{PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown};
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
         Child, CommandBuilder, MasterPty, PtySize as PortablePtySize, native_pty_system,
@@ -33,6 +67,7 @@ mod unix {
         _master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         child: Box<dyn Child + Send>,
+        control: flume::Sender<ReaderControl>,
         shutdown: Option<flume::Sender<()>>,
     }
 
@@ -40,7 +75,7 @@ mod unix {
         pub fn spawn(
             size: PtySize,
             events: flume::Sender<TerminalEvent>,
-        ) -> Result<(Self, flume::Receiver<Vec<u8>>), String> {
+        ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
             let pair = native_pty_system()
                 .openpty(size.into())
                 .map_err(|error| format!("open PTY: {error}"))?;
@@ -59,11 +94,16 @@ mod unix {
                 .master
                 .try_clone_reader()
                 .map_err(|error| format!("clone PTY reader: {error}"))?;
+            let reader_fd = pair
+                .master
+                .as_raw_fd()
+                .ok_or_else(|| "Unix PTY does not expose a pollable file descriptor".to_string())?;
             let writer = pair
                 .master
                 .take_writer()
                 .map_err(|error| format!("take PTY writer: {error}"))?;
             let (output_tx, output_rx) = flume::bounded(256);
+            let (control_tx, control_rx) = flume::bounded(1);
             let (shutdown_tx, shutdown_rx) = flume::bounded(1);
 
             std::thread::Builder::new()
@@ -71,6 +111,21 @@ mod unix {
                 .spawn(move || {
                     let mut buffer = [0_u8; 16 * 1024];
                     loop {
+                        if !reader_checkpoint(&control_rx, &output_tx, &shutdown_rx) {
+                            break;
+                        }
+                        match wait_until_readable(reader_fd) {
+                            Ok(false) => continue,
+                            Ok(true) => {}
+                            Err(error) => {
+                                let _ = send_or_shutdown(
+                                    &events,
+                                    &shutdown_rx,
+                                    TerminalEvent::Failed(format!("wait for PTY output: {error}")),
+                                );
+                                break;
+                            }
+                        }
                         match reader.read(&mut buffer) {
                             Ok(0) => {
                                 let _ =
@@ -81,7 +136,7 @@ mod unix {
                                 if !send_or_shutdown(
                                     &output_tx,
                                     &shutdown_rx,
-                                    buffer[..read].to_vec(),
+                                    PtyOutput::Bytes(buffer[..read].to_vec()),
                                 ) =>
                             {
                                 break;
@@ -111,6 +166,7 @@ mod unix {
                     _master: pair.master,
                     writer,
                     child,
+                    control: control_tx,
                     shutdown: Some(shutdown_tx),
                 },
                 output_rx,
@@ -128,6 +184,18 @@ mod unix {
             self._master
                 .resize(size.into())
                 .map_err(|error| format!("resize PTY: {error}"))
+        }
+
+        pub fn pause_reader(&mut self) -> Result<(), String> {
+            self.control
+                .send(ReaderControl::Pause)
+                .map_err(|_| "pause PTY reader: reader stopped".to_string())
+        }
+
+        pub fn resume_reader(&mut self) -> Result<(), String> {
+            self.control
+                .send(ReaderControl::Resume)
+                .map_err(|_| "resume PTY reader: reader stopped".to_string())
         }
     }
 
@@ -163,6 +231,24 @@ mod unix {
         {
             let _ = error;
             false
+        }
+    }
+
+    fn wait_until_readable(fd: libc::c_int) -> std::io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let result = unsafe { libc::poll(&mut descriptor, 1, 10) };
+            if result >= 0 {
+                return Ok(result > 0);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
     }
 

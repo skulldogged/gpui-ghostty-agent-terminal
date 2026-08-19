@@ -1,6 +1,6 @@
 use crate::{
     ghostty,
-    pty::{PtySession, PtySize},
+    pty::{PtyOutput, PtySession, PtySize},
 };
 
 /// The complete geometry shared by the VT engine and the platform PTY.
@@ -68,13 +68,38 @@ pub enum TerminalEvent {
     Failed(String),
 }
 
+trait TerminalTransport {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn pause_reader(&mut self) -> Result<(), String>;
+    fn resize(&mut self, size: PtySize) -> Result<(), String>;
+    fn resume_reader(&mut self) -> Result<(), String>;
+}
+
+impl TerminalTransport for PtySession {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        PtySession::write(self, bytes)
+    }
+
+    fn pause_reader(&mut self) -> Result<(), String> {
+        PtySession::pause_reader(self)
+    }
+
+    fn resize(&mut self, size: PtySize) -> Result<(), String> {
+        PtySession::resize(self, size)
+    }
+
+    fn resume_reader(&mut self) -> Result<(), String> {
+        PtySession::resume_reader(self)
+    }
+}
+
 /// Owns one live shell, its platform process transport, and its Ghostty VT
 /// state. The UI uses this interface without knowing whether the process is
 /// attached through a Unix PTY or Windows ConPTY.
 pub struct TerminalSession {
     terminal: ghostty::Terminal,
-    process: PtySession,
-    output: Option<flume::Receiver<Vec<u8>>>,
+    process: Box<dyn TerminalTransport>,
+    output: Option<flume::Receiver<PtyOutput>>,
     #[allow(dead_code)] // Read by resize, which the next stacked PR drives from GPUI geometry.
     size: TerminalSize,
 }
@@ -88,7 +113,7 @@ impl TerminalSession {
         Ok((
             Self {
                 terminal,
-                process,
+                process: Box::new(process),
                 output: Some(output),
                 size,
             },
@@ -109,11 +134,21 @@ impl TerminalSession {
             return Ok(());
         }
 
-        // Bytes already queued by the transport were produced under the old
-        // process geometry. Feed them before changing either side so Ghostty
-        // interprets their wrapping and cursor movement at that geometry.
-        self.drain_output();
+        self.process.pause_reader()?;
+        if let Err(error) = self.drain_until_reader_paused() {
+            let resume_error = self.process.resume_reader().err();
+            return Err(combine_errors(error, resume_error));
+        }
 
+        let resize_result = self.resize_while_reader_paused(size);
+        let resume_error = self.process.resume_reader().err();
+        match resize_result {
+            Ok(()) => resume_error.map_or(Ok(()), Err),
+            Err(error) => Err(combine_errors(error, resume_error)),
+        }
+    }
+
+    fn resize_while_reader_paused(&mut self, size: TerminalSize) -> Result<(), String> {
         let previous_size = self.size;
         self.terminal.resize(
             size.cols,
@@ -140,19 +175,47 @@ impl TerminalSession {
     }
 
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
-        self.drain_output();
+        self.drain_output()?;
         self.terminal.snapshot()
     }
 
-    fn drain_output(&mut self) {
-        let output = self
-            .output
-            .as_ref()
-            .expect("Terminal Session output is available before drop");
-        while let Ok(bytes) = output.try_recv() {
-            self.terminal.feed(&bytes);
+    fn drain_output(&mut self) -> Result<(), String> {
+        loop {
+            let message = self
+                .output
+                .as_ref()
+                .expect("Terminal Session output is available before drop")
+                .try_recv();
+            match message {
+                Ok(PtyOutput::Bytes(bytes)) => self.terminal.feed(&bytes),
+                Ok(PtyOutput::Paused) => {
+                    return Err("terminal reader paused outside a resize barrier".into());
+                }
+                Err(flume::TryRecvError::Empty | flume::TryRecvError::Disconnected) => {
+                    return Ok(());
+                }
+            }
         }
     }
+
+    fn drain_until_reader_paused(&mut self) -> Result<(), String> {
+        loop {
+            let message = self
+                .output
+                .as_ref()
+                .expect("Terminal Session output is available before drop")
+                .recv()
+                .map_err(|_| "pause terminal reader: output stream stopped".to_string())?;
+            match message {
+                PtyOutput::Bytes(bytes) => self.terminal.feed(&bytes),
+                PtyOutput::Paused => return Ok(()),
+            }
+        }
+    }
+}
+
+fn combine_errors(error: String, followup: Option<String>) -> String {
+    followup.map_or_else(|| error.clone(), |followup| format!("{error}; {followup}"))
 }
 
 impl Drop for TerminalSession {
@@ -166,9 +229,38 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalEvent, TerminalSession, TerminalSize};
+    use super::{TerminalEvent, TerminalSession, TerminalSize, TerminalTransport};
     use crate::ghostty::snapshot_text;
+    use crate::{
+        ghostty,
+        pty::{PtyOutput, PtySize},
+    };
     use std::time::{Duration, Instant};
+
+    struct OutputDuringResize {
+        output: flume::Sender<PtyOutput>,
+    }
+
+    impl TerminalTransport for OutputDuringResize {
+        fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Bytes(b"\x1b[H\x1b[999C".to_vec()))
+                .and_then(|_| self.output.send(PtyOutput::Paused))
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn terminal_size_rejects_zero_dimensions() {
@@ -186,6 +278,30 @@ mod tests {
         assert_eq!(pty.rows, 40);
         assert_eq!(pty.pixel_width, 900);
         assert_eq!(pty.pixel_height, 720);
+    }
+
+    #[test]
+    fn resize_consumes_in_flight_output_at_previous_geometry() {
+        let previous_size = TerminalSize::new(4, 4, 10, 20);
+        let next_size = TerminalSize::new(8, 4, 10, 20);
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(previous_size.cols, previous_size.rows)
+            .expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(OutputDuringResize { output: output_tx }),
+            output: Some(output_rx),
+            size: previous_size,
+        };
+
+        session.resize(next_size).expect("resize terminal session");
+
+        let snapshot = session.snapshot().expect("snapshot resized terminal");
+        assert_eq!(
+            snapshot.cursor,
+            Some((previous_size.cols - 1, 0)),
+            "bytes accepted before the transport resize must use the previous grid"
+        );
     }
 
     #[test]

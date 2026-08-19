@@ -1,5 +1,5 @@
 use crate::{
-    pty::{PtySize, send_or_shutdown},
+    pty::{PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown},
     terminal_session::TerminalEvent,
 };
 use std::{
@@ -18,7 +18,7 @@ use windows_sys::Win32::{
     Security::SECURITY_ATTRIBUTES,
     System::{
         Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole},
-        Pipes::CreatePipe,
+        Pipes::{CreatePipe, PeekNamedPipe},
         Threading::{
             CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
             EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
@@ -52,6 +52,7 @@ pub struct PtySession {
     input: OwnedHandle,
     pseudoconsole: Arc<SharedPseudoConsole>,
     process: OwnedHandle,
+    control: flume::Sender<ReaderControl>,
     shutdown: Option<flume::Sender<()>>,
 }
 
@@ -75,7 +76,7 @@ impl PtySession {
     pub fn spawn(
         size: PtySize,
         events: flume::Sender<TerminalEvent>,
-    ) -> Result<(Self, flume::Receiver<Vec<u8>>), String> {
+    ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         let input = Pipe::create()?;
         let output = Pipe::create()?;
         let mut pseudoconsole: HPCON = 0;
@@ -111,6 +112,7 @@ impl PtySession {
             }
         };
         let (output_tx, output_rx) = flume::bounded(256);
+        let (control_tx, control_rx) = flume::bounded(1);
         let (shutdown_tx, shutdown_rx) = flume::bounded(1);
         let mut output_handle = output.read;
         let reader_events = events.clone();
@@ -120,7 +122,34 @@ impl PtySession {
             .spawn(move || {
                 let mut buffer = [0_u8; 16 * 1024];
                 loop {
-                    match read_handle(output_handle.raw(), &mut buffer) {
+                    if !reader_checkpoint(&control_rx, &output_tx, &reader_shutdown) {
+                        break;
+                    }
+                    let available = match available_bytes(output_handle.raw()) {
+                        Ok(0) => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        Ok(available) => available,
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                            let _ = send_or_shutdown(
+                                &reader_events,
+                                &reader_shutdown,
+                                TerminalEvent::Exited,
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            let _ = send_or_shutdown(
+                                &reader_events,
+                                &reader_shutdown,
+                                TerminalEvent::Failed(format!("inspect ConPTY output: {error}")),
+                            );
+                            break;
+                        }
+                    };
+                    let read_len = available.min(buffer.len());
+                    match read_handle(output_handle.raw(), &mut buffer[..read_len]) {
                         Ok(0) => {
                             let _ = send_or_shutdown(
                                 &reader_events,
@@ -133,7 +162,7 @@ impl PtySession {
                             if !send_or_shutdown(
                                 &output_tx,
                                 &reader_shutdown,
-                                buffer[..read].to_vec(),
+                                PtyOutput::Bytes(buffer[..read].to_vec()),
                             ) =>
                         {
                             break;
@@ -208,6 +237,7 @@ impl PtySession {
                 input: input.write,
                 pseudoconsole,
                 process,
+                control: control_tx,
                 shutdown: Some(shutdown_tx),
             },
             output_rx,
@@ -220,6 +250,18 @@ impl PtySession {
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
         self.pseudoconsole.resize(size)
+    }
+
+    pub fn pause_reader(&mut self) -> Result<(), String> {
+        self.control
+            .send(ReaderControl::Pause)
+            .map_err(|_| "pause ConPTY reader: reader stopped".to_string())
+    }
+
+    pub fn resume_reader(&mut self) -> Result<(), String> {
+        self.control
+            .send(ReaderControl::Resume)
+            .map_err(|_| "resume ConPTY reader: reader stopped".to_string())
     }
 }
 
@@ -569,6 +611,25 @@ fn read_handle(handle: HANDLE, buffer: &mut [u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(read as usize)
+    }
+}
+
+fn available_bytes(handle: HANDLE) -> io::Result<usize> {
+    let mut available = 0;
+    let result = unsafe {
+        PeekNamedPipe(
+            handle,
+            null_mut(),
+            0,
+            null_mut(),
+            &mut available,
+            null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available as usize)
     }
 }
 
