@@ -1,3 +1,5 @@
+use crate::ghostty::SNAPSHOT_CELL_CAPACITY;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellMetrics {
     pub width_px: u16,
@@ -35,11 +37,30 @@ impl GridDimensions {
     ) -> Self {
         let content_width = (view_width_px - padding_px * 2.0).max(f32::from(cells.width_px));
         let content_height = (view_height_px - padding_px * 2.0).max(f32::from(cells.height_px));
-        Self {
+        fit_within_capacity(Self {
             cols: cell_count(content_width, cells.width_px),
             rows: cell_count(content_height, cells.height_px),
+        })
+    }
+}
+
+fn fit_within_capacity(dimensions: GridDimensions) -> GridDimensions {
+    let cell_count = u64::from(dimensions.cols) * u64::from(dimensions.rows);
+    if cell_count <= SNAPSHOT_CELL_CAPACITY as u64 {
+        return dimensions;
+    }
+
+    let scale = (SNAPSHOT_CELL_CAPACITY as f64 / cell_count as f64).sqrt();
+    let mut cols = (f64::from(dimensions.cols) * scale).floor().max(1.0) as u16;
+    let mut rows = (f64::from(dimensions.rows) * scale).floor().max(1.0) as u16;
+    while usize::from(cols) * usize::from(rows) > SNAPSHOT_CELL_CAPACITY {
+        if cols >= rows {
+            cols -= 1;
+        } else {
+            rows -= 1;
         }
     }
+    GridDimensions { cols, rows }
 }
 
 fn cell_count(available_px: f32, cell_px: u16) -> u16 {
@@ -68,6 +89,16 @@ mod tests {
         let dimensions = GridDimensions::fit(1.0, 1.0, 12.0, CellMetrics::new(9, 20));
         assert_eq!(dimensions.cols, 1);
         assert_eq!(dimensions.rows, 1);
+    }
+
+    #[test]
+    fn viewport_grid_stays_within_the_snapshot_capacity() {
+        let dimensions = GridDimensions::fit(3_840.0, 2_160.0, 0.0, CellMetrics::new(8, 8));
+        assert!(usize::from(dimensions.cols) * usize::from(dimensions.rows) <= 65_536);
+        assert!(
+            dimensions.cols > dimensions.rows,
+            "preserve viewport aspect ratio"
+        );
     }
 
     #[test]
