@@ -7,17 +7,21 @@ use std::{
     ptr::null_mut,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK},
+    Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK,
+        WAIT_FAILED, WAIT_OBJECT_0,
+    },
     Security::SECURITY_ATTRIBUTES,
     System::{
         Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole},
         Pipes::CreatePipe,
         Threading::{
             CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-            EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-            STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-            UpdateProcThreadAttribute,
+            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
+            WaitForSingleObject,
         },
     },
 };
@@ -87,8 +91,10 @@ impl PtySession {
         drop(input.read);
         drop(output.write);
 
+        let process_wait_handle = process.try_clone()?;
         let (output_tx, output_rx) = flume::bounded(256);
         let mut output_handle = output.read;
+        let reader_events = events.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("terminal-conpty-reader".into())
             .spawn(move || {
@@ -96,18 +102,18 @@ impl PtySession {
                 loop {
                     match read_handle(output_handle.raw(), &mut buffer) {
                         Ok(0) => {
-                            let _ = events.send(TerminalEvent::Exited);
+                            let _ = reader_events.send(TerminalEvent::Exited);
                             break;
                         }
                         Ok(read) if output_tx.send(buffer[..read].to_vec()).is_err() => break,
-                        Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
+                        Ok(_) if reader_events.try_send(TerminalEvent::Changed).is_err() => {}
                         Ok(_) => {}
                         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                            let _ = events.send(TerminalEvent::Exited);
+                            let _ = reader_events.send(TerminalEvent::Exited);
                             break;
                         }
                         Err(error) => {
-                            let _ = events.send(TerminalEvent::Failed(format!(
+                            let _ = reader_events.send(TerminalEvent::Failed(format!(
                                 "ConPTY read stopped: {error}"
                             )));
                             break;
@@ -119,6 +125,33 @@ impl PtySession {
         {
             unsafe { TerminateProcess(process.raw(), 0) };
             return Err(format!("spawn ConPTY reader thread: {error}"));
+        }
+
+        if let Err(error) = std::thread::Builder::new()
+            .name("terminal-conpty-process-waiter".into())
+            .spawn(move || {
+                let wait_result =
+                    unsafe { WaitForSingleObject(process_wait_handle.raw(), INFINITE) };
+                match wait_result {
+                    WAIT_OBJECT_0 => {
+                        let _ = events.send(TerminalEvent::Exited);
+                    }
+                    WAIT_FAILED => {
+                        let _ = events.send(TerminalEvent::Failed(format!(
+                            "wait for ConPTY process: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                    unexpected => {
+                        let _ = events.send(TerminalEvent::Failed(format!(
+                            "wait for ConPTY process returned unexpected status {unexpected}"
+                        )));
+                    }
+                }
+            })
+        {
+            unsafe { TerminateProcess(process.raw(), 0) };
+            return Err(format!("spawn ConPTY process waiter thread: {error}"));
         }
 
         Ok((
@@ -197,6 +230,27 @@ impl OwnedHandle {
             Err(last_error("close Windows handle"))
         } else {
             Ok(())
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self, String> {
+        let current_process = unsafe { GetCurrentProcess() };
+        let mut duplicate = INVALID_HANDLE_VALUE;
+        if unsafe {
+            DuplicateHandle(
+                current_process,
+                self.raw(),
+                current_process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            Err(last_error("duplicate Windows handle"))
+        } else {
+            Ok(Self(duplicate))
         }
     }
 }
