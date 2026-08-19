@@ -6,7 +6,7 @@ This document resolves the protocol choice tracked in issue #2 and defines the t
 
 The Resident Core is a separately restartable, unelevated per-user process. It owns all domain state, PTY/ConPTY transports, libghostty-vt state, process lifecycle, persistence, and agent-integration authority. GPUI runs only in a UI Client process.
 
-`CoreClient` is the UI-facing interface. Its adapter uses a Unix-domain local socket on macOS/Linux and a named pipe on Windows through a cross-platform local-socket implementation. The Resident Core restricts Unix peers by effective user ID and socket mode; the Windows duplex pipe requires creator-authorized write access. Platform transport types, raw terminal bytes, and libghostty-vt types do not cross the interface.
+`CoreClient` is the UI-facing interface. Its adapter uses a Unix-domain local socket on macOS/Linux and a named pipe on Windows through a cross-platform local-socket implementation. The Resident Core keeps Unix sockets in an owner-verified private runtime directory and restricts peers by effective user ID; the Windows duplex pipe requires creator-authorized write access. Platform transport types, raw terminal bytes, and libghostty-vt types do not cross the interface.
 
 ## Versioning and attachment
 

@@ -408,13 +408,8 @@ pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
     let name = endpoint
         .name()
         .map_err(|error| format!("name Resident Core endpoint: {error}"))?;
-    let options = ListenerOptions::new().name(name);
-    #[cfg(unix)]
-    let options = {
-        use interprocess::os::unix::local_socket::ListenerOptionsExt;
-        options.mode(0o600)
-    };
-    let listener = options
+    let listener = ListenerOptions::new()
+        .name(name)
         .create_sync()
         .map_err(|error| format!("listen at Resident Core endpoint: {error}"))?;
     let core = ResidentCore::start()?;
