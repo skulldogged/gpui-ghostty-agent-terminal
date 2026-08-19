@@ -121,7 +121,6 @@ pub struct TerminalSession {
     terminal: ghostty::Terminal,
     process: Box<dyn TerminalTransport>,
     output: Option<flume::Receiver<PtyOutput>>,
-    #[allow(dead_code)] // Read by resize, which the next stacked PR drives from GPUI geometry.
     size: TerminalSize,
 }
 
@@ -152,7 +151,6 @@ impl TerminalSession {
         self.size
     }
 
-    #[allow(dead_code)] // The renderer stack adds the first live geometry caller.
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), String> {
         let size = size.validate()?;
         if size == self.size {

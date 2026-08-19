@@ -766,6 +766,7 @@ pub enum TerminalLifecycle {
 pub struct TerminalCell {
     pub x: u16,
     pub y: u16,
+    pub width: u8,
     pub text: String,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
@@ -777,6 +778,7 @@ impl From<ghostty::Cell> for TerminalCell {
         Self {
             x: cell.x,
             y: cell.y,
+            width: cell.width,
             text: cell.text,
             fg: cell.fg,
             bg: cell.bg,
