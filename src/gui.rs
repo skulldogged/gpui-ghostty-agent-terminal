@@ -17,7 +17,10 @@ pub fn run() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let (session, output) = PtySession::spawn().expect("spawn cross-platform PTY");
+                    let (mut session, output) =
+                        PtySession::spawn().expect("spawn cross-platform PTY");
+                    #[cfg(windows)]
+                    session.write(b"echo WINDOWS_CONPTY_LIVE\r");
                     let terminal = ghostty::Terminal::new(COLS, ROWS).expect("create Ghostty VT");
                     let focus = cx.focus_handle();
                     focus.focus(window);
