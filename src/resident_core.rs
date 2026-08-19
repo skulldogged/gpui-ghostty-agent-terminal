@@ -9,6 +9,10 @@ use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::{
     Listener as LocalSocketListener, ListenerOptions, Stream as LocalSocketStream, prelude::*,
 };
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{self, BufRead, BufReader, Write},
@@ -20,6 +24,8 @@ use std::{
 const PROTOCOL_VERSION: u16 = 1;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_TICK: Duration = Duration::from_millis(10);
+const AUTH_SECRET_BYTES: usize = 32;
+const AUTH_NONCE_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreEndpoint(String);
@@ -133,6 +139,124 @@ fn stable_endpoint_hash(endpoint: &str) -> u64 {
     })
 }
 
+fn load_auth_secret() -> Result<[u8; AUTH_SECRET_BYTES], String> {
+    let path = auth_secret_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => parse_auth_secret(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let secret = random_bytes::<AUTH_SECRET_BYTES>()?;
+            create_auth_secret(&path, secret)
+        }
+        Err(error) => Err(format!("read Resident Core authentication secret: {error}")),
+    }
+}
+
+fn create_auth_secret(
+    path: &std::path::Path,
+    secret: [u8; AUTH_SECRET_BYTES],
+) -> Result<[u8; AUTH_SECRET_BYTES], String> {
+    let nonce = u64::from_le_bytes(random_bytes::<8>()?);
+    let temporary = path.with_extension(format!("tmp-{}-{nonce:016x}", std::process::id()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create Resident Core authentication secret: {error}"))?;
+        file.write_all(&secret)
+            .map_err(|error| format!("write Resident Core authentication secret: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("persist Resident Core authentication secret: {error}"))?;
+        drop(file);
+
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => Ok(secret),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => std::fs::read(path)
+                .map_err(|error| format!("read raced Resident Core authentication secret: {error}"))
+                .and_then(parse_auth_secret),
+            Err(error) => Err(format!(
+                "publish Resident Core authentication secret: {error}"
+            )),
+        }
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn parse_auth_secret(bytes: Vec<u8>) -> Result<[u8; AUTH_SECRET_BYTES], String> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "Resident Core authentication secret has invalid length: {}",
+            bytes.len()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn auth_secret_path() -> Result<std::path::PathBuf, String> {
+    private_runtime_directory()
+        .map(|directory| directory.join("core-auth-v1"))
+        .map_err(|error| format!("locate Resident Core authentication directory: {error}"))
+}
+
+#[cfg(windows)]
+fn auth_secret_path() -> Result<std::path::PathBuf, String> {
+    let directory = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is required for Resident Core authentication".to_string())?
+        .join("AgentTerminal");
+    // LOCALAPPDATA inherits the owning user's protected profile ACL. Other
+    // local users cannot pre-create or read this shared client/core secret.
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create Resident Core authentication directory: {error}"))?;
+    Ok(directory.join("core-auth-v1"))
+}
+
+fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
+    let mut bytes = [0_u8; N];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "generate Resident Core authentication randomness".to_string())?;
+    Ok(bytes)
+}
+
+fn authentication_message(endpoint: &CoreEndpoint, nonce: &[u8; AUTH_NONCE_BYTES]) -> Vec<u8> {
+    let mut message = b"agent-terminal-core-auth-v1\0".to_vec();
+    message.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    message.extend_from_slice(endpoint.argument().as_bytes());
+    message.push(0);
+    message.extend_from_slice(nonce);
+    message
+}
+
+fn server_proof(
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
+    endpoint: &CoreEndpoint,
+    nonce: &[u8; AUTH_NONCE_BYTES],
+) -> [u8; 32] {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, auth_secret);
+    hmac::sign(&key, &authentication_message(endpoint, nonce))
+        .as_ref()
+        .try_into()
+        .expect("HMAC-SHA256 proof is 32 bytes")
+}
+
+fn verify_server_proof(
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
+    endpoint: &CoreEndpoint,
+    nonce: &[u8; AUTH_NONCE_BYTES],
+    proof: &[u8; 32],
+) -> Result<(), String> {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, auth_secret);
+    hmac::verify(&key, &authentication_message(endpoint, nonce), proof)
+        .map_err(|_| "Resident Core authentication failed".to_string())
+}
+
 pub struct CoreClient {
     connection: BufReader<LocalSocketStream>,
 }
@@ -140,6 +264,7 @@ pub struct CoreClient {
 impl CoreClient {
     pub fn connect(endpoint: &CoreEndpoint, timeout: Duration) -> Result<Self, String> {
         let deadline = Instant::now() + timeout;
+        let auth_secret = load_auth_secret()?;
 
         loop {
             let connection_error = match LocalSocketStream::connect(
@@ -149,17 +274,27 @@ impl CoreClient {
             ) {
                 Ok(stream) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    configure_stream_timeouts(&stream, remaining.max(Duration::from_millis(1)))?;
+                    configure_stream_timeouts(
+                        &stream,
+                        Some(remaining.max(Duration::from_millis(1))),
+                    )?;
                     let mut client = Self {
                         connection: BufReader::new(stream),
                     };
+                    let nonce = random_bytes::<AUTH_NONCE_BYTES>()?;
                     match client.request(Request::Hello {
                         version: PROTOCOL_VERSION,
+                        nonce,
                     })? {
                         Response::Ready {
                             version: PROTOCOL_VERSION,
-                        } => return Ok(client),
-                        Response::Ready { version } => {
+                            proof,
+                        } => {
+                            verify_server_proof(&auth_secret, endpoint, &nonce, &proof)?;
+                            configure_stream_timeouts(client.connection.get_ref(), None)?;
+                            return Ok(client);
+                        }
+                        Response::Ready { version, .. } => {
                             return Err(format!(
                                 "Resident Core protocol mismatch: client {PROTOCOL_VERSION}, core {version}"
                             ));
@@ -251,12 +386,15 @@ impl CoreClient {
 }
 
 #[cfg(unix)]
-fn configure_stream_timeouts(stream: &LocalSocketStream, timeout: Duration) -> Result<(), String> {
+fn configure_stream_timeouts(
+    stream: &LocalSocketStream,
+    timeout: Option<Duration>,
+) -> Result<(), String> {
     stream
-        .set_recv_timeout(Some(timeout))
+        .set_recv_timeout(timeout)
         .map_err(|error| format!("set Resident Core receive timeout: {error}"))?;
     stream
-        .set_send_timeout(Some(timeout))
+        .set_send_timeout(timeout)
         .map_err(|error| format!("set Resident Core send timeout: {error}"))?;
     Ok(())
 }
@@ -264,7 +402,7 @@ fn configure_stream_timeouts(stream: &LocalSocketStream, timeout: Duration) -> R
 #[cfg(windows)]
 fn configure_stream_timeouts(
     _stream: &LocalSocketStream,
-    _timeout: Duration,
+    _timeout: Option<Duration>,
 ) -> Result<(), String> {
     // Windows named pipes do not support the socket-style I/O timeouts exposed
     // by interprocess. The deadline still bounds retries while waiting for the
@@ -351,16 +489,25 @@ impl From<ghostty::Cell> for TerminalCell {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Request {
-    Hello { version: u16 },
-    Input { bytes: Vec<u8> },
-    Resize { size: TerminalSize },
-    Snapshot { since: Option<u64> },
+    Hello {
+        version: u16,
+        nonce: [u8; AUTH_NONCE_BYTES],
+    },
+    Input {
+        bytes: Vec<u8>,
+    },
+    Resize {
+        size: TerminalSize,
+    },
+    Snapshot {
+        since: Option<u64>,
+    },
     StopResidentCore,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Response {
-    Ready { version: u16 },
+    Ready { version: u16, proof: [u8; 32] },
     Ack,
     Snapshot(Option<TerminalSnapshot>),
     Error(String),
@@ -425,13 +572,7 @@ impl ResidentCore {
                                     Ok(WorkerResponse::Snapshot(None))
                                 }
                                 WorkerRequest::Snapshot { .. } => {
-                                    session.snapshot().map(|snapshot| {
-                                        refresh_terminal_state(
-                                            &mut session,
-                                            &events,
-                                            &mut revision,
-                                            &mut lifecycle,
-                                        );
+                                    session.snapshot_current().map(|snapshot| {
                                         WorkerResponse::Snapshot(Some(
                                             TerminalSnapshot::from_terminal(
                                                 snapshot,
@@ -497,6 +638,7 @@ fn refresh_terminal_state(
 }
 
 pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
+    let auth_secret = load_auth_secret()?;
     let Some((listener, _endpoint_guard)) = create_listener(&endpoint)? else {
         return Ok(());
     };
@@ -509,7 +651,7 @@ pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
         if !same_user(&stream)? {
             continue;
         }
-        match handle_client(stream, &core) {
+        match handle_client(stream, &core, &endpoint, &auth_secret) {
             Ok(ClientOutcome::Disconnected) => {}
             Ok(ClientOutcome::StopResidentCore) => return Ok(()),
             Err(error) if is_disconnect(&error) => {}
@@ -625,9 +767,14 @@ enum ClientOutcome {
     StopResidentCore,
 }
 
-fn handle_client(stream: LocalSocketStream, core: &ResidentCore) -> io::Result<ClientOutcome> {
+fn handle_client(
+    stream: LocalSocketStream,
+    core: &ResidentCore,
+    endpoint: &CoreEndpoint,
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
+) -> io::Result<ClientOutcome> {
     let mut connection = BufReader::new(stream);
-    let Some(Request::Hello { version }) = read_message(&mut connection)? else {
+    let Some(Request::Hello { version, nonce }) = read_message(&mut connection)? else {
         write_message(
             connection.get_mut(),
             &Response::Error("UI Client must begin with a protocol handshake".into()),
@@ -647,6 +794,7 @@ fn handle_client(stream: LocalSocketStream, core: &ResidentCore) -> io::Result<C
         connection.get_mut(),
         &Response::Ready {
             version: PROTOCOL_VERSION,
+            proof: server_proof(auth_secret, endpoint, &nonce),
         },
     )?;
 
@@ -794,4 +942,25 @@ fn detach_command(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoreEndpoint, server_proof, verify_server_proof};
+
+    #[test]
+    fn server_proof_binds_the_secret_endpoint_and_nonce() {
+        let endpoint = CoreEndpoint::for_profile("authentication-test").unwrap();
+        let other_endpoint = CoreEndpoint::for_profile("other-authentication-test").unwrap();
+        let secret = [7_u8; 32];
+        let other_secret = [8_u8; 32];
+        let nonce = [9_u8; 32];
+        let other_nonce = [10_u8; 32];
+        let proof = server_proof(&secret, &endpoint, &nonce);
+
+        verify_server_proof(&secret, &endpoint, &nonce, &proof).unwrap();
+        assert!(verify_server_proof(&other_secret, &endpoint, &nonce, &proof).is_err());
+        assert!(verify_server_proof(&secret, &other_endpoint, &nonce, &proof).is_err());
+        assert!(verify_server_proof(&secret, &endpoint, &other_nonce, &proof).is_err());
+    }
 }

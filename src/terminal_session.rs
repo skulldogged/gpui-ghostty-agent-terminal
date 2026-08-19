@@ -175,8 +175,13 @@ impl TerminalSession {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
         self.drain_output()?;
+        self.snapshot_current()
+    }
+
+    pub(crate) fn snapshot_current(&mut self) -> Result<ghostty::Snapshot, String> {
         self.terminal.snapshot()
     }
 
