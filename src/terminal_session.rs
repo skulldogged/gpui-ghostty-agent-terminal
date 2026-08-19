@@ -74,7 +74,7 @@ pub enum TerminalEvent {
 pub struct TerminalSession {
     terminal: ghostty::Terminal,
     process: PtySession,
-    output: flume::Receiver<Vec<u8>>,
+    output: Option<flume::Receiver<Vec<u8>>>,
     #[allow(dead_code)] // Read by resize, which the next stacked PR drives from GPUI geometry.
     size: TerminalSize,
 }
@@ -89,7 +89,7 @@ impl TerminalSession {
             Self {
                 terminal,
                 process,
-                output,
+                output: Some(output),
                 size,
             },
             TerminalEvents {
@@ -123,10 +123,23 @@ impl TerminalSession {
     }
 
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
-        while let Ok(bytes) = self.output.try_recv() {
+        let output = self
+            .output
+            .as_ref()
+            .expect("Terminal Session output is available before drop");
+        while let Ok(bytes) = output.try_recv() {
             self.terminal.feed(&bytes);
         }
         self.terminal.snapshot()
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        // A platform reader may be blocked while delivering a full output
+        // queue. Disconnect it before dropping the process transport so it
+        // can close its pipe while ConPTY or the Unix PTY shuts down.
+        drop(self.output.take());
     }
 }
 
@@ -181,5 +194,31 @@ mod tests {
         }
 
         panic!("shell did not return the input marker before the timeout");
+    }
+
+    #[test]
+    fn normal_shell_exit_is_reported_as_exited() {
+        let (mut session, events) =
+            TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
+        session.input(b"exit\r").expect("write shell exit command");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(TerminalEvent::Changed) => {
+                    session.snapshot().expect("drain terminal output");
+                }
+                Ok(TerminalEvent::Exited) => return,
+                Ok(TerminalEvent::Failed(error)) => {
+                    panic!("normal shell exit was reported as failure: {error}")
+                }
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    panic!("terminal event stream disconnected")
+                }
+            }
+        }
+
+        panic!("shell exit was not reported before the timeout");
     }
 }

@@ -66,6 +66,10 @@ mod unix {
                             Ok(read) if output_tx.send(buffer[..read].to_vec()).is_err() => break,
                             Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
                             Ok(_) => {}
+                            Err(error) if is_normal_pty_exit(&error) => {
+                                let _ = events.send(TerminalEvent::Exited);
+                                break;
+                            }
                             Err(error) => {
                                 let _ = events.send(TerminalEvent::Failed(format!(
                                     "PTY read stopped: {error}"
@@ -120,6 +124,29 @@ mod unix {
 
     fn shell() -> String {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    }
+
+    fn is_normal_pty_exit(error: &std::io::Error) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            error.raw_os_error() == Some(libc::EIO)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = error;
+            false
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_eio_is_a_normal_pty_exit() {
+            let error = std::io::Error::from_raw_os_error(libc::EIO);
+            assert!(super::is_normal_pty_exit(&error));
+        }
     }
 }
 
