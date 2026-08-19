@@ -2,9 +2,11 @@ use crate::{
     ghostty,
     terminal_session::{TerminalEvent, TerminalSession, TerminalSize},
 };
-use interprocess::local_socket::{
-    GenericNamespaced, ListenerOptions, Stream as LocalSocketStream, prelude::*,
-};
+#[cfg(unix)]
+use interprocess::local_socket::GenericFilePath;
+#[cfg(windows)]
+use interprocess::local_socket::GenericNamespaced;
+use interprocess::local_socket::{ListenerOptions, Stream as LocalSocketStream, prelude::*};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{self, BufRead, BufReader, Write},
@@ -73,9 +75,49 @@ impl CoreEndpoint {
         &self.0
     }
 
+    #[cfg(windows)]
     fn name(&self) -> io::Result<interprocess::local_socket::Name<'_>> {
         self.0.as_str().to_ns_name::<GenericNamespaced>()
     }
+
+    #[cfg(unix)]
+    fn name(&self) -> io::Result<interprocess::local_socket::Name<'static>> {
+        let directory = private_runtime_directory()?;
+        let path = directory.join(format!("{:016x}.sock", stable_endpoint_hash(&self.0)));
+        path.to_fs_name::<GenericFilePath>()
+            .map(interprocess::local_socket::Name::into_owned)
+    }
+}
+
+#[cfg(unix)]
+fn private_runtime_directory() -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let effective_user = unsafe { libc::geteuid() };
+    let directory = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("agent-terminal-{effective_user}")))
+        .join("agent-terminal");
+    std::fs::create_dir_all(&directory)?;
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != effective_user {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Resident Core runtime directory is not owned by the current user: {}",
+                directory.display()
+            ),
+        ));
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn stable_endpoint_hash(endpoint: &str) -> u64 {
+    endpoint.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 pub struct CoreClient {
