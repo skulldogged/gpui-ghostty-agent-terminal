@@ -1,12 +1,14 @@
 use crate::{
     ghostty,
-    terminal_session::{TerminalEvent, TerminalSession, TerminalSize},
+    terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
-use interprocess::local_socket::{ListenerOptions, Stream as LocalSocketStream, prelude::*};
+use interprocess::local_socket::{
+    Listener as LocalSocketListener, ListenerOptions, Stream as LocalSocketStream, prelude::*,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{self, BufRead, BufReader, Write},
@@ -82,10 +84,21 @@ impl CoreEndpoint {
 
     #[cfg(unix)]
     fn name(&self) -> io::Result<interprocess::local_socket::Name<'static>> {
-        let directory = private_runtime_directory()?;
-        let path = directory.join(format!("{:016x}.sock", stable_endpoint_hash(&self.0)));
-        path.to_fs_name::<GenericFilePath>()
+        self.socket_path()?
+            .to_fs_name::<GenericFilePath>()
             .map(interprocess::local_socket::Name::into_owned)
+    }
+
+    #[cfg(unix)]
+    fn socket_path(&self) -> io::Result<std::path::PathBuf> {
+        Ok(private_runtime_directory()?
+            .join(format!("{:016x}.sock", stable_endpoint_hash(&self.0))))
+    }
+
+    #[cfg(unix)]
+    fn lock_path(&self) -> io::Result<std::path::PathBuf> {
+        Ok(private_runtime_directory()?
+            .join(format!("{:016x}.lock", stable_endpoint_hash(&self.0))))
     }
 }
 
@@ -198,10 +211,25 @@ impl CoreClient {
     }
 
     pub fn snapshot(&mut self) -> Result<TerminalSnapshot, String> {
-        match self.request(Request::Snapshot)? {
-            Response::Snapshot(snapshot) => Ok(snapshot),
+        match self.request(Request::Snapshot { since: None })? {
+            Response::Snapshot(Some(snapshot)) => Ok(snapshot),
+            Response::Snapshot(None) => {
+                Err("Resident Core omitted an unconditional snapshot".into())
+            }
             Response::Error(error) => Err(error),
             response => Err(format!("invalid snapshot response: {response:?}")),
+        }
+    }
+
+    pub fn snapshot_since(&mut self, revision: u64) -> Result<Option<TerminalSnapshot>, String> {
+        match self.request(Request::Snapshot {
+            since: Some(revision),
+        })? {
+            Response::Snapshot(snapshot) => Ok(snapshot),
+            Response::Error(error) => Err(error),
+            response => Err(format!(
+                "invalid conditional snapshot response: {response:?}"
+            )),
         }
     }
 
@@ -246,6 +274,8 @@ fn configure_stream_timeouts(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
+    pub revision: u64,
+    pub lifecycle: TerminalLifecycle,
     pub cols: u16,
     pub rows: u16,
     pub cursor: Option<(u16, u16)>,
@@ -270,9 +300,15 @@ impl TerminalSnapshot {
     }
 }
 
-impl From<ghostty::Snapshot> for TerminalSnapshot {
-    fn from(snapshot: ghostty::Snapshot) -> Self {
+impl TerminalSnapshot {
+    fn from_terminal(
+        snapshot: ghostty::Snapshot,
+        revision: u64,
+        lifecycle: TerminalLifecycle,
+    ) -> Self {
         Self {
+            revision,
+            lifecycle,
             cols: snapshot.cols,
             rows: snapshot.rows,
             cursor: snapshot.cursor,
@@ -281,6 +317,13 @@ impl From<ghostty::Snapshot> for TerminalSnapshot {
             cells: snapshot.cells.into_iter().map(TerminalCell::from).collect(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalLifecycle {
+    Running,
+    Exited,
+    Failed(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,7 +354,7 @@ enum Request {
     Hello { version: u16 },
     Input { bytes: Vec<u8> },
     Resize { size: TerminalSize },
-    Snapshot,
+    Snapshot { since: Option<u64> },
     StopResidentCore,
 }
 
@@ -319,20 +362,20 @@ enum Request {
 enum Response {
     Ready { version: u16 },
     Ack,
-    Snapshot(TerminalSnapshot),
+    Snapshot(Option<TerminalSnapshot>),
     Error(String),
 }
 
 enum WorkerRequest {
     Input(Vec<u8>),
     Resize(TerminalSize),
-    Snapshot,
+    Snapshot { since: Option<u64> },
     Stop,
 }
 
 enum WorkerResponse {
     Ack,
-    Snapshot(TerminalSnapshot),
+    Snapshot(Option<TerminalSnapshot>),
 }
 
 struct WorkerCommand {
@@ -362,8 +405,11 @@ impl ResidentCore {
                         return;
                     }
                 };
+                let mut revision = 0_u64;
+                let mut lifecycle = TerminalLifecycle::Running;
 
                 loop {
+                    refresh_terminal_state(&mut session, &events, &mut revision, &mut lifecycle);
                     match commands_rx.recv_timeout(SESSION_TICK) {
                         Ok(command) => {
                             let stop = matches!(command.request, WorkerRequest::Stop);
@@ -371,13 +417,30 @@ impl ResidentCore {
                                 WorkerRequest::Input(bytes) => {
                                     session.input(&bytes).map(|()| WorkerResponse::Ack)
                                 }
-                                WorkerRequest::Resize(size) => {
-                                    session.resize(size).map(|()| WorkerResponse::Ack)
+                                WorkerRequest::Resize(size) => session.resize(size).map(|()| {
+                                    revision = revision.saturating_add(1);
+                                    WorkerResponse::Ack
+                                }),
+                                WorkerRequest::Snapshot { since } if since == Some(revision) => {
+                                    Ok(WorkerResponse::Snapshot(None))
                                 }
-                                WorkerRequest::Snapshot => session
-                                    .snapshot()
-                                    .map(TerminalSnapshot::from)
-                                    .map(WorkerResponse::Snapshot),
+                                WorkerRequest::Snapshot { .. } => {
+                                    session.snapshot().map(|snapshot| {
+                                        refresh_terminal_state(
+                                            &mut session,
+                                            &events,
+                                            &mut revision,
+                                            &mut lifecycle,
+                                        );
+                                        WorkerResponse::Snapshot(Some(
+                                            TerminalSnapshot::from_terminal(
+                                                snapshot,
+                                                revision,
+                                                lifecycle.clone(),
+                                            ),
+                                        ))
+                                    })
+                                }
                                 WorkerRequest::Stop => Ok(WorkerResponse::Ack),
                             };
                             let _ = command.response.send(result);
@@ -385,16 +448,8 @@ impl ResidentCore {
                                 break;
                             }
                         }
-                        Err(flume::RecvTimeoutError::Timeout) => {
-                            let _ = session.drain_pending_output();
-                        }
+                        Err(flume::RecvTimeoutError::Timeout) => {}
                         Err(flume::RecvTimeoutError::Disconnected) => break,
-                    }
-
-                    while let Some(event) = events.try_recv() {
-                        if let TerminalEvent::Failed(error) = event {
-                            eprintln!("Terminal Session failed: {error}");
-                        }
                     }
                 }
             })
@@ -421,14 +476,30 @@ impl ResidentCore {
     }
 }
 
+fn refresh_terminal_state(
+    session: &mut TerminalSession,
+    events: &TerminalEvents,
+    revision: &mut u64,
+    lifecycle: &mut TerminalLifecycle,
+) {
+    if let Err(error) = session.drain_pending_output() {
+        *lifecycle = TerminalLifecycle::Failed(error);
+        *revision = revision.saturating_add(1);
+    }
+    while let Some(event) = events.try_recv() {
+        match event {
+            TerminalEvent::Changed => {}
+            TerminalEvent::Exited => *lifecycle = TerminalLifecycle::Exited,
+            TerminalEvent::Failed(error) => *lifecycle = TerminalLifecycle::Failed(error),
+        }
+        *revision = revision.saturating_add(1);
+    }
+}
+
 pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
-    let name = endpoint
-        .name()
-        .map_err(|error| format!("name Resident Core endpoint: {error}"))?;
-    let listener = ListenerOptions::new()
-        .name(name)
-        .create_sync()
-        .map_err(|error| format!("listen at Resident Core endpoint: {error}"))?;
+    let Some((listener, _endpoint_guard)) = create_listener(&endpoint)? else {
+        return Ok(());
+    };
     let core = ResidentCore::start()?;
 
     loop {
@@ -444,6 +515,108 @@ pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
             Err(error) if is_disconnect(&error) => {}
             Err(error) => eprintln!("UI Client connection failed: {error}"),
         }
+    }
+}
+
+#[cfg(unix)]
+struct EndpointGuard {
+    _lock: std::fs::File,
+}
+
+#[cfg(windows)]
+struct EndpointGuard;
+
+#[cfg(unix)]
+fn create_listener(
+    endpoint: &CoreEndpoint,
+) -> Result<Option<(LocalSocketListener, EndpointGuard)>, String> {
+    use std::os::{fd::AsRawFd, unix::fs::FileTypeExt};
+
+    let lock_path = endpoint
+        .lock_path()
+        .map_err(|error| format!("name Resident Core startup lock: {error}"))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open Resident Core startup lock: {error}"))?;
+    let lock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(format!("lock Resident Core startup: {error}"));
+    }
+    let guard = EndpointGuard { _lock: lock };
+
+    match bind_listener(endpoint) {
+        Ok(listener) => Ok(Some((listener, guard))),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            if endpoint_is_reachable(endpoint)? {
+                return Ok(None);
+            }
+
+            let socket_path = endpoint
+                .socket_path()
+                .map_err(|error| format!("name stale Resident Core endpoint: {error}"))?;
+            let metadata = std::fs::symlink_metadata(&socket_path)
+                .map_err(|error| format!("inspect stale Resident Core endpoint: {error}"))?;
+            if !metadata.file_type().is_socket()
+                || std::os::unix::fs::MetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
+            {
+                return Err(format!(
+                    "refuse to reclaim unverified Resident Core endpoint: {}",
+                    socket_path.display()
+                ));
+            }
+            std::fs::remove_file(&socket_path)
+                .map_err(|error| format!("reclaim stale Resident Core endpoint: {error}"))?;
+            bind_listener(endpoint)
+                .map(|listener| Some((listener, guard)))
+                .map_err(|error| format!("listen at reclaimed Resident Core endpoint: {error}"))
+        }
+        Err(error) => Err(format!("listen at Resident Core endpoint: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn create_listener(
+    endpoint: &CoreEndpoint,
+) -> Result<Option<(LocalSocketListener, EndpointGuard)>, String> {
+    bind_listener(endpoint)
+        .map(|listener| Some((listener, EndpointGuard)))
+        .map_err(|error| format!("listen at Resident Core endpoint: {error}"))
+}
+
+fn bind_listener(endpoint: &CoreEndpoint) -> io::Result<LocalSocketListener> {
+    ListenerOptions::new().name(endpoint.name()?).create_sync()
+}
+
+#[cfg(unix)]
+fn endpoint_is_reachable(endpoint: &CoreEndpoint) -> Result<bool, String> {
+    match LocalSocketStream::connect(
+        endpoint
+            .name()
+            .map_err(|error| format!("name existing Resident Core endpoint: {error}"))?,
+    ) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(format!("probe existing Resident Core endpoint: {error}")),
     }
 }
 
@@ -498,7 +671,10 @@ fn handle_client(stream: LocalSocketStream, core: &ResidentCore) -> io::Result<C
                 worker_response(core.call(WorkerRequest::Resize(size))),
                 None,
             ),
-            Request::Snapshot => (worker_response(core.call(WorkerRequest::Snapshot)), None),
+            Request::Snapshot { since } => (
+                worker_response(core.call(WorkerRequest::Snapshot { since })),
+                None,
+            ),
             Request::StopResidentCore => (
                 worker_response(core.call(WorkerRequest::Stop)),
                 Some(ClientOutcome::StopResidentCore),

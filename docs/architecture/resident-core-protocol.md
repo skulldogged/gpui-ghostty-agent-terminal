@@ -1,6 +1,6 @@
 # Resident Core and UI Client protocol
 
-This document resolves the protocol choice tracked in issue #2 and defines the target contract that issue #4 will exercise. The initial implementation in this stack is a tracer bullet: real local IPC, protocol negotiation, an exclusive connection-scoped Control Lease, commands, snapshots, detach, and reconnect.
+This document resolves the protocol choice tracked in issue #2 and defines the target contract that issue #4 will exercise. The initial implementation in this stack is a tracer bullet: real local IPC, protocol negotiation, an exclusive connection-scoped Control Lease, commands, revision-gated terminal snapshots with lifecycle state, detach, and reconnect.
 
 ## Process and transport seam
 
@@ -21,11 +21,12 @@ The Resident Core is a separately restartable, unelevated per-user process. It o
 - Input and resize require the current lease generation. Resize updates libghostty-vt and PTY/ConPTY through the ordered barrier before its acknowledgement.
 - Semantic lifecycle events are reliable and ordered by a monotonically increasing sequence. They include resource creation/removal, process exit/failure, lease changes, agent state, and command results.
 - Terminal visual updates are a separate pressure class. They carry only invalidation/revision information and may be coalesced; the client requests the latest terminal snapshot. Raw PTY bytes never cross the protocol.
+- The tracer bullet exposes terminal revision and Running/Exited/Failed state in its snapshots. A conditional snapshot request returns no payload when that revision is unchanged, so an idle UI neither rebuilds Ghostty snapshots nor rerenders. Server-pushed revision and lifecycle events remain the target for the next pressure-focused slice.
 - A slow client never blocks PTY consumption. Coalescible terminal notifications may be replaced by a newer revision. If the bounded reliable queue fills, the Core disconnects that client and requires a resnapshot rather than dropping semantic events.
 
 ## Failure behavior
 
 - UI Client disconnect, crash, or normal quit releases its lease while the Resident Core and terminals continue.
 - Resident Core failure ends live-process continuity. Restart restores only persisted structure and explicitly supported agent resumes.
-- A stale endpoint is never overwritten merely from a PID file. Startup first attempts a versioned handshake and requires singleton ownership before reclaiming an unreachable endpoint.
+- A stale endpoint is never overwritten merely from a PID file. On Unix, the core holds an exclusive per-endpoint startup lock for its lifetime; only that lock owner may reclaim a same-user socket after a live connection probe fails. Windows named-pipe lifetime is managed by the kernel.
 - Stopping the Resident Core is a separate acknowledged destructive command; closing a window, Pane presentation, or Desktop Shell never aliases it.

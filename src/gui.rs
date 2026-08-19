@@ -1,4 +1,4 @@
-use crate::{CoreClient, TerminalSnapshot};
+use crate::{CoreClient, TerminalLifecycle, TerminalSnapshot};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Task,
     Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
@@ -9,6 +9,7 @@ pub fn run() {
     Application::new().run(|cx: &mut App| {
         let mut core = CoreClient::connect_or_spawn().expect("attach to Resident Core");
         let snapshot = core.snapshot().expect("snapshot Terminal Session");
+        let terminal_error = lifecycle_message(&snapshot.lifecycle);
         let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
         let window = cx
             .open_window(
@@ -24,7 +25,7 @@ pub fn run() {
                         snapshot,
                         focus,
                         event_task: Task::ready(()),
-                        terminal_error: None,
+                        terminal_error,
                     });
                     view.update(cx, |view, cx| {
                         view.start_refresh_task(cx);
@@ -78,14 +79,18 @@ impl TerminalView {
                 };
                 if this
                     .update(cx, |view, cx| {
-                        match view.core.snapshot() {
-                            Ok(snapshot) => {
+                        match view.core.snapshot_since(view.snapshot.revision) {
+                            Ok(Some(snapshot)) => {
+                                view.terminal_error = lifecycle_message(&snapshot.lifecycle);
                                 view.snapshot = snapshot;
-                                view.terminal_error = None;
+                                cx.notify();
                             }
-                            Err(error) => view.terminal_error = Some(error),
+                            Ok(None) => {}
+                            Err(error) => {
+                                view.terminal_error = Some(error);
+                                cx.notify();
+                            }
                         }
-                        cx.notify();
                     })
                     .is_err()
                 {
@@ -123,6 +128,14 @@ impl TerminalView {
             }
             cx.stop_propagation();
         }
+    }
+}
+
+fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
+    match lifecycle {
+        TerminalLifecycle::Running => None,
+        TerminalLifecycle::Exited => Some("Terminal process exited".into()),
+        TerminalLifecycle::Failed(error) => Some(format!("Terminal process failed: {error}")),
     }
 }
 

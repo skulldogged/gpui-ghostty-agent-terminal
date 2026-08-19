@@ -14,7 +14,7 @@ mod gui;
 
 #[cfg(feature = "gui")]
 pub use resident_core::{
-    CoreClient, CoreEndpoint, TerminalCell, TerminalSnapshot, run_resident_core,
+    CoreClient, CoreEndpoint, TerminalCell, TerminalLifecycle, TerminalSnapshot, run_resident_core,
 };
 #[cfg(feature = "gui")]
 pub use terminal_session::TerminalSize;
