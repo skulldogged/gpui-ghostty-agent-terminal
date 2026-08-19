@@ -3,9 +3,15 @@ use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Task,
     Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
+#[cfg(windows)]
+use std::time::Duration;
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
+#[cfg(not(windows))]
+const STARTUP_BANNER: &[u8] = b"\x1b[1;32mGPUI + libghostty-vt\x1b[0m\r\nUnix PTY live\r\n";
+#[cfg(windows)]
+const STARTUP_BANNER: &[u8] = b"\x1b[1;32mGPUI + libghostty-vt\x1b[0m\r\nWindows ConPTY probe starting...\r\n";
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -17,11 +23,10 @@ pub fn run() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let (mut session, output) =
-                        PtySession::spawn().expect("spawn cross-platform PTY");
-                    #[cfg(windows)]
-                    session.write(b"echo WINDOWS_CONPTY_LIVE\r");
-                    let terminal = ghostty::Terminal::new(COLS, ROWS).expect("create Ghostty VT");
+                    let (session, output) = PtySession::spawn().expect("spawn cross-platform PTY");
+                    let mut terminal =
+                        ghostty::Terminal::new(COLS, ROWS).expect("create Ghostty VT");
+                    terminal.feed(STARTUP_BANNER);
                     let focus = cx.focus_handle();
                     focus.focus(window);
                     let view = cx.new(|_| TerminalView {
@@ -30,7 +35,11 @@ pub fn run() {
                         focus,
                         output_task: Task::ready(()),
                     });
-                    view.update(cx, |view, cx| view.start_output_task(output, cx));
+                    view.update(cx, |view, cx| {
+                        view.start_output_task(output, cx);
+                        #[cfg(windows)]
+                        view.start_windows_probe(cx);
+                    });
                     view
                 },
             )
@@ -50,6 +59,21 @@ struct TerminalView {
 }
 
 impl TerminalView {
+    #[cfg(windows)]
+    fn start_windows_probe(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(Duration::from_millis(750));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |view, _cx| {
+                    view.session.write(b"echo WINDOWS_CONPTY_LIVE\r");
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn start_output_task(
         &mut self,
         output: flume::Receiver<Vec<u8>>,
