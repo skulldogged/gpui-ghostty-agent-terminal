@@ -250,6 +250,26 @@ fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WideTailCursor {
+    x: u16,
+    y: u16,
+    background: [u8; 3],
+}
+
+fn wide_tail_cursor(snapshot: &TerminalSnapshot) -> Option<WideTailCursor> {
+    let (x, y) = snapshot.cursor?;
+    let cell = snapshot
+        .cells
+        .iter()
+        .find(|cell| cell.x == x && cell.y == y && cell.width == 0)?;
+    Some(WideTailCursor {
+        x,
+        y,
+        background: cell.fg,
+    })
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
@@ -274,6 +294,7 @@ impl Render for TerminalView {
 
         let snapshot = &self.snapshot;
         let cursor = snapshot.cursor;
+        let wide_tail_cursor = wide_tail_cursor(snapshot);
         let default_bg = color(snapshot.default_bg);
         let mut cells_by_offset =
             vec![None; usize::from(snapshot.cols) * usize::from(snapshot.rows)];
@@ -341,6 +362,21 @@ impl Render for TerminalView {
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
             .children(rows)
+            .when_some(wide_tail_cursor, |this, cursor| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(TERMINAL_PADDING_PX
+                            + f32::from(cursor.x)
+                                * f32::from(self.terminal_font.cells.width_px)))
+                        .top(px(TERMINAL_PADDING_PX
+                            + f32::from(cursor.y)
+                                * f32::from(self.terminal_font.cells.height_px)))
+                        .w(px(f32::from(self.terminal_font.cells.width_px)))
+                        .h(px(f32::from(self.terminal_font.cells.height_px)))
+                        .bg(color(cursor.background)),
+                )
+            })
             .when_some(self.terminal_error.clone(), |this, error| {
                 this.child(
                     div()
@@ -356,4 +392,51 @@ impl Render for TerminalView {
 
 fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
     rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wide_tail_cursor;
+    use crate::{TerminalCell, TerminalLifecycle, TerminalSnapshot};
+
+    #[test]
+    fn cursor_on_a_wide_glyph_tail_gets_an_independent_cell_overlay() {
+        let snapshot = TerminalSnapshot {
+            revision: 1,
+            lifecycle: TerminalLifecycle::Running,
+            cols: 4,
+            rows: 1,
+            cursor: Some((1, 0)),
+            default_fg: [0xdd, 0xdd, 0xdd],
+            default_bg: [0x11, 0x11, 0x11],
+            cells: vec![
+                TerminalCell {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    text: "界".into(),
+                    fg: [0xaa, 0xbb, 0xcc],
+                    bg: [0x11, 0x11, 0x11],
+                    has_explicit_bg: false,
+                },
+                TerminalCell {
+                    x: 1,
+                    y: 0,
+                    width: 0,
+                    text: String::new(),
+                    fg: [0xaa, 0xbb, 0xcc],
+                    bg: [0x11, 0x11, 0x11],
+                    has_explicit_bg: false,
+                },
+            ],
+        };
+
+        let overlay = wide_tail_cursor(&snapshot).expect("wide-tail cursor overlay");
+        assert_eq!((overlay.x, overlay.y), (1, 0));
+        assert_eq!(overlay.background, [0xaa, 0xbb, 0xcc]);
+
+        let mut ordinary_cursor = snapshot;
+        ordinary_cursor.cursor = Some((0, 0));
+        assert!(wide_tail_cursor(&ordinary_cursor).is_none());
+    }
 }
