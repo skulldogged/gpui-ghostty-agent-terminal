@@ -89,7 +89,7 @@ impl PtySession {
             )
         };
         if result != S_OK {
-            return Err(last_error("create ConPTY"));
+            return Err(hresult_error("create ConPTY", result));
         }
 
         let pseudoconsole = Arc::new(SharedPseudoConsole::new(pseudoconsole));
@@ -219,12 +219,7 @@ impl PtySession {
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
-        let result = unsafe { ResizePseudoConsole(self.pseudoconsole.raw()?, size.coord()) };
-        if result == S_OK {
-            Ok(())
-        } else {
-            Err(last_error("resize ConPTY"))
-        }
+        self.pseudoconsole.resize(size)
     }
 }
 
@@ -334,6 +329,23 @@ impl SharedPseudoConsole {
         let handle = self.0.lock().ok().and_then(|mut handle| handle.take());
         if let Some(handle) = handle {
             unsafe { ClosePseudoConsole(handle) };
+        }
+    }
+
+    fn resize(&self, size: PtySize) -> Result<(), String> {
+        let handle = self
+            .0
+            .lock()
+            .map_err(|_| "lock ConPTY handle".to_string())?;
+        let handle = handle
+            .as_ref()
+            .copied()
+            .ok_or_else(|| "ConPTY process has exited".to_string())?;
+        let result = unsafe { ResizePseudoConsole(handle, size.coord()) };
+        if result == S_OK {
+            Ok(())
+        } else {
+            Err(hresult_error("resize ConPTY", result))
         }
     }
 }
@@ -589,4 +601,8 @@ fn write_handle(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
 
 fn last_error(operation: &str) -> String {
     format!("{operation}: {}", io::Error::last_os_error())
+}
+
+fn hresult_error(operation: &str, result: i32) -> String {
+    format!("{operation}: HRESULT 0x{:08X}", result as u32)
 }
