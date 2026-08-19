@@ -15,9 +15,10 @@ live shell, the platform process transport, Ghostty terminal state, input,
 resize, snapshots, events, and cleanup. Neither PTY bytes nor raw Ghostty C
 types escape to the view.
 
-The current transport implementation uses Unix PTYs on macOS/Linux and ConPTY
-on Windows through `portable-pty`. That dependency remains an internal adapter
-so Windows can move to a dedicated implementation without changing callers.
+The current transport implementation uses `portable-pty` only for Unix PTYs on
+macOS/Linux. Windows uses a project-owned ConPTY adapter over the supported
+Windows API. Both remain internal adapters behind the same Terminal Session
+interface.
 
 ## Pinned inputs
 
@@ -41,20 +42,20 @@ cargo run
 ## Verdict
 
 The foundation is viable, with one important qualification: lock GPUI and
-`libghostty-vt`, but keep the process transport behind an interface rather than
-locking `portable-pty` as the production Windows implementation.
+`libghostty-vt`, and keep each process transport behind the project-owned
+Terminal Session interface.
 
 | Platform | GPUI window | `libghostty-vt` link/render | Process transport | Result |
 | --- | --- | --- | --- | --- |
 | Linux x64 | Native Vulkan/X11 window | ANSI color, Unicode, resize, and cell snapshots passed | Native Unix PTY input/output passed | Green |
 | macOS arm64 | Native Metal window | Same pinned library and GPUI renderer passed | Native Unix PTY input/output passed | Green |
-| Windows x64 | Native GPUI window | MSVC build plus ANSI/Unicode/resize executable smoke passed | ConPTY process starts, but this spike did not receive its byte stream in the scheduled desktop launch | Yellow |
+| Windows x64 | Native GPUI window | MSVC build plus ANSI/Unicode/resize executable smoke passed | Project-owned ConPTY input/output, resize, and live shell round trip passed | Green |
 
-The Windows result does not block the architecture. It reinforces the planned
-seam: a resident core owns terminals and exposes a narrow byte-stream/resize/
-lifecycle protocol; platform adapters own Unix PTY or ConPTY details. T3 Code
-uses the same broad split (`libghostty-vt` semantics plus an independently
-owned PTY layer), while mightty is the closest native Rust/GPUI precedent.
+The Windows implementation validates the planned seam: a resident core owns
+terminals and exposes a narrow byte-stream/resize/lifecycle protocol; platform
+adapters own Unix PTY or ConPTY details. T3 Code uses the same broad split
+(`libghostty-vt` semantics plus an independently owned PTY layer), while
+mightty is the closest native Rust/GPUI precedent.
 
 ## Remaining vertical-slice work
 

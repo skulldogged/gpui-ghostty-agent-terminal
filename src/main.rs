@@ -7,6 +7,8 @@ mod terminal_session;
 mod gui;
 #[cfg(feature = "gui")]
 mod pty;
+#[cfg(all(feature = "gui", windows))]
+mod windows_pty;
 
 fn main() {
     #[cfg(feature = "gui")]

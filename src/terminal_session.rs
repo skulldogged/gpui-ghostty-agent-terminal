@@ -1,5 +1,7 @@
-use crate::{ghostty, pty::PtySession};
-use portable_pty::PtySize;
+use crate::{
+    ghostty,
+    pty::{PtySession, PtySize},
+};
 
 /// The complete geometry shared by the VT engine and the platform PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -6,12 +6,23 @@ publish = false
 
 [features]
 default = ["gui"]
-gui = ["dep:flume", "dep:gpui", "dep:portable-pty"]
+gui = ["dep:flume", "dep:gpui", "dep:portable-pty", "dep:windows-sys"]
 
 [dependencies]
 flume = { version = "0.12", optional = true }
 gpui = { version = "0.2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
 portable-pty = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [build-dependencies]
 cc = "1"
