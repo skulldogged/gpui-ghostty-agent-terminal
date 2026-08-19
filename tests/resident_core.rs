@@ -52,20 +52,32 @@ fn snapshots_report_revisions_and_terminal_exit() {
         CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
 
     let initial = client.snapshot().expect("take initial snapshot");
+    let initial = wait_for_idle_snapshot(&mut client, initial);
     assert_eq!(initial.lifecycle, TerminalLifecycle::Running);
-    assert!(
-        client
-            .snapshot_since(initial.revision)
-            .expect("check unchanged Terminal Session")
-            .is_none(),
-        "an idle Terminal Session should not rebuild an unchanged snapshot"
-    );
 
     client.input(b"exit\r").expect("exit terminal shell");
     let exited = wait_for_snapshot_after(&mut client, initial.revision);
     assert_eq!(exited.lifecycle, TerminalLifecycle::Exited);
     client.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
+}
+
+fn wait_for_idle_snapshot(
+    client: &mut CoreClient,
+    mut snapshot: agent_terminal::TerminalSnapshot,
+) -> agent_terminal::TerminalSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        match client
+            .snapshot_since(snapshot.revision)
+            .expect("check Terminal Session revision")
+        {
+            Some(changed) => snapshot = changed,
+            None => return snapshot,
+        }
+    }
+    panic!("Terminal Session did not reach an unchanged revision before timeout");
 }
 
 #[cfg(unix)]
