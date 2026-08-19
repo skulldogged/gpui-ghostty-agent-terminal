@@ -177,7 +177,7 @@ impl TerminalSession {
 
     #[cfg(test)]
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
-        self.drain_output()?;
+        let _changed = self.drain_output()?;
         self.snapshot_current()
     }
 
@@ -185,11 +185,12 @@ impl TerminalSession {
         self.terminal.snapshot()
     }
 
-    pub(crate) fn drain_pending_output(&mut self) -> Result<(), String> {
+    pub(crate) fn drain_pending_output(&mut self) -> Result<bool, String> {
         self.drain_output()
     }
 
-    fn drain_output(&mut self) -> Result<(), String> {
+    fn drain_output(&mut self) -> Result<bool, String> {
+        let mut changed = false;
         loop {
             let message = self
                 .output
@@ -197,12 +198,15 @@ impl TerminalSession {
                 .expect("Terminal Session output is available before drop")
                 .try_recv();
             match message {
-                Ok(PtyOutput::Bytes(bytes)) => self.terminal.feed(&bytes),
+                Ok(PtyOutput::Bytes(bytes)) => {
+                    self.terminal.feed(&bytes);
+                    changed = true;
+                }
                 Ok(PtyOutput::Paused) => {
                     return Err("terminal reader paused outside a resize barrier".into());
                 }
                 Err(flume::TryRecvError::Empty | flume::TryRecvError::Disconnected) => {
-                    return Ok(());
+                    return Ok(changed);
                 }
             }
         }

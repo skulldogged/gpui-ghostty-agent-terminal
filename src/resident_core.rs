@@ -110,15 +110,40 @@ impl CoreEndpoint {
 
 #[cfg(unix)]
 fn private_runtime_directory() -> io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let effective_user = unsafe { libc::geteuid() };
-    let directory = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("agent-terminal-{effective_user}")))
-        .join("agent-terminal");
-    std::fs::create_dir_all(&directory)?;
-    let metadata = std::fs::symlink_metadata(&directory)?;
+    let parent = if let Some(runtime_directory) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let runtime_directory = std::path::PathBuf::from(runtime_directory);
+        verify_owned_directory(&runtime_directory, effective_user)?;
+        runtime_directory
+    } else {
+        let fallback = std::env::temp_dir().join(format!("agent-terminal-{effective_user}"));
+        create_owned_directory(&fallback, effective_user)?;
+        fallback
+    };
+    let directory = parent.join("agent-terminal");
+    create_owned_directory(&directory, effective_user)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn create_owned_directory(directory: &std::path::Path, effective_user: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    verify_owned_directory(directory, effective_user)?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    verify_owned_directory(directory, effective_user)
+}
+
+#[cfg(unix)]
+fn verify_owned_directory(directory: &std::path::Path, effective_user: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(directory)?;
     if !metadata.file_type().is_dir() || metadata.uid() != effective_user {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -128,8 +153,7 @@ fn private_runtime_directory() -> io::Result<std::path::PathBuf> {
             ),
         ));
     }
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    Ok(directory)
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -282,10 +306,7 @@ impl CoreClient {
                         connection: BufReader::new(stream),
                     };
                     let nonce = random_bytes::<AUTH_NONCE_BYTES>()?;
-                    match client.request(Request::Hello {
-                        version: PROTOCOL_VERSION,
-                        nonce,
-                    })? {
+                    match client.handshake(nonce, deadline)? {
                         Response::Ready {
                             version: PROTOCOL_VERSION,
                             proof,
@@ -383,6 +404,109 @@ impl CoreClient {
             .map_err(|error| format!("receive Resident Core response: {error}"))?
             .ok_or_else(|| "Resident Core disconnected before responding".into())
     }
+
+    fn handshake(
+        &mut self,
+        nonce: [u8; AUTH_NONCE_BYTES],
+        deadline: Instant,
+    ) -> Result<Response, String> {
+        write_message(
+            self.connection.get_mut(),
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+                nonce,
+            },
+        )
+        .map_err(|error| format!("send Resident Core handshake: {error}"))?;
+        read_handshake_response(&mut self.connection, deadline)
+            .map_err(|error| format!("receive Resident Core handshake: {error}"))?
+            .ok_or_else(|| "Resident Core disconnected during handshake".into())
+    }
+}
+
+#[cfg(unix)]
+fn read_handshake_response(
+    connection: &mut BufReader<LocalSocketStream>,
+    _deadline: Instant,
+) -> io::Result<Option<Response>> {
+    read_message(connection)
+}
+
+#[cfg(windows)]
+fn read_handshake_response(
+    connection: &mut BufReader<LocalSocketStream>,
+    deadline: Instant,
+) -> io::Result<Option<Response>> {
+    read_windows_message_until(connection, deadline)
+}
+
+#[cfg(windows)]
+fn read_windows_message_until<T: DeserializeOwned>(
+    reader: &mut BufReader<LocalSocketStream>,
+    deadline: Instant,
+) -> io::Result<Option<T>> {
+    let mut bytes = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Resident Core handshake deadline elapsed",
+            ));
+        }
+
+        let available = windows_available_bytes(reader.get_ref())?;
+        if available > 0 {
+            let remaining_capacity = (MAX_MESSAGE_BYTES + 1 - bytes.len() as u64) as usize;
+            let mut chunk = vec![0_u8; available.min(remaining_capacity).min(8 * 1024)];
+            let read = std::io::Read::read(reader.get_mut(), &mut chunk)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.len() as u64 > MAX_MESSAGE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Resident Core protocol message exceeds 16 MiB",
+                ));
+            }
+            if bytes.last() == Some(&b'\n') {
+                return serde_json::from_slice(&bytes)
+                    .map(Some)
+                    .map_err(io::Error::other);
+            }
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn windows_available_bytes(stream: &LocalSocketStream) -> io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let LocalSocketStream::NamedPipe(stream) = stream;
+    let handle = stream.inner().as_raw_handle();
+    let mut available = 0;
+    let result = unsafe {
+        PeekNamedPipe(
+            handle,
+            null_mut(),
+            0,
+            null_mut(),
+            &mut available,
+            null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available as usize)
+    }
 }
 
 #[cfg(unix)]
@@ -404,9 +528,8 @@ fn configure_stream_timeouts(
     _stream: &LocalSocketStream,
     _timeout: Option<Duration>,
 ) -> Result<(), String> {
-    // Windows named pipes do not support the socket-style I/O timeouts exposed
-    // by interprocess. The deadline still bounds retries while waiting for the
-    // named pipe to appear; once connected, protocol requests are blocking.
+    // Windows named pipes do not support socket-style I/O timeouts. The
+    // handshake reader polls available bytes and enforces the deadline itself.
     Ok(())
 }
 
@@ -623,17 +746,26 @@ fn refresh_terminal_state(
     revision: &mut u64,
     lifecycle: &mut TerminalLifecycle,
 ) {
-    if let Err(error) = session.drain_pending_output() {
-        *lifecycle = TerminalLifecycle::Failed(error);
-        *revision = revision.saturating_add(1);
+    match session.drain_pending_output() {
+        Ok(true) => *revision = revision.saturating_add(1),
+        Ok(false) => {}
+        Err(error) => {
+            *lifecycle = TerminalLifecycle::Failed(error);
+            *revision = revision.saturating_add(1);
+        }
     }
     while let Some(event) = events.try_recv() {
         match event {
             TerminalEvent::Changed => {}
-            TerminalEvent::Exited => *lifecycle = TerminalLifecycle::Exited,
-            TerminalEvent::Failed(error) => *lifecycle = TerminalLifecycle::Failed(error),
+            TerminalEvent::Exited => {
+                *lifecycle = TerminalLifecycle::Exited;
+                *revision = revision.saturating_add(1);
+            }
+            TerminalEvent::Failed(error) => {
+                *lifecycle = TerminalLifecycle::Failed(error);
+                *revision = revision.saturating_add(1);
+            }
         }
-        *revision = revision.saturating_add(1);
     }
 }
 
@@ -962,5 +1094,29 @@ mod tests {
         assert!(verify_server_proof(&other_secret, &endpoint, &nonce, &proof).is_err());
         assert!(verify_server_proof(&secret, &other_endpoint, &nonce, &proof).is_err());
         assert!(verify_server_proof(&secret, &endpoint, &other_nonce, &proof).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_handshake_deadline_survives_a_silent_named_pipe() {
+        use super::{CoreClient, bind_listener};
+        use interprocess::local_socket::traits::Listener;
+        use std::time::{Duration, Instant};
+
+        let endpoint =
+            CoreEndpoint::for_profile(&format!("silent-handshake-{}", std::process::id())).unwrap();
+        let listener = bind_listener(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let _connection = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+
+        let started = Instant::now();
+        let error = CoreClient::connect(&endpoint, Duration::from_millis(50))
+            .err()
+            .expect("silent named pipe must not complete the handshake");
+        assert!(error.contains("deadline elapsed"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
     }
 }
