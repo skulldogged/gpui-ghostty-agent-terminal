@@ -6,12 +6,23 @@ pub struct PtySize {
     pub pixel_height: u16,
 }
 
+pub(crate) fn send_or_shutdown<T>(
+    sender: &flume::Sender<T>,
+    shutdown: &flume::Receiver<()>,
+    value: T,
+) -> bool {
+    flume::Selector::new()
+        .send(sender, value, |result| result.is_ok())
+        .recv(shutdown, |_| false)
+        .wait()
+}
+
 #[cfg(windows)]
 pub use crate::windows_pty::PtySession;
 
 #[cfg(unix)]
 mod unix {
-    use super::PtySize;
+    use super::{PtySize, send_or_shutdown};
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
         Child, CommandBuilder, MasterPty, PtySize as PortablePtySize, native_pty_system,
@@ -22,6 +33,7 @@ mod unix {
         _master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         child: Box<dyn Child + Send>,
+        shutdown: Option<flume::Sender<()>>,
     }
 
     impl PtySession {
@@ -52,6 +64,7 @@ mod unix {
                 .take_writer()
                 .map_err(|error| format!("take PTY writer: {error}"))?;
             let (output_tx, output_rx) = flume::bounded(256);
+            let (shutdown_tx, shutdown_rx) = flume::bounded(1);
 
             std::thread::Builder::new()
                 .name("terminal-pty-reader".into())
@@ -60,20 +73,32 @@ mod unix {
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => {
-                                let _ = events.send(TerminalEvent::Exited);
+                                let _ =
+                                    send_or_shutdown(&events, &shutdown_rx, TerminalEvent::Exited);
                                 break;
                             }
-                            Ok(read) if output_tx.send(buffer[..read].to_vec()).is_err() => break,
+                            Ok(read)
+                                if !send_or_shutdown(
+                                    &output_tx,
+                                    &shutdown_rx,
+                                    buffer[..read].to_vec(),
+                                ) =>
+                            {
+                                break;
+                            }
                             Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
                             Ok(_) => {}
                             Err(error) if is_normal_pty_exit(&error) => {
-                                let _ = events.send(TerminalEvent::Exited);
+                                let _ =
+                                    send_or_shutdown(&events, &shutdown_rx, TerminalEvent::Exited);
                                 break;
                             }
                             Err(error) => {
-                                let _ = events.send(TerminalEvent::Failed(format!(
-                                    "PTY read stopped: {error}"
-                                )));
+                                let _ = send_or_shutdown(
+                                    &events,
+                                    &shutdown_rx,
+                                    TerminalEvent::Failed(format!("PTY read stopped: {error}")),
+                                );
                                 break;
                             }
                         }
@@ -86,6 +111,7 @@ mod unix {
                     _master: pair.master,
                     writer,
                     child,
+                    shutdown: Some(shutdown_tx),
                 },
                 output_rx,
             ))
@@ -107,6 +133,7 @@ mod unix {
 
     impl Drop for PtySession {
         fn drop(&mut self) {
+            drop(self.shutdown.take());
             let _ = self.child.kill();
         }
     }
@@ -152,3 +179,16 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::PtySession;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shutdown_cancels_a_blocked_worker_send() {
+        let (events, _event_receiver) = flume::bounded(1);
+        events.send(()).expect("fill worker queue");
+        let (shutdown, shutdown_receiver) = flume::bounded::<()>(1);
+        drop(shutdown);
+
+        assert!(!super::send_or_shutdown(&events, &shutdown_receiver, ()));
+    }
+}

@@ -109,6 +109,11 @@ impl TerminalSession {
             return Ok(());
         }
 
+        // Bytes already queued by the transport were produced under the old
+        // process geometry. Feed them before changing either side so Ghostty
+        // interprets their wrapping and cursor movement at that geometry.
+        self.drain_output();
+
         let previous_size = self.size;
         self.terminal.resize(
             size.cols,
@@ -135,6 +140,11 @@ impl TerminalSession {
     }
 
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
+        self.drain_output();
+        self.terminal.snapshot()
+    }
+
+    fn drain_output(&mut self) {
         let output = self
             .output
             .as_ref()
@@ -142,7 +152,6 @@ impl TerminalSession {
         while let Ok(bytes) = output.try_recv() {
             self.terminal.feed(&bytes);
         }
-        self.terminal.snapshot()
     }
 }
 

@@ -1,4 +1,7 @@
-use crate::{pty::PtySize, terminal_session::TerminalEvent};
+use crate::{
+    pty::{PtySize, send_or_shutdown},
+    terminal_session::TerminalEvent,
+};
 use std::{
     alloc::{Layout, alloc, dealloc},
     ffi::{OsStr, OsString, c_void},
@@ -205,17 +208,6 @@ impl Drop for PtySession {
             TerminateProcess(self.process.raw(), 0);
         }
     }
-}
-
-fn send_or_shutdown<T>(
-    sender: &flume::Sender<T>,
-    shutdown: &flume::Receiver<()>,
-    value: T,
-) -> bool {
-    flume::Selector::new()
-        .send(sender, value, |result| result.is_ok())
-        .recv(shutdown, |_| false)
-        .wait()
 }
 
 impl PtySize {
@@ -546,17 +538,4 @@ fn write_handle(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
 
 fn last_error(operation: &str) -> String {
     format!("{operation}: {}", io::Error::last_os_error())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn shutdown_cancels_a_blocked_worker_send() {
-        let (events, _event_receiver) = flume::bounded(1);
-        events.send(()).expect("fill worker queue");
-        let (shutdown, shutdown_receiver) = flume::bounded::<()>(1);
-        drop(shutdown);
-
-        assert!(!super::send_or_shutdown(&events, &shutdown_receiver, ()));
-    }
 }
