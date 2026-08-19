@@ -31,7 +31,7 @@ fn terminal_session_survives_ui_client_disconnect_and_reconnect() {
         .arg(endpoint.argument())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn Resident Core process");
     let mut core = ChildGuard(child);
