@@ -1,0 +1,1 @@
+# gpui-ghostty-agent-terminal
