@@ -5,9 +5,9 @@ use crate::{
     terminal_grid::{CellMetrics, GridDimensions, measured_cell_height},
 };
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Pixels, Render,
-    SharedString, Task, TextRun, Window, WindowBounds, WindowOptions, canvas, div, fill, font,
-    point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Pixels,
+    Render, SharedString, Task, TextRun, Window, WindowBounds, WindowOptions, canvas, div, fill,
+    font, point, prelude::*, px, rgb, size,
 };
 use std::time::Duration;
 
@@ -217,32 +217,34 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = &event.keystroke;
-        let bytes = if key.modifiers.control && key.key.len() == 1 {
-            let byte = key.key.as_bytes()[0].to_ascii_uppercase();
-            (b'@'..=b'_').contains(&byte).then(|| vec![byte - b'@'])
-        } else if key.modifiers.platform || key.modifiers.alt {
-            None
-        } else {
-            match key.key.as_str() {
-                "enter" => Some(vec![b'\r']),
-                "backspace" => Some(vec![0x7f]),
-                "tab" => Some(vec![b'\t']),
-                "escape" => Some(vec![0x1b]),
-                "up" => Some(b"\x1b[A".to_vec()),
-                "down" => Some(b"\x1b[B".to_vec()),
-                "right" => Some(b"\x1b[C".to_vec()),
-                "left" => Some(b"\x1b[D".to_vec()),
-                _ => key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
-            }
-        };
-
-        if let Some(bytes) = bytes {
+        if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
             if let Err(error) = self.driver.input(bytes) {
                 self.terminal_error = Some(error);
                 cx.notify();
             }
             cx.stop_propagation();
+        }
+    }
+}
+
+fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
+    if key.modifiers.control && key.key.len() == 1 {
+        let byte = key.key.as_bytes()[0].to_ascii_uppercase();
+        (b'@'..=b'_').contains(&byte).then(|| vec![byte - b'@'])
+    } else if key.modifiers.platform || key.modifiers.alt {
+        None
+    } else {
+        match key.key.as_str() {
+            "enter" => Some(vec![b'\r']),
+            "space" => Some(vec![b' ']),
+            "backspace" => Some(vec![0x7f]),
+            "tab" => Some(vec![b'\t']),
+            "escape" => Some(vec![0x1b]),
+            "up" => Some(b"\x1b[A".to_vec()),
+            "down" => Some(b"\x1b[B".to_vec()),
+            "right" => Some(b"\x1b[C".to_vec()),
+            "left" => Some(b"\x1b[D".to_vec()),
+            _ => key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
         }
     }
 }
@@ -391,4 +393,21 @@ impl Render for TerminalView {
 
 fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
     rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_input_bytes;
+    use gpui::Keystroke;
+
+    #[test]
+    fn named_space_key_maps_to_ascii_space_without_a_key_char() {
+        let key = Keystroke {
+            key: "space".into(),
+            key_char: None,
+            ..Default::default()
+        };
+
+        assert_eq!(terminal_input_bytes(&key), Some(vec![b' ']));
+    }
 }
