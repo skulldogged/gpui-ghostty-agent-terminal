@@ -1,5 +1,6 @@
 use super::{
-    MAX_MESSAGE_BYTES, Request, Response, TerminalCell, TerminalLifecycle, TerminalUpdate,
+    MAX_MESSAGE_BYTES, Request, Response, TerminalCell, TerminalChange, TerminalLifecycle,
+    TerminalUpdate,
 };
 use std::io::{self, Read, Write};
 
@@ -12,6 +13,7 @@ const RESPONSE_READY: u8 = 1;
 const RESPONSE_ACK: u8 = 2;
 const RESPONSE_SNAPSHOT: u8 = 3;
 const RESPONSE_ERROR: u8 = 4;
+const RESPONSE_TERMINAL_CHANGED: u8 = 5;
 
 pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
@@ -102,6 +104,11 @@ pub(super) fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
                 None => payload.push(0),
             }
         }
+        Response::TerminalChanged(change) => {
+            payload.push(RESPONSE_TERMINAL_CHANGED);
+            payload.extend_from_slice(&change.sequence.to_le_bytes());
+            payload.extend_from_slice(&change.terminal_revision.to_le_bytes());
+        }
         Response::Error(error) => {
             payload.push(RESPONSE_ERROR);
             put_string(&mut payload, error)?;
@@ -124,6 +131,10 @@ pub(super) fn decode_response(frame: &[u8]) -> io::Result<Response> {
             _ => return Err(invalid("invalid Snapshot presence flag")),
         }),
         RESPONSE_ERROR => Response::Error(decoder.string()?.to_owned()),
+        RESPONSE_TERMINAL_CHANGED => Response::TerminalChanged(TerminalChange {
+            sequence: decoder.u64()?,
+            terminal_revision: decoder.u64()?,
+        }),
         _ => return Err(invalid("unknown Resident Core response kind")),
     };
     decoder.finish()?;
@@ -423,7 +434,7 @@ mod tests {
         write_response,
     };
     use crate::resident_core::{
-        Request, Response, TerminalCell, TerminalLifecycle, TerminalUpdate,
+        Request, Response, TerminalCell, TerminalChange, TerminalLifecycle, TerminalUpdate,
     };
     use crate::terminal_session::TerminalSize;
 
@@ -506,6 +517,10 @@ mod tests {
             Response::Ack,
             Response::Snapshot(None),
             Response::Snapshot(Some(snapshot)),
+            Response::TerminalChanged(TerminalChange {
+                sequence: 23,
+                terminal_revision: 42,
+            }),
             Response::Error("failed: λ".into()),
         ];
 

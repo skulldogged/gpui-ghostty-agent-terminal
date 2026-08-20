@@ -2,6 +2,7 @@ use crate::{
     ghostty,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
+use interprocess::TryClone;
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
@@ -18,16 +19,20 @@ use std::io::Read;
 use std::{
     io::{self, BufReader, Write},
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 mod wire;
 
-// Version 2 replaces JSON with binary dirty-row updates and carries each
-// cell's display width. An old core must fail the handshake rather than let a
-// new UI interpret an incompatible terminal grid.
-const PROTOCOL_VERSION: u16 = 2;
+// Version 3 adds coalescible server-pushed terminal invalidations to the
+// binary dirty-row protocol. An old core must fail the handshake rather than
+// let a new UI misinterpret unsolicited frames as command responses.
+const PROTOCOL_VERSION: u16 = 3;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_TICK: Duration = Duration::from_millis(10);
 const AUTH_SECRET_BYTES: usize = 32;
@@ -313,9 +318,16 @@ fn verify_server_proof(
         .map_err(|_| "Resident Core authentication failed".to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalChange {
+    pub sequence: u64,
+    pub terminal_revision: u64,
+}
+
 pub struct CoreClient {
     connection: BufReader<LocalSocketStream>,
     snapshot: Option<TerminalSnapshot>,
+    pending_terminal_change: Option<TerminalChange>,
 }
 
 impl CoreClient {
@@ -338,6 +350,7 @@ impl CoreClient {
                     let mut client = Self {
                         connection: BufReader::new(stream),
                         snapshot: None,
+                        pending_terminal_change: None,
                     };
                     let nonce = random_bytes::<AUTH_NONCE_BYTES>()?;
                     match client.handshake(nonce, deadline)? {
@@ -447,12 +460,48 @@ impl CoreClient {
         }
     }
 
+    pub fn wait_for_terminal_change(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<TerminalChange>, String> {
+        if let Some(change) = self.pending_terminal_change.take() {
+            return Ok(Some(change));
+        }
+
+        let response = read_response_with_timeout(&mut self.connection, timeout);
+        match response {
+            Ok(Some(Response::TerminalChanged(change))) => Ok(Some(change)),
+            Ok(Some(response)) => Err(format!(
+                "Resident Core sent a command response while no command was pending: {response:?}"
+            )),
+            Ok(None) => {
+                Err("Resident Core disconnected while waiting for a terminal change".into())
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(format!("wait for Resident Core terminal change: {error}")),
+        }
+    }
+
     fn request(&mut self, request: Request) -> Result<Response, String> {
         wire::write_request(self.connection.get_mut(), &request)
             .map_err(|error| format!("send Resident Core command: {error}"))?;
-        wire::read_response(&mut self.connection)
-            .map_err(|error| format!("receive Resident Core response: {error}"))?
-            .ok_or_else(|| "Resident Core disconnected before responding".into())
+        loop {
+            let response = wire::read_response(&mut self.connection)
+                .map_err(|error| format!("receive Resident Core response: {error}"))?
+                .ok_or_else(|| "Resident Core disconnected before responding".to_string())?;
+            match response {
+                // A snapshot is authoritative, so only the newest wake hint matters.
+                Response::TerminalChanged(change) => self.pending_terminal_change = Some(change),
+                response => return Ok(response),
+            }
+        }
     }
 
     fn accept_update(&mut self, update: TerminalUpdate) -> Result<TerminalSnapshot, String> {
@@ -491,6 +540,30 @@ impl CoreClient {
 }
 
 #[cfg(unix)]
+fn read_response_with_timeout(
+    connection: &mut BufReader<LocalSocketStream>,
+    timeout: Duration,
+) -> io::Result<Option<Response>> {
+    connection
+        .get_ref()
+        .set_recv_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+    let response = wire::read_response(connection);
+    let clear_result = connection.get_ref().set_recv_timeout(None);
+    match (response, clear_result) {
+        (result, Ok(())) => result,
+        (_, Err(error)) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn read_response_with_timeout(
+    connection: &mut BufReader<LocalSocketStream>,
+    timeout: Duration,
+) -> io::Result<Option<Response>> {
+    read_windows_response_until(connection, Instant::now() + timeout)
+}
+
+#[cfg(unix)]
 fn read_handshake_response(
     connection: &mut BufReader<LocalSocketStream>,
     deadline: Instant,
@@ -508,7 +581,7 @@ fn read_response_until<R: Read>(reader: &mut R, deadline: Instant) -> io::Result
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Resident Core handshake deadline elapsed",
+                "Resident Core response deadline elapsed",
             ));
         }
 
@@ -521,7 +594,7 @@ fn read_response_until<R: Read>(reader: &mut R, deadline: Instant) -> io::Result
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "Resident Core disconnected inside its handshake frame",
+                    "Resident Core disconnected inside its response frame",
                 ));
             }
             Ok(read) => {
@@ -544,7 +617,7 @@ fn read_response_until<R: Read>(reader: &mut R, deadline: Instant) -> io::Result
                     if bytes.len() > expected_len {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "Resident Core handshake contains trailing frame bytes",
+                            "Resident Core response contains trailing frame bytes",
                         ));
                     }
                 }
@@ -586,7 +659,7 @@ fn read_windows_response_until(
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Resident Core handshake deadline elapsed",
+                "Resident Core response deadline elapsed",
             ));
         }
 
@@ -617,7 +690,7 @@ fn read_windows_response_until(
                 if bytes.len() > expected_len {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Resident Core handshake contains trailing frame bytes",
+                        "Resident Core response contains trailing frame bytes",
                     ));
                 }
             }
@@ -885,6 +958,7 @@ enum Response {
     Ready { version: u16, proof: [u8; 32] },
     Ack,
     Snapshot(Option<TerminalUpdate>),
+    TerminalChanged(TerminalChange),
     Error(String),
 }
 
@@ -908,12 +982,35 @@ struct WorkerCommand {
 
 struct ResidentCore {
     commands: flume::Sender<WorkerCommand>,
+    subscribers: Arc<Mutex<Vec<TerminalSubscriber>>>,
+    next_subscriber_id: AtomicU64,
+}
+
+struct TerminalSubscriber {
+    id: u64,
+    sender: flume::Sender<TerminalChange>,
+}
+
+struct TerminalSubscription {
+    id: u64,
+    subscribers: Arc<Mutex<Vec<TerminalSubscriber>>>,
+}
+
+impl Drop for TerminalSubscription {
+    fn drop(&mut self) {
+        self.subscribers
+            .lock()
+            .expect("Resident Core subscriber mutex poisoned")
+            .retain(|subscriber| subscriber.id != self.id);
+    }
 }
 
 impl ResidentCore {
     fn start() -> Result<Self, String> {
         let (commands_tx, commands_rx) = flume::bounded::<WorkerCommand>(32);
         let (ready_tx, ready_rx) = flume::bounded(1);
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let worker_subscribers = Arc::clone(&subscribers);
         thread::Builder::new()
             .name("resident-core-terminal".into())
             .spawn(move || {
@@ -931,12 +1028,18 @@ impl ResidentCore {
                 let mut revision = 0_u64;
                 let mut lifecycle = TerminalLifecycle::Running;
                 let mut last_snapshot_revision = None;
+                let mut event_sequence = 0_u64;
 
                 loop {
+                    let revision_before_refresh = revision;
                     refresh_terminal_state(&mut session, &events, &mut revision, &mut lifecycle);
+                    if revision != revision_before_refresh {
+                        publish_terminal_change(&worker_subscribers, &mut event_sequence, revision);
+                    }
                     match commands_rx.recv_timeout(SESSION_TICK) {
                         Ok(command) => {
                             let stop = matches!(command.request, WorkerRequest::Stop);
+                            let revision_before_command = revision;
                             let result = match command.request {
                                 WorkerRequest::Attach => {
                                     last_snapshot_revision = None;
@@ -976,6 +1079,13 @@ impl ResidentCore {
                                 }
                                 WorkerRequest::Stop => Ok(WorkerResponse::Ack),
                             };
+                            if revision != revision_before_command {
+                                publish_terminal_change(
+                                    &worker_subscribers,
+                                    &mut event_sequence,
+                                    revision,
+                                );
+                            }
                             let _ = command.response.send(result);
                             if stop {
                                 break;
@@ -992,7 +1102,25 @@ impl ResidentCore {
             .map_err(|_| "Resident Core terminal thread stopped during startup".to_string())??;
         Ok(Self {
             commands: commands_tx,
+            subscribers,
+            next_subscriber_id: AtomicU64::new(1),
         })
+    }
+
+    fn subscribe(&self) -> (flume::Receiver<TerminalChange>, TerminalSubscription) {
+        let (sender, receiver) = flume::bounded(1);
+        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
+        self.subscribers
+            .lock()
+            .expect("Resident Core subscriber mutex poisoned")
+            .push(TerminalSubscriber { id, sender });
+        (
+            receiver,
+            TerminalSubscription {
+                id,
+                subscribers: Arc::clone(&self.subscribers),
+            },
+        )
     }
 
     fn call(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
@@ -1007,6 +1135,27 @@ impl ResidentCore {
             .recv()
             .map_err(|_| "Resident Core terminal thread stopped before responding".to_string())?
     }
+}
+
+fn publish_terminal_change(
+    subscribers: &Arc<Mutex<Vec<TerminalSubscriber>>>,
+    sequence: &mut u64,
+    terminal_revision: u64,
+) {
+    *sequence = sequence.saturating_add(1);
+    let change = TerminalChange {
+        sequence: *sequence,
+        terminal_revision,
+    };
+    subscribers
+        .lock()
+        .expect("Resident Core subscriber mutex poisoned")
+        .retain(
+            |subscriber| match subscriber.sender.try_send(change.clone()) {
+                Ok(()) | Err(flume::TrySendError::Full(_)) => true,
+                Err(flume::TrySendError::Disconnected(_)) => false,
+            },
+        );
 }
 
 fn refresh_terminal_state(
@@ -1187,17 +1336,19 @@ fn handle_client(
     endpoint: &CoreEndpoint,
     auth_secret: &[u8; AUTH_SECRET_BYTES],
 ) -> io::Result<ClientOutcome> {
-    let mut connection = BufReader::new(stream);
+    let reader = stream.try_clone()?;
+    let writer = Arc::new(Mutex::new(stream));
+    let mut connection = BufReader::new(reader);
     let Some(Request::Hello { version, nonce }) = wire::read_request(&mut connection)? else {
-        wire::write_response(
-            connection.get_mut(),
+        write_shared_response(
+            &writer,
             &Response::Error("UI Client must begin with a protocol handshake".into()),
         )?;
         return Ok(ClientOutcome::Disconnected);
     };
     if version != PROTOCOL_VERSION {
-        wire::write_response(
-            connection.get_mut(),
+        write_shared_response(
+            &writer,
             &Response::Error(format!(
                 "Resident Core protocol mismatch: client {version}, core {PROTOCOL_VERSION}"
             )),
@@ -1205,13 +1356,26 @@ fn handle_client(
         return Ok(ClientOutcome::Disconnected);
     }
     core.call(WorkerRequest::Attach).map_err(io::Error::other)?;
-    wire::write_response(
-        connection.get_mut(),
+    write_shared_response(
+        &writer,
         &Response::Ready {
             version: PROTOCOL_VERSION,
             proof: server_proof(auth_secret, endpoint, &nonce),
         },
     )?;
+    let (changes, _subscription) = core.subscribe();
+    let change_writer = Arc::clone(&writer);
+    thread::Builder::new()
+        .name("resident-core-client-events".into())
+        .spawn(move || {
+            while let Ok(change) = changes.recv() {
+                if write_shared_response(&change_writer, &Response::TerminalChanged(change))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })?;
 
     loop {
         let Some(request) = wire::read_request(&mut connection)? else {
@@ -1243,11 +1407,21 @@ fn handle_client(
                 Some(ClientOutcome::StopResidentCore),
             ),
         };
-        wire::write_response(connection.get_mut(), &response)?;
+        write_shared_response(&writer, &response)?;
         if let Some(outcome) = outcome {
             return Ok(outcome);
         }
     }
+}
+
+fn write_shared_response(
+    writer: &Arc<Mutex<LocalSocketStream>>,
+    response: &Response,
+) -> io::Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| io::Error::other("Resident Core response writer mutex poisoned"))?;
+    wire::write_response(&mut *writer, response)
 }
 
 fn worker_response(response: Result<WorkerResponse, String>) -> Response {
