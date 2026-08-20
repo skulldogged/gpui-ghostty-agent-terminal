@@ -51,6 +51,11 @@ fn snapshots_report_revisions_and_terminal_exit() {
     let mut client =
         CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
 
+    client
+        .input(b"echo RESIDENT_CORE_REVISION_READY\r")
+        .expect("request a shell readiness marker");
+    wait_for_text(&mut client, "RESIDENT_CORE_REVISION_READY");
+
     let initial = client.snapshot().expect("take initial snapshot");
     let initial = wait_for_idle_snapshot(&mut client, initial);
     assert_eq!(initial.lifecycle, TerminalLifecycle::Running);
@@ -82,14 +87,20 @@ fn wait_for_idle_snapshot(
     mut snapshot: agent_terminal::TerminalSnapshot,
 ) -> agent_terminal::TerminalSnapshot {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let quiet_period = Duration::from_millis(100);
+    let mut quiet_since = Instant::now();
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
         match client
             .snapshot_since(snapshot.revision)
             .expect("check Terminal Session revision")
         {
-            Some(changed) => snapshot = changed,
-            None => return snapshot,
+            Some(changed) => {
+                snapshot = changed;
+                quiet_since = Instant::now();
+            }
+            None if quiet_since.elapsed() >= quiet_period => return snapshot,
+            None => {}
         }
     }
     panic!("Terminal Session did not reach an unchanged revision before timeout");
