@@ -80,7 +80,7 @@ trait TerminalTransport: Send {
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn process_id(&self) -> Option<u32> {
         None
     }
@@ -106,7 +106,7 @@ impl TerminalTransport for PtySession {
         PtySession::resume_reader(self)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn process_id(&self) -> Option<u32> {
         PtySession::process_id(self)
     }
@@ -219,7 +219,7 @@ impl TerminalSession {
         self.process.reap()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn process_id(&self) -> Option<u32> {
         self.process.process_id()
     }

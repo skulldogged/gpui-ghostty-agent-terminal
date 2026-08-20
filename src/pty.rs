@@ -198,7 +198,7 @@ mod unix {
                 .map_err(|_| "resume PTY reader: reader stopped".to_string())
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         pub fn process_id(&self) -> Option<u32> {
             self.child.as_ref().and_then(|child| child.process_id())
         }
