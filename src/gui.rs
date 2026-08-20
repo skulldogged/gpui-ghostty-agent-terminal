@@ -9,6 +9,7 @@ use gpui::{
     Render, SharedString, Task, TextRun, Window, WindowBounds, WindowOptions, canvas, div, fill,
     font, point, prelude::*, px, rgb, size,
 };
+#[cfg(windows)]
 use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 12.0;
@@ -185,28 +186,22 @@ impl TerminalView {
     }
 
     fn start_refresh_task(&mut self, cx: &mut Context<Self>) {
-        let executor = cx.background_executor().clone();
+        let updates = self.driver.updates();
         self.refresh_task = cx.spawn(async move |this, cx| {
-            loop {
-                executor.timer(Duration::from_millis(16)).await;
+            while let Some(update) = updates.next().await {
                 let Some(this) = this.upgrade() else {
                     break;
                 };
                 if this
-                    .update(cx, |view, cx| {
-                        view.driver.request_snapshot();
-                        match view.driver.latest_update() {
-                            Some(DriverUpdate::Snapshot(snapshot)) => {
+                    .update(cx, move |view, cx| {
+                        match update {
+                            DriverUpdate::Snapshot(snapshot) => {
                                 view.terminal_error = lifecycle_message(&snapshot.lifecycle);
                                 view.snapshot = snapshot;
-                                cx.notify();
                             }
-                            Some(DriverUpdate::Error(error)) => {
-                                view.terminal_error = Some(error);
-                                cx.notify();
-                            }
-                            None => {}
+                            DriverUpdate::Error(error) => view.terminal_error = Some(error),
                         }
+                        cx.notify();
                     })
                     .is_err()
                 {

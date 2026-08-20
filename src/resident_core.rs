@@ -31,10 +31,9 @@ use std::{
 
 mod wire;
 
-// Version 4 adds explicit UI Client identity and generation-checked Control
-// Lease arbitration. An old core must fail the handshake rather than accept
-// input without the current lease generation.
-const PROTOCOL_VERSION: u16 = 4;
+// Version 5 adds an explicit detach command so the client's pushed-response
+// reader can be shut down without owning Terminal Session lifetime.
+const PROTOCOL_VERSION: u16 = 5;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_TICK: Duration = Duration::from_millis(10);
 const AUTH_SECRET_BYTES: usize = 32;
@@ -374,9 +373,10 @@ impl std::fmt::Display for CoreCommandError {
 impl std::error::Error for CoreCommandError {}
 
 pub struct CoreClient {
-    connection: BufReader<LocalSocketStream>,
+    connection: LocalSocketStream,
+    responses: flume::Receiver<Result<Response, String>>,
+    terminal_changes: flume::Receiver<TerminalChange>,
     snapshot: Option<TerminalSnapshot>,
-    pending_terminal_change: Option<TerminalChange>,
     client_id: UiClientId,
     control_lease: ControlLease,
 }
@@ -398,18 +398,20 @@ impl CoreClient {
                         &stream,
                         Some(remaining.max(Duration::from_millis(1))),
                     )?;
-                    let mut client = Self {
-                        connection: BufReader::new(stream),
-                        snapshot: None,
-                        pending_terminal_change: None,
-                        client_id: UiClientId(0),
-                        control_lease: ControlLease {
-                            generation: 0,
-                            controller: None,
-                        },
-                    };
+                    let mut connection = BufReader::new(stream);
                     let nonce = random_bytes::<AUTH_NONCE_BYTES>()?;
-                    match client.handshake(nonce, deadline)? {
+                    wire::write_request(
+                        connection.get_mut(),
+                        &Request::Hello {
+                            version: PROTOCOL_VERSION,
+                            nonce,
+                        },
+                    )
+                    .map_err(|error| format!("send Resident Core handshake: {error}"))?;
+                    let handshake = read_handshake_response(&mut connection, deadline)
+                        .map_err(|error| format!("receive Resident Core handshake: {error}"))?
+                        .ok_or_else(|| "Resident Core disconnected during handshake".to_string())?;
+                    match handshake {
                         Response::Ready {
                             version: PROTOCOL_VERSION,
                             proof,
@@ -417,10 +419,35 @@ impl CoreClient {
                             lease,
                         } => {
                             verify_server_proof(&auth_secret, endpoint, &nonce, &proof)?;
-                            client.client_id = client_id;
-                            client.control_lease = lease;
-                            configure_stream_timeouts(client.connection.get_ref(), None)?;
-                            return Ok(client);
+                            configure_stream_timeouts(connection.get_ref(), None)?;
+                            let writer = connection
+                                .get_ref()
+                                .try_clone()
+                                .map_err(|error| format!("clone Resident Core stream: {error}"))?;
+                            let (responses_tx, responses_rx) = flume::unbounded();
+                            let (changes_tx, changes_rx) = flume::bounded(1);
+                            let stale_changes = changes_rx.clone();
+                            thread::Builder::new()
+                                .name("resident-core-responses".into())
+                                .spawn(move || {
+                                    read_core_responses(
+                                        connection,
+                                        responses_tx,
+                                        changes_tx,
+                                        stale_changes,
+                                    )
+                                })
+                                .map_err(|error| {
+                                    format!("spawn Resident Core response reader: {error}")
+                                })?;
+                            return Ok(Self {
+                                connection: writer,
+                                responses: responses_rx,
+                                terminal_changes: changes_rx,
+                                snapshot: None,
+                                client_id,
+                                control_lease: lease,
+                            });
                         }
                         Response::Ready { version, .. } => {
                             return Err(format!(
@@ -618,44 +645,25 @@ impl CoreClient {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<TerminalChange>, String> {
-        if let Some(change) = self.pending_terminal_change.take() {
-            return Ok(Some(change));
-        }
-
-        let response = read_response_with_timeout(&mut self.connection, timeout);
-        match response {
-            Ok(Some(Response::TerminalChanged(change))) => Ok(Some(change)),
-            Ok(Some(response)) => Err(format!(
-                "Resident Core sent a command response while no command was pending: {response:?}"
-            )),
-            Ok(None) => {
+        match self.terminal_changes.recv_timeout(timeout) {
+            Ok(change) => Ok(Some(change)),
+            Err(flume::RecvTimeoutError::Timeout) => Ok(None),
+            Err(flume::RecvTimeoutError::Disconnected) => {
                 Err("Resident Core disconnected while waiting for a terminal change".into())
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(format!("wait for Resident Core terminal change: {error}")),
         }
     }
 
+    pub(crate) fn terminal_changes(&self) -> flume::Receiver<TerminalChange> {
+        self.terminal_changes.clone()
+    }
+
     fn request(&mut self, request: Request) -> Result<Response, String> {
-        wire::write_request(self.connection.get_mut(), &request)
+        wire::write_request(&mut self.connection, &request)
             .map_err(|error| format!("send Resident Core command: {error}"))?;
-        loop {
-            let response = wire::read_response(&mut self.connection)
-                .map_err(|error| format!("receive Resident Core response: {error}"))?
-                .ok_or_else(|| "Resident Core disconnected before responding".to_string())?;
-            match response {
-                // A snapshot is authoritative, so only the newest wake hint matters.
-                Response::TerminalChanged(change) => self.pending_terminal_change = Some(change),
-                response => return Ok(response),
-            }
-        }
+        self.responses
+            .recv()
+            .map_err(|_| "Resident Core disconnected before responding".to_string())?
     }
 
     fn accept_update(&mut self, update: TerminalUpdate) -> Result<TerminalSnapshot, String> {
@@ -673,48 +681,59 @@ impl CoreClient {
             .expect("accepted update stores a snapshot")
             .clone())
     }
+}
 
-    fn handshake(
-        &mut self,
-        nonce: [u8; AUTH_NONCE_BYTES],
-        deadline: Instant,
-    ) -> Result<Response, String> {
-        wire::write_request(
-            self.connection.get_mut(),
-            &Request::Hello {
-                version: PROTOCOL_VERSION,
-                nonce,
-            },
-        )
-        .map_err(|error| format!("send Resident Core handshake: {error}"))?;
-        read_handshake_response(&mut self.connection, deadline)
-            .map_err(|error| format!("receive Resident Core handshake: {error}"))?
-            .ok_or_else(|| "Resident Core disconnected during handshake".into())
+impl Drop for CoreClient {
+    fn drop(&mut self) {
+        // The response reader owns a cloned stream. Ask the server to close its
+        // end so that reader exits and the Control Lease is released promptly.
+        let _ = wire::write_request(&mut self.connection, &Request::Detach);
     }
 }
 
-#[cfg(unix)]
-fn read_response_with_timeout(
-    connection: &mut BufReader<LocalSocketStream>,
-    timeout: Duration,
-) -> io::Result<Option<Response>> {
-    connection
-        .get_ref()
-        .set_recv_timeout(Some(timeout.max(Duration::from_millis(1))))?;
-    let response = wire::read_response(connection);
-    let clear_result = connection.get_ref().set_recv_timeout(None);
-    match (response, clear_result) {
-        (result, Ok(())) => result,
-        (_, Err(error)) => Err(error),
+fn read_core_responses(
+    mut connection: BufReader<LocalSocketStream>,
+    responses: flume::Sender<Result<Response, String>>,
+    terminal_changes: flume::Sender<TerminalChange>,
+    stale_terminal_changes: flume::Receiver<TerminalChange>,
+) {
+    loop {
+        match wire::read_response(&mut connection) {
+            Ok(Some(Response::TerminalChanged(change))) => {
+                publish_latest_terminal_change(&terminal_changes, &stale_terminal_changes, change);
+            }
+            Ok(Some(response)) => {
+                if responses.send(Ok(response)).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = responses.send(Err(
+                    "Resident Core disconnected before responding".to_string()
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(Err(format!("receive Resident Core response: {error}")));
+                return;
+            }
+        }
     }
 }
 
-#[cfg(windows)]
-fn read_response_with_timeout(
-    connection: &mut BufReader<LocalSocketStream>,
-    timeout: Duration,
-) -> io::Result<Option<Response>> {
-    read_windows_response_until(connection, Instant::now() + timeout)
+fn publish_latest_terminal_change(
+    changes: &flume::Sender<TerminalChange>,
+    stale_changes: &flume::Receiver<TerminalChange>,
+    change: TerminalChange,
+) {
+    match changes.try_send(change) {
+        Ok(()) => {}
+        Err(flume::TrySendError::Full(change)) => {
+            let _ = stale_changes.try_recv();
+            let _ = changes.try_send(change);
+        }
+        Err(flume::TrySendError::Disconnected(_)) => {}
+    }
 }
 
 #[cfg(unix)]
@@ -1114,6 +1133,7 @@ enum Request {
     AcquireControl {
         lease_generation: u64,
     },
+    Detach,
     StopResidentCore,
 }
 
@@ -1770,6 +1790,7 @@ fn handle_client(
             Request::AcquireControl { lease_generation } => {
                 (core.acquire_control(client_id, lease_generation), None)
             }
+            Request::Detach => (Response::Ack, Some(ClientOutcome::Disconnected)),
             Request::StopResidentCore => (
                 worker_response(core.call(WorkerRequest::Stop)),
                 Some(ClientOutcome::StopResidentCore),
