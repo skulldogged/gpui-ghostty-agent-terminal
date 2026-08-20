@@ -45,6 +45,44 @@ fn terminal_session_survives_ui_client_disconnect_and_reconnect() {
 }
 
 #[test]
+fn terminal_changes_wake_the_ui_client_without_snapshot_polling() {
+    let endpoint = isolated_endpoint("pushed-terminal-change");
+    let mut core = spawn_core(&endpoint);
+    let mut client =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
+    let initial = client.snapshot().expect("take initial terminal snapshot");
+
+    client
+        .input(b"echo PUSHED_TERMINAL_CHANGE\r")
+        .expect("write terminal input");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let change = loop {
+        let change = client
+            .wait_for_terminal_change(Duration::from_millis(250))
+            .expect("wait for pushed terminal invalidation");
+        if let Some(change) = change
+            && change.terminal_revision > initial.revision
+        {
+            break change;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Resident Core did not push a terminal invalidation"
+        );
+    };
+
+    let snapshot = client
+        .snapshot_since(initial.revision)
+        .expect("fetch changed terminal snapshot")
+        .expect("terminal changed after pushed invalidation");
+    assert!(snapshot.revision >= change.terminal_revision);
+    wait_for_text(&mut client, "PUSHED_TERMINAL_CHANGE");
+    client.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
 fn snapshots_report_revisions_and_terminal_exit() {
     let endpoint = isolated_endpoint("revision-lifecycle");
     let mut core = spawn_core(&endpoint);
