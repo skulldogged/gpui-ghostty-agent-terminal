@@ -8,6 +8,16 @@ The Resident Core is a separately restartable, unelevated per-user process. It o
 
 `CoreClient` is the UI-facing interface. Its adapter uses a Unix-domain local socket on macOS/Linux and a named pipe on Windows through a cross-platform local-socket implementation. The Resident Core keeps Unix sockets in an owner-verified private runtime directory and restricts peers by effective user ID; the Windows duplex pipe requires creator-authorized write access and derives its otherwise opaque name from the protected per-user secret, preventing another local user from predictably claiming the endpoint first. That 256-bit secret authenticates every server handshake with a fresh HMAC challenge before the client sends any commands. Platform transport types, raw terminal bytes, and libghostty-vt types do not cross the interface.
 
+Protocol version 2 uses one little-endian 32-bit length prefix followed by an
+explicit binary payload. Requests, acknowledgements, lifecycle state, and
+rendered cell data each have stable field encodings; Rust memory layouts are
+never copied onto the wire. A complete frame is assembled before it is written,
+which avoids turning each terminal-cell field into a separate socket write.
+Frames are rejected before allocation when their declared payload exceeds 16
+MiB. Raw PTY bytes remain inside the Resident Core and are consumed unchanged by
+libghostty-vt; the binary IPC payload represents commands and rendered state,
+not a second terminal byte stream.
+
 ## Versioning and attachment
 
 - Every connection begins with a protocol-version and authenticated challenge-response handshake. An incompatible major version or invalid server proof fails closed with a useful error. Connect timeouts cover endpoint discovery and this handshake only; established Unix connections clear that temporary socket timeout before normal commands begin.

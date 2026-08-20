@@ -2,10 +2,8 @@ use crate::{
     ghostty,
     pty::{PtyOutput, PtySession, PtySize},
 };
-use serde::{Deserialize, Serialize};
-
 /// The complete geometry shared by the VT engine and the platform PTY.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize {
     pub cols: u16,
     pub rows: u16,

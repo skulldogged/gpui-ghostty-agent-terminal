@@ -13,15 +13,16 @@ use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufReader, Write},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-const PROTOCOL_VERSION: u16 = 1;
+mod wire;
+
+const PROTOCOL_VERSION: u16 = 2;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_TICK: Duration = Duration::from_millis(10);
 const AUTH_SECRET_BYTES: usize = 32;
@@ -424,9 +425,9 @@ impl CoreClient {
     }
 
     fn request(&mut self, request: Request) -> Result<Response, String> {
-        write_message(self.connection.get_mut(), &request)
+        wire::write_request(self.connection.get_mut(), &request)
             .map_err(|error| format!("send Resident Core command: {error}"))?;
-        read_message(&mut self.connection)
+        wire::read_response(&mut self.connection)
             .map_err(|error| format!("receive Resident Core response: {error}"))?
             .ok_or_else(|| "Resident Core disconnected before responding".into())
     }
@@ -436,7 +437,7 @@ impl CoreClient {
         nonce: [u8; AUTH_NONCE_BYTES],
         deadline: Instant,
     ) -> Result<Response, String> {
-        write_message(
+        wire::write_request(
             self.connection.get_mut(),
             &Request::Hello {
                 version: PROTOCOL_VERSION,
@@ -455,7 +456,7 @@ fn read_handshake_response(
     connection: &mut BufReader<LocalSocketStream>,
     _deadline: Instant,
 ) -> io::Result<Option<Response>> {
-    read_message(connection)
+    wire::read_response(connection)
 }
 
 #[cfg(windows)]
@@ -463,15 +464,16 @@ fn read_handshake_response(
     connection: &mut BufReader<LocalSocketStream>,
     deadline: Instant,
 ) -> io::Result<Option<Response>> {
-    read_windows_message_until(connection, deadline)
+    read_windows_response_until(connection, deadline)
 }
 
 #[cfg(windows)]
-fn read_windows_message_until<T: DeserializeOwned>(
+fn read_windows_response_until(
     reader: &mut BufReader<LocalSocketStream>,
     deadline: Instant,
-) -> io::Result<Option<T>> {
+) -> io::Result<Option<Response>> {
     let mut bytes = Vec::new();
+    let mut expected_len = None;
     loop {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -482,23 +484,34 @@ fn read_windows_message_until<T: DeserializeOwned>(
 
         let available = windows_available_bytes(reader.get_ref())?;
         if available > 0 {
-            let remaining_capacity = (MAX_MESSAGE_BYTES + 1 - bytes.len() as u64) as usize;
+            let remaining_capacity = (MAX_MESSAGE_BYTES + 4 - bytes.len() as u64) as usize;
             let mut chunk = vec![0_u8; available.min(remaining_capacity).min(8 * 1024)];
             let read = std::io::Read::read(reader.get_mut(), &mut chunk)?;
             if read == 0 {
                 return Ok(None);
             }
             bytes.extend_from_slice(&chunk[..read]);
-            if bytes.len() as u64 > MAX_MESSAGE_BYTES {
+            if bytes.len() as u64 > MAX_MESSAGE_BYTES + 4 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Resident Core protocol message exceeds 16 MiB",
                 ));
             }
-            if bytes.last() == Some(&b'\n') {
-                return serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(io::Error::other);
+            if expected_len.is_none() && bytes.len() >= 4 {
+                expected_len = Some(wire::expected_frame_len(
+                    bytes[..4].try_into().expect("four-byte frame prefix"),
+                )?);
+            }
+            if let Some(expected_len) = expected_len {
+                if bytes.len() == expected_len {
+                    return wire::decode_response(&bytes).map(Some);
+                }
+                if bytes.len() > expected_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Resident Core handshake contains trailing frame bytes",
+                    ));
+                }
             }
         }
         thread::sleep(
@@ -559,7 +572,7 @@ fn configure_stream_timeouts(
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     pub revision: u64,
     pub lifecycle: TerminalLifecycle,
@@ -606,14 +619,14 @@ impl TerminalSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalLifecycle {
     Running,
     Exited,
     Failed(String),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalCell {
     pub x: u16,
     pub y: u16,
@@ -636,7 +649,7 @@ impl From<ghostty::Cell> for TerminalCell {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 enum Request {
     Hello {
         version: u16,
@@ -654,7 +667,7 @@ enum Request {
     StopResidentCore,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 enum Response {
     Ready { version: u16, proof: [u8; 32] },
     Ack,
@@ -953,15 +966,15 @@ fn handle_client(
     auth_secret: &[u8; AUTH_SECRET_BYTES],
 ) -> io::Result<ClientOutcome> {
     let mut connection = BufReader::new(stream);
-    let Some(Request::Hello { version, nonce }) = read_message(&mut connection)? else {
-        write_message(
+    let Some(Request::Hello { version, nonce }) = wire::read_request(&mut connection)? else {
+        wire::write_response(
             connection.get_mut(),
             &Response::Error("UI Client must begin with a protocol handshake".into()),
         )?;
         return Ok(ClientOutcome::Disconnected);
     };
     if version != PROTOCOL_VERSION {
-        write_message(
+        wire::write_response(
             connection.get_mut(),
             &Response::Error(format!(
                 "Resident Core protocol mismatch: client {version}, core {PROTOCOL_VERSION}"
@@ -969,7 +982,7 @@ fn handle_client(
         )?;
         return Ok(ClientOutcome::Disconnected);
     }
-    write_message(
+    wire::write_response(
         connection.get_mut(),
         &Response::Ready {
             version: PROTOCOL_VERSION,
@@ -978,7 +991,7 @@ fn handle_client(
     )?;
 
     loop {
-        let Some(request) = read_message::<_, Request>(&mut connection)? else {
+        let Some(request) = wire::read_request(&mut connection)? else {
             return Ok(ClientOutcome::Disconnected);
         };
         let (response, outcome) = match request {
@@ -1007,7 +1020,7 @@ fn handle_client(
                 Some(ClientOutcome::StopResidentCore),
             ),
         };
-        write_message(connection.get_mut(), &response)?;
+        wire::write_response(connection.get_mut(), &response)?;
         if let Some(outcome) = outcome {
             return Ok(outcome);
         }
@@ -1020,36 +1033,6 @@ fn worker_response(response: Result<WorkerResponse, String>) -> Response {
         Ok(WorkerResponse::Snapshot(snapshot)) => Response::Snapshot(snapshot),
         Err(error) => Response::Error(error),
     }
-}
-
-fn write_message<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, message).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
-fn read_message<R: BufRead, T: DeserializeOwned>(reader: &mut R) -> io::Result<Option<T>> {
-    let mut bytes = Vec::new();
-    let mut limited = std::io::Read::take(reader, MAX_MESSAGE_BYTES + 1);
-    let read = limited.read_until(b'\n', &mut bytes)?;
-    if read == 0 {
-        return Ok(None);
-    }
-    if bytes.len() as u64 > MAX_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Resident Core protocol message exceeds 16 MiB",
-        ));
-    }
-    if bytes.last() != Some(&b'\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Resident Core protocol message is not newline terminated",
-        ));
-    }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(io::Error::other)
 }
 
 #[cfg(unix)]
