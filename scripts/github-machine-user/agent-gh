@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONFIG_ROOT="${XDG_CONFIG_HOME:-${HOME:?HOME must be set}/.config}/codex-github-machine"
+CONFIG_FILE="$CONFIG_ROOT/setup.env"
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  printf 'agent-gh: missing configuration: %s\n' "$CONFIG_FILE" >&2
+  printf 'Run scripts/setup-github-machine-user.sh first.\n' >&2
+  exit 1
+fi
+
+# setup.env contains only the public account name, repository, email, and key
+# paths. The token itself remains in Secret Service.
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+: "${AGENT_GITHUB_USER:?missing AGENT_GITHUB_USER in $CONFIG_FILE}"
+
+LEGACY_TARGET_REPO=${TARGET_REPO:-}
+REPOSITORIES_FILE=${AGENT_GITHUB_REPOSITORIES_FILE:-$CONFIG_ROOT/repositories}
+unset TARGET_REPO
+
+if ! command -v gh >/dev/null 2>&1; then
+  printf 'agent-gh: required command not found: gh\n' >&2
+  exit 1
+fi
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TOKEN_STORE="$SCRIPT_DIR/agent-token-store"
+if [[ ! -x "$TOKEN_STORE" ]]; then
+  TOKEN_STORE="$SCRIPT_DIR/token-store"
+fi
+if [[ ! -x "$TOKEN_STORE" ]]; then
+  printf 'agent-gh: token-store helper is missing beside agent-gh\n' >&2
+  exit 1
+fi
+
+TOKEN=$("$TOKEN_STORE" lookup || true)
+
+if [[ -z "$TOKEN" ]]; then
+  printf 'agent-gh: no machine-user token found in Secret Service\n' >&2
+  exit 1
+fi
+
+unset GH_DEBUG DEBUG
+
+ACTUAL_LOGIN=$(GH_TOKEN="$TOKEN" gh api user --jq .login 2>/dev/null || true)
+if [[ "$ACTUAL_LOGIN" != "$AGENT_GITHUB_USER" ]]; then
+  printf 'agent-gh: credential identity mismatch (expected %s, got %s)\n' \
+    "$AGENT_GITHUB_USER" "${ACTUAL_LOGIN:-no authenticated user}" >&2
+  exit 1
+fi
+
+canonical_repository() {
+  local remote_url=$1 repository
+
+  case "$remote_url" in
+    https://github.com/*)
+      repository=${remote_url#https://github.com/}
+      ;;
+    git@github.com:*)
+      repository=${remote_url#git@github.com:}
+      ;;
+    ssh://git@github.com/*)
+      repository=${remote_url#ssh://git@github.com/}
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  repository=${repository%.git}
+  repository=${repository%/}
+  [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  printf '%s\n' "$repository"
+}
+
+current_repository() {
+  local remote_url repository
+
+  remote_url=$(git remote get-url origin 2>/dev/null || true)
+  repository=$(canonical_repository "$remote_url" 2>/dev/null || true)
+  if [[ -z "$repository" ]]; then
+    printf 'agent-gh: cannot identify a GitHub origin for the current checkout\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "$repository"
+}
+
+repository_is_registered() {
+  local repository=$1
+
+  if [[ -r "$REPOSITORIES_FILE" ]] && grep -Fqx -- "$repository" "$REPOSITORIES_FILE"; then
+    return 0
+  fi
+  [[ ! -e "$REPOSITORIES_FILE" && -n "$LEGACY_TARGET_REPO" && \
+     "$repository" == "$LEGACY_TARGET_REPO" ]]
+}
+
+require_registered_repository() {
+  local repository=$1
+
+  if ! repository_is_registered "$repository"; then
+    printf 'agent-gh: repository is not registered for @%s: %s\n' \
+      "$AGENT_GITHUB_USER" "$repository" >&2
+    printf 'Ask the repository owner to grant @%s write access and have the invitation accepted.\n' \
+      "$AGENT_GITHUB_USER" >&2
+    printf 'After access is active, run: agent-gh register %s\n' "$repository" >&2
+    exit 1
+  fi
+}
+
+machine_user_has_push_access() {
+  local repository=$1
+  [[ "$(GH_TOKEN="$TOKEN" gh api "repos/$repository" \
+    --jq '.permissions.push // false' 2>/dev/null || true)" == "true" ]]
+}
+
+register_repository() {
+  local repository=${1:-} temporary_file
+
+  if [[ -z "$repository" || $# -ne 1 ]] || \
+     ! [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    printf 'Usage: agent-gh register OWNER/REPOSITORY\n' >&2
+    exit 2
+  fi
+  if ! machine_user_has_push_access "$repository"; then
+    printf 'agent-gh: @%s does not have write access to %s\n' \
+      "$AGENT_GITHUB_USER" "$repository" >&2
+    printf 'Ask the repository owner to grant access and have the invitation accepted, then retry.\n' >&2
+    exit 1
+  fi
+
+  mkdir -p "$CONFIG_ROOT"
+  chmod 700 "$CONFIG_ROOT"
+  umask 077
+  temporary_file=$(mktemp "$CONFIG_ROOT/.repositories.XXXXXX")
+  cleanup_registry_temp() {
+    if [[ -n "${temporary_file:-}" && -f "$temporary_file" ]]; then
+      rm -f -- "$temporary_file"
+    fi
+  }
+  trap cleanup_registry_temp EXIT
+  if [[ -r "$REPOSITORIES_FILE" ]]; then
+    sed '/^[[:space:]]*$/d' "$REPOSITORIES_FILE" > "$temporary_file"
+  fi
+  printf '%s\n' "$repository" >> "$temporary_file"
+  sort -u -o "$temporary_file" "$temporary_file"
+  chmod 600 "$temporary_file"
+  mv "$temporary_file" "$REPOSITORIES_FILE"
+  temporary_file=""
+  printf 'Registered %s for @%s\n' "$repository" "$ACTUAL_LOGIN"
+}
+
+reject_repo_override() {
+  local expect_repo_value=false argument value url_path url_owner url_name url_repository
+
+  for argument in "$@"; do
+    if [[ "$expect_repo_value" == true ]]; then
+      if [[ "$argument" != "$TARGET_REPO" ]]; then
+        printf 'agent-gh: refusing repository override: %s\n' "$argument" >&2
+        exit 1
+      fi
+      expect_repo_value=false
+      continue
+    fi
+
+    case "$argument" in
+      -R|--repo)
+        expect_repo_value=true
+        ;;
+      --repo=*)
+        value=${argument#--repo=}
+        if [[ "$value" != "$TARGET_REPO" ]]; then
+          printf 'agent-gh: refusing repository override: %s\n' "$value" >&2
+          exit 1
+        fi
+        ;;
+      -R*)
+        value=${argument#-R}
+        if [[ -n "$value" && "$value" != "$TARGET_REPO" ]]; then
+          printf 'agent-gh: refusing repository override: %s\n' "$value" >&2
+          exit 1
+        fi
+        ;;
+      https://github.com/*)
+        url_path=${argument#https://github.com/}
+        if [[ "$url_path" == */*/* ]]; then
+          url_owner=${url_path%%/*}
+          url_path=${url_path#*/}
+          url_name=${url_path%%/*}
+          url_repository=$url_owner/${url_name%.git}
+          if [[ "$url_repository" != "$TARGET_REPO" ]]; then
+            printf 'agent-gh: refusing repository URL outside %s: %s\n' \
+              "$TARGET_REPO" "$argument" >&2
+            exit 1
+          fi
+        fi
+        ;;
+    esac
+  done
+
+  if [[ "$expect_repo_value" == true ]]; then
+    printf 'agent-gh: --repo requires the configured repository\n' >&2
+    exit 1
+  fi
+}
+
+guard_api_request() {
+  shift
+
+  local endpoint="" method="GET" explicit_method=false argument
+  while (( $# )); do
+    argument=$1
+    case "$argument" in
+      -X|--method)
+        shift
+        [[ $# -gt 0 ]] || { printf 'agent-gh: missing API method\n' >&2; exit 1; }
+        method=${1^^}
+        explicit_method=true
+        ;;
+      --method=*)
+        method=${argument#--method=}
+        method=${method^^}
+        explicit_method=true
+        ;;
+      -f|-F|--field|--raw-field|--input)
+        if [[ "$explicit_method" == false ]]; then
+          method="POST"
+        fi
+        shift
+        [[ $# -gt 0 ]] || { printf 'agent-gh: missing API field value\n' >&2; exit 1; }
+        ;;
+      --field=*|--raw-field=*|--input=*)
+        if [[ "$explicit_method" == false ]]; then
+          method="POST"
+        fi
+        ;;
+      -*)
+        ;;
+      *)
+        [[ -n "$endpoint" ]] || endpoint=$argument
+        ;;
+    esac
+    shift
+  done
+
+  endpoint=${endpoint#/}
+  if [[ -z "$endpoint" ]]; then
+    printf 'agent-gh: API endpoint is required\n' >&2
+    exit 1
+  fi
+
+  if [[ "$endpoint" == "graphql" ]]; then
+    printf 'agent-gh: arbitrary GraphQL is disabled; use an audited helper instead\n' >&2
+    exit 1
+  fi
+
+  if [[ "$method" != "GET" && "$endpoint" != "repos/$TARGET_REPO/"* ]]; then
+    printf 'agent-gh: refusing %s outside repos/%s/: %s\n' \
+      "$method" "$TARGET_REPO" "$endpoint" >&2
+    exit 1
+  fi
+}
+
+COMMAND=${1:-}
+if [[ "$COMMAND" == "register" ]]; then
+  shift
+  register_repository "$@"
+  exit 0
+fi
+
+TARGET_REPO=$(current_repository)
+require_registered_repository "$TARGET_REPO"
+if ! machine_user_has_push_access "$TARGET_REPO"; then
+  printf 'agent-gh: @%s no longer has write access to %s\n' \
+    "$AGENT_GITHUB_USER" "$TARGET_REPO" >&2
+  printf 'Ask the repository owner to grant or restore access before continuing.\n' >&2
+  exit 1
+fi
+
+case "$COMMAND" in
+  identity)
+    printf '%s acting on %s\n' "$ACTUAL_LOGIN" "$TARGET_REPO"
+    exit 0
+    ;;
+  pr|issue)
+    reject_repo_override "$@"
+    ;;
+  api)
+    guard_api_request "$@"
+    ;;
+  *)
+    printf 'Usage: agent-gh {identity|register|pr|issue|api} ...\n' >&2
+    printf 'Only PRs, issues, and guarded REST API calls are enabled.\n' >&2
+    exit 2
+    ;;
+esac
+
+exec env \
+  GH_TOKEN="$TOKEN" \
+  GH_REPO="$TARGET_REPO" \
+  gh "$@"
