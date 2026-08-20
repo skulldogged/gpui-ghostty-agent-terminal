@@ -10,6 +10,7 @@ struct RawCell {
     y: u16,
     text: [u8; 32],
     text_len: u8,
+    width: u8,
     fg_r: u8,
     fg_g: u8,
     fg_b: u8,
@@ -81,6 +82,7 @@ pub struct Cell {
     pub x: u16,
     pub y: u16,
     pub text: String,
+    pub width: u8,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     #[cfg_attr(feature = "gui", allow(dead_code))]
@@ -102,7 +104,6 @@ impl Terminal {
         unsafe { spike_terminal_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
     }
 
-    #[allow(dead_code)] // Used by the fixed-cell renderer in the next stacked PR.
     pub fn resize(
         &mut self,
         cols: u16,
@@ -147,6 +148,7 @@ impl Terminal {
                 x: raw.x,
                 y: raw.y,
                 text: String::from_utf8_lossy(&raw.text[..usize::from(raw.text_len)]).into_owned(),
+                width: raw.width,
                 fg: [raw.fg_r, raw.fg_g, raw.fg_b],
                 bg: [raw.bg_r, raw.bg_g, raw.bg_b],
                 has_explicit_bg: raw.has_explicit_bg,

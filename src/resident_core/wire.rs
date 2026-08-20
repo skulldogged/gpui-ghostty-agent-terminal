@@ -222,6 +222,7 @@ fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalUpdate) -> io::Result<(
     for cell in &snapshot.cells {
         output.extend_from_slice(&cell.x.to_le_bytes());
         output.extend_from_slice(&cell.y.to_le_bytes());
+        output.push(cell.width);
         put_string(output, &cell.text)?;
         output.extend_from_slice(&cell.fg);
         output.extend_from_slice(&cell.bg);
@@ -269,6 +270,7 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalUpdate> {
         let cell = TerminalCell {
             x: decoder.u16()?,
             y: decoder.u16()?,
+            width: decoder.u8()?,
             text: decoder.string()?.to_owned(),
             fg: decoder.array()?,
             bg: decoder.array()?,
@@ -483,6 +485,7 @@ mod tests {
                     (0..80).map(move |x| TerminalCell {
                         x,
                         y,
+                        width: 1,
                         text: if (x, y) == (0, 0) {
                             "λ界".into()
                         } else {
@@ -583,6 +586,7 @@ mod tests {
                 .map(|x| TerminalCell {
                     x,
                     y: 7,
+                    width: 1,
                     text: if x == 4 { "λ".into() } else { String::new() },
                     fg: [0xdd; 3],
                     bg: [0x11; 3],

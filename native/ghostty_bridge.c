@@ -152,6 +152,25 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
           cell->text_len = sizeof(replacement);
         }
 
+        GhosttyCell raw = 0;
+        GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+        GhosttyResult raw_result = ghostty_render_state_row_cells_get(
+            spike->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
+        if (success(raw_result)) {
+          ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+        }
+        switch (wide) {
+          case GHOSTTY_CELL_WIDE_WIDE:
+            cell->width = 2;
+            break;
+          case GHOSTTY_CELL_WIDE_SPACER_TAIL:
+            cell->width = 0;
+            break;
+          default:
+            cell->width = 1;
+            break;
+        }
+
         GhosttyColorRgb fg = colors.foreground;
         GhosttyColorRgb bg = colors.background;
         GhosttyResult fg_result = ghostty_render_state_row_cells_get(

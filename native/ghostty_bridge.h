@@ -16,6 +16,7 @@ typedef struct {
   uint16_t y;
   uint8_t text[32];
   uint8_t text_len;
+  uint8_t width;
   uint8_t fg_r;
   uint8_t fg_g;
   uint8_t fg_b;
