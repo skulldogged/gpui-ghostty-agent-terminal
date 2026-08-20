@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resident Core pressure model — throwaway prototype</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101316;
+      --panel: #181d21;
+      --panel-2: #20262b;
+      --line: #343c43;
+      --text: #edf2f4;
+      --muted: #9aa7ae;
+      --accent: #72d6b1;
+      --warn: #f0c36a;
+      --bad: #ef7f78;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 42px auto 72px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 8px; font-size: clamp(28px, 4vw, 42px); letter-spacing: -0.035em; }
+    h2 { margin-bottom: 16px; font-size: 18px; }
+    h3 { margin-bottom: 10px; font-size: 15px; }
+    .eyebrow { color: var(--accent); font-size: 12px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .question { max-width: 900px; color: var(--muted); font-size: 17px; }
+    .panel { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+    .state-grid { display: grid; grid-template-columns: 1.1fr 1fr 1fr; gap: 14px; }
+    .client { background: var(--panel-2); }
+    .field-grid { display: grid; grid-template-columns: max-content 1fr; gap: 7px 14px; margin: 0; }
+    dt { color: var(--muted); }
+    dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+    .good { color: var(--accent); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .section { margin-top: 28px; }
+    .outcome { min-height: 54px; margin-top: 14px; border-left: 3px solid var(--accent); padding: 12px 14px; background: var(--panel-2); color: var(--text); }
+    .actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #082019; font-weight: 750; }
+    button[disabled] { cursor: default; opacity: .42; }
+    .action-group { display: contents; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .tabs button { width: auto; }
+    .tabs button[aria-selected="true"] { color: #082019; border-color: var(--accent); background: var(--accent); font-weight: 750; }
+    .walkthrough { display: grid; grid-template-columns: 280px 1fr; gap: 18px; }
+    .steps { display: grid; gap: 8px; }
+    .step { display: grid; grid-template-columns: 30px 1fr; align-items: start; gap: 10px; }
+    .step-number { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .step.active .step-number { border-color: var(--accent); color: var(--accent); }
+    .step.done .step-number { border-color: var(--accent); background: var(--accent); color: #082019; }
+    .log { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .log li { padding-bottom: 6px; border-bottom: 1px solid #293036; }
+    .note { color: var(--muted); font-size: 13px; }
+    @media (max-width: 850px) {
+      .state-grid, .walkthrough { grid-template-columns: 1fr; }
+      .actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 520px) { .actions { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">Throwaway logic prototype · issue #4</div>
+    <h1>Resident Core pressure and Control Lease model</h1>
+    <p class="question">
+      Can one client-state model preserve reliable lifecycle events while coalescing terminal visuals,
+      reject input from observers, recover cleanly from sequence gaps, and disconnect a slow client
+      without ever slowing PTY consumption?
+    </p>
+
+    <section class="section">
+      <h2>Current state</h2>
+      <div class="state-grid" id="state"></div>
+      <div class="outcome" id="outcome" aria-live="polite"></div>
+    </section>
+
+    <section class="section panel">
+      <h2>Free play</h2>
+      <p class="note">Every action stays available. Invalid actions leave state safe and explain why they were rejected.</p>
+      <div class="actions" id="actions"></div>
+    </section>
+
+    <section class="section panel">
+      <h2>Guided walkthroughs</h2>
+      <div class="tabs" id="tabs" role="tablist"></div>
+      <div class="walkthrough">
+        <div>
+          <h3 id="scenario-title"></h3>
+          <p class="note" id="scenario-description"></p>
+          <button class="primary" id="restart-scenario">Restart this walkthrough</button>
+        </div>
+        <div class="steps" id="steps"></div>
+      </div>
+    </section>
+
+    <section class="section panel">
+      <h2>Recent model decisions</h2>
+      <ul class="log" id="log"></ul>
+    </section>
+  </main>
+
+  <script>
+    const PressureModel = (() => {
+      const QUEUE_LIMIT = 3;
+
+      const freshClient = () => ({
+        connection: "disconnected",
+        role: "none",
+        leaseGeneration: null,
+        lastSequence: 0,
+        lastTerminalRevision: 0,
+        reliableQueue: [],
+        pendingVisualRevision: null,
+        needsSnapshot: false,
+      });
+
+      const initialState = () => ({
+        sequence: 0,
+        terminalRevision: 0,
+        lifecycle: "running",
+        lease: { holder: null, generation: 0 },
+        clients: { A: freshClient(), B: freshClient() },
+        outcome: "The Core is running with no attached UI Clients.",
+        log: ["Model reset."],
+      });
+
+      const copy = state => structuredClone(state);
+
+      const record = (state, message) => {
+        state.outcome = message;
+        state.log.unshift(message);
+        state.log = state.log.slice(0, 12);
+      };
+
+      const takeSnapshot = (state, client) => {
+        client.lastSequence = state.sequence;
+        client.lastTerminalRevision = state.terminalRevision;
+        client.reliableQueue = [];
+        client.pendingVisualRevision = null;
+        client.needsSnapshot = false;
+      };
+
+      const enqueueAt = (state, clientId, event) => {
+        const client = state.clients[clientId];
+        if (client.connection !== "connected") return false;
+        if (client.reliableQueue.length >= QUEUE_LIMIT) {
+          const heldLease = state.lease.holder === clientId;
+          client.connection = "disconnected";
+          client.role = "none";
+          client.leaseGeneration = null;
+          client.reliableQueue = [];
+          client.pendingVisualRevision = null;
+          client.needsSnapshot = true;
+          if (heldLease) state.lease.holder = null;
+          record(state, `Client ${clientId} was disconnected: its reliable queue reached ${QUEUE_LIMIT}. The Core kept running.`);
+          return heldLease;
+        }
+        client.reliableQueue.push(event);
+        return false;
+      };
+
+      const publishReliable = (state, kind, label) => {
+        state.sequence += 1;
+        const event = { sequence: state.sequence, kind, label };
+        let leaseHolderDropped = false;
+        for (const clientId of ["A", "B"]) {
+          leaseHolderDropped = enqueueAt(state, clientId, event) || leaseHolderDropped;
+        }
+        if (leaseHolderDropped) {
+          state.sequence += 1;
+          const released = {
+            sequence: state.sequence,
+            kind: "lease",
+            label: "Control Lease released after pressure disconnect",
+          };
+          for (const clientId of ["A", "B"]) enqueueAt(state, clientId, released);
+        }
+      };
+
+      const connect = (state, clientId, wantsControl) => {
+        const client = state.clients[clientId];
+        if (client.connection === "connected") {
+          record(state, `Client ${clientId} is already attached as ${client.role}; use an explicit lease request or detach action.`);
+          return;
+        }
+        client.connection = "connected";
+        takeSnapshot(state, client);
+        if (wantsControl && state.lease.holder === null) {
+          state.lease.generation += 1;
+          state.lease.holder = clientId;
+          client.role = "controller";
+          client.leaseGeneration = state.lease.generation;
+          publishReliable(state, "lease", `Control Lease granted to Client ${clientId}`);
+          record(state, `Client ${clientId} attached, snapshotted, and received Control Lease generation ${state.lease.generation}.`);
+        } else {
+          client.role = "observer";
+          client.leaseGeneration = null;
+          const reason = wantsControl ? `Client ${state.lease.holder} already controls the Terminal Session.` : "It requested observation only.";
+          record(state, `Client ${clientId} attached as an observer. ${reason}`);
+        }
+      };
+
+      const reduce = (previous, action) => {
+        if (action.type === "RESET") return initialState();
+        const state = copy(previous);
+        const client = action.client ? state.clients[action.client] : null;
+
+        switch (action.type) {
+          case "ATTACH_CONTROL":
+            connect(state, action.client, true);
+            break;
+          case "ATTACH_OBSERVER":
+            connect(state, action.client, false);
+            break;
+          case "REQUEST_CONTROL":
+            if (client.connection !== "connected") {
+              record(state, `Client ${action.client} cannot request control while disconnected.`);
+            } else if (state.lease.holder !== null) {
+              record(state, `Control request rejected: Client ${state.lease.holder} holds generation ${state.lease.generation}.`);
+            } else {
+              state.lease.generation += 1;
+              state.lease.holder = action.client;
+              client.role = "controller";
+              client.leaseGeneration = state.lease.generation;
+              publishReliable(state, "lease", `Control Lease granted to Client ${action.client}`);
+              record(state, `Client ${action.client} acquired Control Lease generation ${state.lease.generation}.`);
+            }
+            break;
+          case "DISCONNECT": {
+            if (client.connection !== "connected") {
+              record(state, `Client ${action.client} is already disconnected.`);
+              break;
+            }
+            const heldLease = state.lease.holder === action.client;
+            client.connection = "disconnected";
+            client.role = "none";
+            client.leaseGeneration = null;
+            client.reliableQueue = [];
+            client.pendingVisualRevision = null;
+            if (heldLease) {
+              state.lease.holder = null;
+              publishReliable(state, "lease", `Control Lease released by Client ${action.client}`);
+            }
+            record(state, `Client ${action.client} detached. Terminal lifecycle remains ${state.lifecycle}.`);
+            break;
+          }
+          case "INPUT":
+            if (client.connection === "connected" &&
+                client.role === "controller" &&
+                state.lease.holder === action.client &&
+                client.leaseGeneration === state.lease.generation) {
+              record(state, `Input from Client ${action.client} accepted under lease generation ${state.lease.generation}.`);
+            } else {
+              record(state, `Input from Client ${action.client} rejected: it does not hold the current Control Lease.`);
+            }
+            break;
+          case "TERMINAL_OUTPUT":
+            state.terminalRevision += 1;
+            for (const id of ["A", "B"]) {
+              const target = state.clients[id];
+              if (target.connection === "connected" && !target.needsSnapshot) {
+                target.pendingVisualRevision = state.terminalRevision;
+              }
+            }
+            record(state, `PTY bytes reached libghostty-vt. Visual revision ${state.terminalRevision} replaced any older pending visual notice.`);
+            break;
+          case "SEMANTIC_EVENT":
+            publishReliable(state, "lifecycle", `Lifecycle notice at sequence ${state.sequence + 1}`);
+            if (!state.outcome.includes("disconnected")) record(state, `Reliable lifecycle event ${state.sequence} queued for every connected client.`);
+            break;
+          case "PROCESS_EXIT":
+            state.lifecycle = "exited";
+            publishReliable(state, "lifecycle", "Terminal process exited");
+            if (!state.outcome.includes("disconnected")) record(state, `Process exit published reliably at sequence ${state.sequence}.`);
+            break;
+          case "DELIVER_RELIABLE": {
+            if (client.connection !== "connected") {
+              record(state, `Client ${action.client} cannot consume events while disconnected.`);
+              break;
+            }
+            const event = client.reliableQueue.shift();
+            if (!event) {
+              record(state, `Client ${action.client} has no reliable event waiting.`);
+            } else if (event.sequence !== client.lastSequence + 1) {
+              client.needsSnapshot = true;
+              client.reliableQueue = [];
+              client.pendingVisualRevision = null;
+              record(state, `Client ${action.client} detected sequence gap: expected ${client.lastSequence + 1}, received ${event.sequence}. A full resnapshot is required.`);
+            } else {
+              client.lastSequence = event.sequence;
+              record(state, `Client ${action.client} applied reliable event ${event.sequence}: ${event.label}.`);
+            }
+            break;
+          }
+          case "DROP_RELIABLE": {
+            const event = client.reliableQueue.shift();
+            if (!event) record(state, `There was no queued event to drop for Client ${action.client}.`);
+            else record(state, `Prototype dropped event ${event.sequence} before Client ${action.client} saw it; the next delivery must reveal the gap.`);
+            break;
+          }
+          case "DELIVER_VISUAL":
+            if (client.connection !== "connected") {
+              record(state, `Client ${action.client} cannot consume visuals while disconnected.`);
+            } else if (client.needsSnapshot) {
+              record(state, `Client ${action.client} cannot apply a visual delta until it resnapshots.`);
+            } else if (client.pendingVisualRevision === null) {
+              record(state, `Client ${action.client} has no visual invalidation waiting.`);
+            } else {
+              const skipped = client.pendingVisualRevision - client.lastTerminalRevision - 1;
+              client.lastTerminalRevision = client.pendingVisualRevision;
+              client.pendingVisualRevision = null;
+              record(state, `Client ${action.client} fetched visual revision ${client.lastTerminalRevision}${skipped > 0 ? ` after coalescing ${skipped} older revision(s)` : ""}.`);
+            }
+            break;
+          case "RESNAPSHOT":
+            if (client.connection !== "connected") {
+              record(state, `Client ${action.client} must reconnect before requesting a snapshot.`);
+            } else {
+              takeSnapshot(state, client);
+              record(state, `Client ${action.client} replaced local state with sequence ${state.sequence} and visual revision ${state.terminalRevision}.`);
+            }
+            break;
+          default:
+            record(state, `Unknown prototype action: ${action.type}.`);
+        }
+        return state;
+      };
+
+      return { initialState, reduce, queueLimit: QUEUE_LIMIT };
+    })();
+
+    const actionDefinitions = [
+      ["Reset model", { type: "RESET" }],
+      ["A requests control", { type: "ATTACH_CONTROL", client: "A" }],
+      ["B requests control", { type: "ATTACH_CONTROL", client: "B" }],
+      ["B attaches as observer", { type: "ATTACH_OBSERVER", client: "B" }],
+      ["Produce terminal output", { type: "TERMINAL_OUTPUT" }],
+      ["Publish lifecycle event", { type: "SEMANTIC_EVENT" }],
+      ["Publish process exit", { type: "PROCESS_EXIT" }],
+      ["A consumes reliable event", { type: "DELIVER_RELIABLE", client: "A" }],
+      ["B consumes reliable event", { type: "DELIVER_RELIABLE", client: "B" }],
+      ["A fetches latest screen", { type: "DELIVER_VISUAL", client: "A" }],
+      ["B fetches latest screen", { type: "DELIVER_VISUAL", client: "B" }],
+      ["Drop A's next event", { type: "DROP_RELIABLE", client: "A" }],
+      ["A resnapshots", { type: "RESNAPSHOT", client: "A" }],
+      ["B requests free lease", { type: "REQUEST_CONTROL", client: "B" }],
+      ["A sends input", { type: "INPUT", client: "A" }],
+      ["B sends input", { type: "INPUT", client: "B" }],
+      ["Disconnect A", { type: "DISCONNECT", client: "A" }],
+      ["Disconnect B", { type: "DISCONNECT", client: "B" }],
+    ];
+
+    const scenarios = [
+      {
+        title: "Visual pressure coalesces",
+        description: "Three terminal revisions arrive before Client A paints. Watch one pending notice advance to the newest revision without a reliable-event backlog.",
+        steps: [
+          ["Attach A with control", { type: "ATTACH_CONTROL", client: "A" }],
+          ["Consume the lease event", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Output revision 1", { type: "TERMINAL_OUTPUT" }],
+          ["Output revision 2", { type: "TERMINAL_OUTPUT" }],
+          ["Output revision 3", { type: "TERMINAL_OUTPUT" }],
+          ["Fetch only the latest screen", { type: "DELIVER_VISUAL", client: "A" }],
+        ],
+      },
+      {
+        title: "Observer and lease transfer",
+        description: "Client B may observe while A controls, but cannot input. Once A detaches, B explicitly acquires a new lease generation.",
+        steps: [
+          ["Attach A with control", { type: "ATTACH_CONTROL", client: "A" }],
+          ["B asks for control", { type: "ATTACH_CONTROL", client: "B" }],
+          ["Try input from B", { type: "INPUT", client: "B" }],
+          ["Detach A", { type: "DISCONNECT", client: "A" }],
+          ["B requests the free lease", { type: "REQUEST_CONTROL", client: "B" }],
+          ["Send input from B", { type: "INPUT", client: "B" }],
+        ],
+      },
+      {
+        title: "Sequence gap recovers",
+        description: "A missing reliable event is never guessed through. The next event exposes the gap and blocks deltas until a complete snapshot replaces local state.",
+        steps: [
+          ["Attach A with control", { type: "ATTACH_CONTROL", client: "A" }],
+          ["Consume the lease event", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Publish event 2", { type: "SEMANTIC_EVENT" }],
+          ["Publish event 3", { type: "SEMANTIC_EVENT" }],
+          ["Drop event 2", { type: "DROP_RELIABLE", client: "A" }],
+          ["Attempt event 3", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Recover with full snapshot", { type: "RESNAPSHOT", client: "A" }],
+        ],
+      },
+      {
+        title: "Slow observer disconnects",
+        description: `Client A keeps up while observer B ignores reliable events. At the queue limit of ${PressureModel.queueLimit}, B is disconnected; terminal output continues for A.`,
+        steps: [
+          ["Attach A with control", { type: "ATTACH_CONTROL", client: "A" }],
+          ["A consumes lease event", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Attach B as observer", { type: "ATTACH_OBSERVER", client: "B" }],
+          ["Publish reliable event 1", { type: "SEMANTIC_EVENT" }],
+          ["A consumes event 1", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Publish reliable event 2", { type: "SEMANTIC_EVENT" }],
+          ["A consumes event 2", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Publish reliable event 3", { type: "SEMANTIC_EVENT" }],
+          ["A consumes event 3", { type: "DELIVER_RELIABLE", client: "A" }],
+          ["Publish event 4; B overflows", { type: "SEMANTIC_EVENT" }],
+          ["Produce more terminal output", { type: "TERMINAL_OUTPUT" }],
+          ["A fetches the latest screen", { type: "DELIVER_VISUAL", client: "A" }],
+        ],
+      },
+    ];
+
+    let state = PressureModel.initialState();
+    let activeScenario = 0;
+    let activeStep = 0;
+
+    const valueClass = value => {
+      if (["connected", "controller", "running", false].includes(value)) return "good";
+      if (["observer", true].includes(value)) return "warn";
+      if (["disconnected", "exited", "none"].includes(value)) return "bad";
+      return "";
+    };
+
+    const field = (label, value) => `<dt>${label}</dt><dd class="${valueClass(value)}">${String(value)}</dd>`;
+
+    const renderCore = () => `
+      <article class="panel">
+        <h3>Resident Core</h3>
+        <dl class="field-grid">
+          ${field("Lifecycle", state.lifecycle)}
+          ${field("Event sequence", state.sequence)}
+          ${field("Terminal revision", state.terminalRevision)}
+          ${field("Lease holder", state.lease.holder ?? "none")}
+          ${field("Lease generation", state.lease.generation)}
+        </dl>
+      </article>`;
+
+    const renderClient = id => {
+      const client = state.clients[id];
+      return `
+        <article class="panel client">
+          <h3>UI Client ${id}</h3>
+          <dl class="field-grid">
+            ${field("Connection", client.connection)}
+            ${field("Role", client.role)}
+            ${field("Lease generation", client.leaseGeneration ?? "none")}
+            ${field("Last event", client.lastSequence)}
+            ${field("Reliable queued", client.reliableQueue.length)}
+            ${field("Last visual", client.lastTerminalRevision)}
+            ${field("Pending visual", client.pendingVisualRevision ?? "none")}
+            ${field("Needs snapshot", client.needsSnapshot)}
+          </dl>
+        </article>`;
+    };
+
+    const dispatch = action => {
+      state = PressureModel.reduce(state, action);
+      render();
+    };
+
+    const renderActions = () => {
+      document.querySelector("#actions").innerHTML = actionDefinitions.map(([label, action], index) =>
+        `<button data-action="${index}">${label}</button>`
+      ).join("");
+      document.querySelectorAll("[data-action]").forEach(button => {
+        button.addEventListener("click", () => dispatch(actionDefinitions[Number(button.dataset.action)][1]));
+      });
+    };
+
+    const startScenario = index => {
+      activeScenario = index;
+      activeStep = 0;
+      state = PressureModel.initialState();
+      state.outcome = `Walkthrough started: ${scenarios[index].title}.`;
+      render();
+    };
+
+    const runScenarioStep = index => {
+      if (index !== activeStep) return;
+      state = PressureModel.reduce(state, scenarios[activeScenario].steps[index][1]);
+      activeStep += 1;
+      render();
+    };
+
+    const renderScenario = () => {
+      document.querySelector("#tabs").innerHTML = scenarios.map((scenario, index) =>
+        `<button role="tab" aria-selected="${index === activeScenario}" data-tab="${index}">${scenario.title}</button>`
+      ).join("");
+      document.querySelectorAll("[data-tab]").forEach(button => {
+        button.addEventListener("click", () => startScenario(Number(button.dataset.tab)));
+      });
+
+      const scenario = scenarios[activeScenario];
+      document.querySelector("#scenario-title").textContent = scenario.title;
+      document.querySelector("#scenario-description").textContent = scenario.description;
+      document.querySelector("#steps").innerHTML = scenario.steps.map(([label], index) => {
+        const status = index < activeStep ? "done" : index === activeStep ? "active" : "";
+        return `<div class="step ${status}">
+          <span class="step-number">${index < activeStep ? "✓" : index + 1}</span>
+          <button data-step="${index}" ${index !== activeStep ? "disabled" : ""}>${label}</button>
+        </div>`;
+      }).join("");
+      document.querySelectorAll("[data-step]").forEach(button => {
+        button.addEventListener("click", () => runScenarioStep(Number(button.dataset.step)));
+      });
+    };
+
+    const render = () => {
+      document.querySelector("#state").innerHTML = renderCore() + renderClient("A") + renderClient("B");
+      document.querySelector("#outcome").textContent = state.outcome;
+      document.querySelector("#log").innerHTML = state.log.map(item => `<li>${item}</li>`).join("");
+      renderActions();
+      renderScenario();
+    };
+
+    document.querySelector("#restart-scenario").addEventListener("click", () => startScenario(activeScenario));
+    render();
+  </script>
+</body>
+</html>
