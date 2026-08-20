@@ -1,5 +1,5 @@
 {
-  description = "Throwaway GPUI + libghostty-vt foundation spike";
+  description = "Cross-platform GPUI terminal powered by libghostty-vt";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -12,6 +12,7 @@
         packages = with pkgs; [
           cargo
           clang
+          clippy
           fontconfig
           freetype
           git
@@ -19,6 +20,7 @@
           mesa
           pkg-config
           rustc
+          rustfmt
           wayland
           vulkan-loader
           xorg.libX11

@@ -21,7 +21,7 @@ fn main() {
 
     build_ghostty(&ghostty);
     build_bridge(&root, &ghostty);
-    println!("cargo:rustc-env=SPIKE_GHOSTTY_REVISION={GHOSTTY_REVISION}");
+    println!("cargo:rustc-env=GHOSTTY_SOURCE_REVISION={GHOSTTY_REVISION}");
 }
 
 fn build_ghostty(ghostty: &Path) {
@@ -92,6 +92,6 @@ fn zig_target(target: &str) -> &'static str {
         "aarch64-apple-darwin" => "aarch64-macos-none",
         "x86_64-apple-darwin" => "x86_64-macos-none",
         "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
-        other => panic!("unsupported spike target: {other}"),
+        other => panic!("unsupported target: {other}"),
     }
 }

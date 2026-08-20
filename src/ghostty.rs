@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 #[repr(C)]
+#[derive(Default)]
 struct RawCell {
     x: u16,
     y: u16,
@@ -14,24 +15,6 @@ struct RawCell {
     bg_g: u8,
     bg_b: u8,
     has_explicit_bg: bool,
-}
-
-impl Default for RawCell {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            text: [0; 32],
-            text_len: 0,
-            fg_r: 0,
-            fg_g: 0,
-            fg_b: 0,
-            bg_r: 0,
-            bg_g: 0,
-            bg_b: 0,
-            has_explicit_bg: false,
-        }
-    }
 }
 
 #[repr(C)]
@@ -70,7 +53,8 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-pub const SOURCE_REVISION: &str = env!("SPIKE_GHOSTTY_REVISION");
+#[cfg(not(feature = "gui"))]
+pub const SOURCE_REVISION: &str = env!("GHOSTTY_SOURCE_REVISION");
 
 pub struct Terminal {
     raw: NonNull<c_void>,
@@ -92,6 +76,7 @@ pub struct Cell {
     pub text: String,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
+    #[cfg_attr(feature = "gui", allow(dead_code))]
     pub has_explicit_bg: bool,
 }
 
@@ -107,8 +92,17 @@ impl Terminal {
         unsafe { spike_terminal_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-        let result = unsafe { spike_terminal_resize(self.raw.as_ptr(), cols, rows, 10, 20) };
+    #[allow(dead_code)] // Used by the fixed-cell renderer in the next stacked PR.
+    pub fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Result<(), String> {
+        let result = unsafe {
+            spike_terminal_resize(self.raw.as_ptr(), cols, rows, cell_width_px, cell_height_px)
+        };
         result_ok(result, "resize")
     }
 
@@ -180,11 +174,15 @@ fn result_ok(result: i32, operation: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(any(test, not(feature = "gui")))]
 pub fn snapshot_text(snapshot: &Snapshot) -> String {
     let mut output = String::new();
     for y in 0..snapshot.rows {
         for x in 0..snapshot.cols {
-            let cell = snapshot.cells.iter().find(|cell| cell.x == x && cell.y == y);
+            let cell = snapshot
+                .cells
+                .iter()
+                .find(|cell| cell.x == x && cell.y == y);
             match cell {
                 Some(cell) if !cell.text.is_empty() => output.push_str(&cell.text),
                 _ => output.push(' '),

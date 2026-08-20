@@ -1,9 +1,14 @@
 mod ghostty;
 
 #[cfg(feature = "gui")]
+mod terminal_session;
+
+#[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]
 mod pty;
+#[cfg(all(feature = "gui", windows))]
+mod windows_pty;
 
 fn main() {
     #[cfg(feature = "gui")]
@@ -13,12 +18,13 @@ fn main() {
     headless_smoke();
 }
 
+#[cfg(not(feature = "gui"))]
 fn headless_smoke() {
     let mut terminal = ghostty::Terminal::new(48, 8).expect("create terminal");
     terminal.feed(
         b"\x1b[2J\x1b[H\x1b[1;31mRED\x1b[0m green?\r\nUnicode: \xe7\x8c\xab \xf0\x9f\x90\x88 e\xcc\x81\r\n\x1b[44mbackground\x1b[0m\r\n",
     );
-    terminal.resize(52, 9).expect("resize terminal");
+    terminal.resize(52, 9, 10, 20).expect("resize terminal");
     let snapshot = terminal.snapshot().expect("snapshot terminal");
     let text = ghostty::snapshot_text(&snapshot);
     assert!(text.contains("RED"));
