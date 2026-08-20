@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONFIG_ROOT="${XDG_CONFIG_HOME:-${HOME:?HOME must be set}/.config}/codex-github-machine"
+CONFIG_FILE="$CONFIG_ROOT/setup.env"
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  printf 'token-store: missing configuration: %s\n' "$CONFIG_FILE" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+: "${AGENT_GITHUB_USER:?missing AGENT_GITHUB_USER in $CONFIG_FILE}"
+
+LEGACY_TARGET_REPO=${TARGET_REPO:-}
+
+DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-github-machine"
+TOKEN_FILE="${AGENT_GITHUB_TOKEN_FILE:-$DATA_ROOT/$AGENT_GITHUB_USER/github-token}"
+
+read_token() {
+  TOKEN=""
+  IFS= read -r TOKEN || true
+  if [[ -z "$TOKEN" ]]; then
+    printf 'token-store: refusing to store an empty token\n' >&2
+    exit 1
+  fi
+}
+
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+lookup_file_token() {
+  local mode
+  if [[ ! -f "$TOKEN_FILE" || -L "$TOKEN_FILE" ]]; then
+    return 1
+  fi
+  if [[ ! -O "$TOKEN_FILE" ]]; then
+    printf 'token-store: token file is not owned by the current user: %s\n' "$TOKEN_FILE" >&2
+    exit 1
+  fi
+  mode=$(file_mode "$TOKEN_FILE" || true)
+  if [[ "$mode" != "600" && "$mode" != "400" ]]; then
+    printf 'token-store: token file must have mode 600 or 400: %s\n' "$TOKEN_FILE" >&2
+    exit 1
+  fi
+  TOKEN=$(<"$TOKEN_FILE")
+  [[ -n "$TOKEN" ]] || return 1
+  printf '%s' "$TOKEN"
+}
+
+COMMAND=${1:-}
+case "$COMMAND" in
+  store-secret-service)
+    read_token
+    if [[ "${CODEX_GITHUB_DISABLE_SECRET_SERVICE:-}" == "1" ]] || \
+       ! command -v secret-tool >/dev/null 2>&1; then
+      unset TOKEN
+      exit 1
+    fi
+    if printf '%s' "$TOKEN" | secret-tool store \
+      --label="Codex GitHub machine user ($AGENT_GITHUB_USER)" \
+      service codex-github-machine-user \
+      account "$AGENT_GITHUB_USER" \
+      scope global 2>/dev/null; then
+      unset TOKEN
+      exit 0
+    fi
+    unset TOKEN
+    exit 1
+    ;;
+  store-file)
+    read_token
+    TOKEN_DIRECTORY=$(dirname "$TOKEN_FILE")
+    mkdir -p "$TOKEN_DIRECTORY"
+    chmod 700 "$TOKEN_DIRECTORY"
+    umask 077
+    TEMP_TOKEN_FILE=$(mktemp "$TOKEN_DIRECTORY/.github-token.XXXXXX")
+    cleanup_temp_token() {
+      if [[ -n "${TEMP_TOKEN_FILE:-}" && -f "$TEMP_TOKEN_FILE" ]]; then
+        rm -f -- "$TEMP_TOKEN_FILE"
+      fi
+    }
+    trap cleanup_temp_token EXIT
+    printf '%s' "$TOKEN" > "$TEMP_TOKEN_FILE"
+    chmod 600 "$TEMP_TOKEN_FILE"
+    mv "$TEMP_TOKEN_FILE" "$TOKEN_FILE"
+    TEMP_TOKEN_FILE=""
+    unset TOKEN
+    ;;
+  lookup)
+    TOKEN=""
+    if [[ "${CODEX_GITHUB_DISABLE_SECRET_SERVICE:-}" != "1" ]] && \
+       command -v secret-tool >/dev/null 2>&1; then
+      TOKEN=$(secret-tool lookup \
+        service codex-github-machine-user \
+        account "$AGENT_GITHUB_USER" \
+        scope global 2>/dev/null || true)
+      if [[ -z "$TOKEN" && -n "$LEGACY_TARGET_REPO" ]]; then
+        TOKEN=$(secret-tool lookup \
+          service codex-github-machine-user \
+          account "$AGENT_GITHUB_USER" \
+          repository "$LEGACY_TARGET_REPO" 2>/dev/null || true)
+      fi
+    fi
+    if [[ -n "$TOKEN" ]]; then
+      printf '%s' "$TOKEN"
+      unset TOKEN
+      exit 0
+    fi
+    unset TOKEN
+    if lookup_file_token; then
+      exit 0
+    fi
+    printf 'token-store: no usable machine-user token was found\n' >&2
+    exit 1
+    ;;
+  *)
+    printf 'Usage: token-store {store-secret-service|store-file|lookup}\n' >&2
+    exit 2
+    ;;
+esac
