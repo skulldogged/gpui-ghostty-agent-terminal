@@ -17,7 +17,7 @@ A leaf placement in a Tab's split layout that references one Terminal Session. P
 _Avoid_: Panel, Agent Pane
 
 **Terminal Session**:
-A live shell or CLI execution stream with an immutable identity independent of Pane placement. It appears in at most one Pane at a time.
+A live shell or CLI execution stream with an immutable identity independent of Pane placement. It appears in at most one Pane and has at most one controlling UI Client at a time.
 _Avoid_: Agent Session
 
 **Resident Core**:
@@ -29,8 +29,16 @@ An attachable GPUI front end whose windows can present any Space without owning 
 _Avoid_: Main Process, Space Window
 
 **Detach**:
-Closing a UI view while its Space and Terminal Sessions continue running in the Resident Core.
+Closing a UI view while its Space, Panes, and Terminal Sessions continue running in the Resident Core. Detach never means closing a Pane.
 _Avoid_: Quit, Stop
+
+**Close Pane**:
+An explicit destructive action that removes a Pane and stops its referenced Terminal Session after confirmation.
+_Avoid_: Detach, Close Window
+
+**Control Lease**:
+The exclusive relationship granting one UI Client authority to send input and set the canonical size of a Terminal Session. Other UI Clients cannot control that Terminal Session while the lease is held.
+_Avoid_: Focus, Ownership
 
 **Agent Integration**:
 Optional capabilities that augment a Terminal Session when an agent program is recognized or cooperates with the application.

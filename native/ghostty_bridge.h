@@ -37,6 +37,7 @@ typedef struct {
   uint8_t default_bg_r;
   uint8_t default_bg_g;
   uint8_t default_bg_b;
+  bool full;
   size_t cell_count;
 } SpikeSnapshot;
 
@@ -45,8 +46,9 @@ void spike_terminal_free(SpikeTerminal* terminal);
 void spike_terminal_write(SpikeTerminal* terminal, const uint8_t* data, size_t len);
 int spike_terminal_resize(SpikeTerminal* terminal, uint16_t cols, uint16_t rows,
                           uint32_t cell_width_px, uint32_t cell_height_px);
-int spike_terminal_snapshot(SpikeTerminal* terminal, SpikeSnapshot* snapshot,
-                            SpikeCell* cells, size_t capacity);
+int spike_terminal_snapshot(SpikeTerminal* terminal, bool force_full,
+                            SpikeSnapshot* snapshot, SpikeCell* cells,
+                            size_t capacity);
 
 #ifdef __cplusplus
 }

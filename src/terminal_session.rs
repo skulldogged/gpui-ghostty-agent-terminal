@@ -2,7 +2,6 @@ use crate::{
     ghostty,
     pty::{PtyOutput, PtySession, PtySize},
 };
-
 /// The complete geometry shared by the VT engine and the platform PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -22,12 +21,18 @@ impl TerminalSize {
         }
     }
 
-    fn validate(self) -> Result<Self, String> {
+    pub(crate) fn validate(self) -> Result<Self, String> {
         if self.cols == 0 || self.rows == 0 {
             return Err("terminal grid must contain at least one row and column".into());
         }
         if self.cell_width_px == 0 || self.cell_height_px == 0 {
             return Err("terminal cells must have non-zero pixel dimensions".into());
+        }
+        if usize::from(self.cols) * usize::from(self.rows) > ghostty::SNAPSHOT_CELL_CAPACITY {
+            return Err(format!(
+                "terminal grid exceeds the {}-cell snapshot capacity",
+                ghostty::SNAPSHOT_CELL_CAPACITY
+            ));
         }
         Ok(self)
     }
@@ -56,8 +61,8 @@ pub struct TerminalEvents {
 }
 
 impl TerminalEvents {
-    pub async fn recv(&self) -> Option<TerminalEvent> {
-        self.receiver.recv_async().await.ok()
+    pub(crate) fn try_recv(&self) -> Option<TerminalEvent> {
+        self.receiver.try_recv().ok()
     }
 }
 
@@ -68,11 +73,18 @@ pub enum TerminalEvent {
     Failed(String),
 }
 
-trait TerminalTransport {
+trait TerminalTransport: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
+    #[cfg(all(test, target_os = "linux"))]
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+    fn reap(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl TerminalTransport for PtySession {
@@ -90,6 +102,15 @@ impl TerminalTransport for PtySession {
 
     fn resume_reader(&mut self) -> Result<(), String> {
         PtySession::resume_reader(self)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn process_id(&self) -> Option<u32> {
+        PtySession::process_id(self)
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        PtySession::reap(self)
     }
 }
 
@@ -125,6 +146,10 @@ impl TerminalSession {
 
     pub fn input(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.process.write(bytes)
+    }
+
+    pub(crate) fn size(&self) -> TerminalSize {
+        self.size
     }
 
     #[allow(dead_code)] // The renderer stack adds the first live geometry caller.
@@ -174,12 +199,31 @@ impl TerminalSession {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
-        self.drain_output()?;
-        self.terminal.snapshot()
+        let _changed = self.drain_output()?;
+        self.render_update(true)
     }
 
-    fn drain_output(&mut self) -> Result<(), String> {
+    pub(crate) fn render_update(&mut self, force_full: bool) -> Result<ghostty::Snapshot, String> {
+        self.terminal.render_update(force_full)
+    }
+
+    pub(crate) fn drain_pending_output(&mut self) -> Result<bool, String> {
+        self.drain_output()
+    }
+
+    pub(crate) fn reap_process(&mut self) -> Result<(), String> {
+        self.process.reap()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn process_id(&self) -> Option<u32> {
+        self.process.process_id()
+    }
+
+    fn drain_output(&mut self) -> Result<bool, String> {
+        let mut changed = false;
         loop {
             let message = self
                 .output
@@ -187,12 +231,15 @@ impl TerminalSession {
                 .expect("Terminal Session output is available before drop")
                 .try_recv();
             match message {
-                Ok(PtyOutput::Bytes(bytes)) => self.terminal.feed(&bytes),
+                Ok(PtyOutput::Bytes(bytes)) => {
+                    self.terminal.feed(&bytes);
+                    changed = true;
+                }
                 Ok(PtyOutput::Paused) => {
                     return Err("terminal reader paused outside a resize barrier".into());
                 }
                 Err(flume::TryRecvError::Empty | flume::TryRecvError::Disconnected) => {
-                    return Ok(());
+                    return Ok(changed);
                 }
             }
         }
@@ -271,6 +318,12 @@ mod tests {
     }
 
     #[test]
+    fn terminal_size_rejects_grids_larger_than_snapshot_capacity() {
+        assert!(TerminalSize::new(256, 256, 10, 20).validate().is_ok());
+        assert!(TerminalSize::new(400, 200, 10, 20).validate().is_err());
+    }
+
+    #[test]
     fn pty_geometry_uses_the_same_cell_metrics() {
         let size = TerminalSize::new(100, 40, 9, 18);
         let pty = size.pty_size();
@@ -337,6 +390,8 @@ mod tests {
     fn normal_shell_exit_is_reported_as_exited() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
+        #[cfg(target_os = "linux")]
+        let process_id = session.process_id();
         session
             .input(b"echo TERMINAL_SESSION_EXIT_OUTPUT; exit\r")
             .expect("write shell exit command");
@@ -349,10 +404,18 @@ mod tests {
                 }
                 Ok(TerminalEvent::Exited) => {
                     let snapshot = session.snapshot().expect("drain final terminal output");
+                    session.reap_process().expect("reap exited shell");
                     assert!(
                         snapshot_text(&snapshot).contains("TERMINAL_SESSION_EXIT_OUTPUT"),
                         "shell exit was reported before final output was available"
                     );
+                    #[cfg(target_os = "linux")]
+                    if let Some(process_id) = process_id {
+                        assert!(
+                            !std::path::Path::new(&format!("/proc/{process_id}")).exists(),
+                            "reaped shell must not remain as a zombie"
+                        );
+                    }
                     return;
                 }
                 Ok(TerminalEvent::Failed(error)) => {

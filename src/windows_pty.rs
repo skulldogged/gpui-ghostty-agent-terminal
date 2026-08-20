@@ -263,6 +263,12 @@ impl PtySession {
             .send(ReaderControl::Resume)
             .map_err(|_| "resume ConPTY reader: reader stopped".to_string())
     }
+
+    pub fn reap(&mut self) -> Result<(), String> {
+        // The dedicated ConPTY waiter owns a duplicate process handle and
+        // waits for termination before it closes the pseudoconsole.
+        Ok(())
+    }
 }
 
 impl Drop for PtySession {
