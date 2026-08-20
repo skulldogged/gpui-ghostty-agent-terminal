@@ -874,7 +874,7 @@ fn read_response_until<R: Read>(reader: &mut R, deadline: Instant) -> io::Result
 
         let read_capacity = expected_len
             .map(|expected_len| expected_len - bytes.len())
-            .unwrap_or(chunk.len())
+            .unwrap_or_else(|| 4 - bytes.len())
             .min(chunk.len());
         match reader.read(&mut chunk[..read_capacity]) {
             Ok(0) if bytes.is_empty() => return Ok(None),
@@ -942,6 +942,7 @@ fn read_windows_response_until(
 ) -> io::Result<Option<Response>> {
     let mut bytes = Vec::new();
     let mut expected_len = None;
+    let mut chunk = [0_u8; 8 * 1024];
     loop {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -953,8 +954,14 @@ fn read_windows_response_until(
         let available = windows_available_bytes(reader.get_ref())?;
         if available > 0 {
             let remaining_capacity = (MAX_MESSAGE_BYTES + 4 - bytes.len() as u64) as usize;
-            let mut chunk = vec![0_u8; available.min(remaining_capacity).min(8 * 1024)];
-            let read = std::io::Read::read(reader.get_mut(), &mut chunk)?;
+            let frame_remaining = expected_len
+                .map(|expected_len| expected_len - bytes.len())
+                .unwrap_or_else(|| 4 - bytes.len());
+            let read_capacity = available
+                .min(remaining_capacity)
+                .min(frame_remaining)
+                .min(chunk.len());
+            let read = std::io::Read::read(reader.get_mut(), &mut chunk[..read_capacity])?;
             if read == 0 {
                 return Ok(None);
             }
