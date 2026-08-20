@@ -20,8 +20,9 @@ mod gui;
 
 #[cfg(feature = "gui")]
 pub use resident_core::{
-    ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, TerminalCell,
-    TerminalChange, TerminalLifecycle, TerminalSnapshot, UiClientId, run_resident_core,
+    ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, SemanticEvent,
+    SemanticEventKind, TerminalCell, TerminalChange, TerminalLifecycle, TerminalSnapshot,
+    UiClientId, run_resident_core,
 };
 #[cfg(feature = "gui")]
 pub use terminal_session::TerminalSize;

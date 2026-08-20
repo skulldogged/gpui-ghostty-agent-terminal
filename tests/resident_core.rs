@@ -1,5 +1,6 @@
 use agent_terminal::{
-    ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, TerminalLifecycle, TerminalSize,
+    ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, SemanticEventKind,
+    TerminalLifecycle, TerminalSize,
 };
 use std::{
     process::{Child, Command, Stdio},
@@ -142,6 +143,52 @@ fn observer_can_attach_and_receive_an_explicit_control_lease_transfer() {
 }
 
 #[test]
+fn control_lease_changes_are_delivered_as_ordered_semantic_events() {
+    let endpoint = isolated_endpoint("semantic-control-lease");
+    let mut core = spawn_core(&endpoint);
+    let mut controller = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("attach controlling UI Client");
+    let mut observer =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach observer UI Client");
+
+    let transferred = controller
+        .transfer_control(observer.client_id())
+        .expect("transfer Control Lease to observer");
+    let first = observer
+        .wait_for_semantic_event(Duration::from_secs(10))
+        .expect("wait for first semantic event")
+        .expect("Control Lease transfer must publish a semantic event");
+    assert_eq!(
+        first.kind,
+        SemanticEventKind::ControlLeaseChanged {
+            lease: transferred.clone(),
+        }
+    );
+    assert_eq!(observer.control_lease(), &transferred);
+    let controller_first = controller
+        .wait_for_semantic_event(Duration::from_secs(10))
+        .expect("wait for controller's first semantic event")
+        .expect("controller must observe the same Control Lease transfer");
+    assert_eq!(controller_first, first);
+
+    let returned = observer
+        .transfer_control(controller.client_id())
+        .expect("transfer Control Lease back to original controller");
+    let second = controller
+        .wait_for_semantic_event(Duration::from_secs(10))
+        .expect("wait for second semantic event")
+        .expect("second Control Lease transfer must publish a semantic event");
+    assert_eq!(second.sequence, first.sequence + 1);
+    assert_eq!(
+        second.kind,
+        SemanticEventKind::ControlLeaseChanged { lease: returned }
+    );
+
+    controller.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
 fn observer_can_acquire_the_control_lease_after_controller_detaches() {
     let endpoint = isolated_endpoint("control-lease-reacquire");
     let mut core = spawn_core(&endpoint);
@@ -161,20 +208,15 @@ fn observer_can_acquire_the_control_lease_after_controller_detaches() {
     );
     drop(controller);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let vacant = loop {
-        let lease = observer
-            .refresh_control_lease()
-            .expect("refresh Control Lease after controller detach");
-        if lease.controller.is_none() {
-            break lease;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "controller detach did not release the Control Lease"
-        );
-        std::thread::sleep(Duration::from_millis(10));
+    let vacancy = observer
+        .wait_for_semantic_event(Duration::from_secs(10))
+        .expect("wait for controller detach event")
+        .expect("controller detach must publish a Control Lease event");
+    let vacant = match vacancy.kind {
+        SemanticEventKind::ControlLeaseChanged { lease } if lease.controller.is_none() => lease,
+        event => panic!("expected vacant Control Lease event, got {event:?}"),
     };
+    assert_eq!(observer.control_lease(), &vacant);
 
     assert_eq!(
         observer
@@ -197,6 +239,63 @@ fn observer_can_acquire_the_control_lease_after_controller_detaches() {
     wait_for_text(&mut observer, "REACQUIRED_CONTROL_LIVE");
 
     observer.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn a_slow_semantic_observer_recovers_without_blocking_the_controller_or_terminal() {
+    let endpoint = isolated_endpoint("semantic-pressure");
+    let mut core = spawn_core(&endpoint);
+    let mut first = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("attach first controlling UI Client");
+    let mut second =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach second UI Client");
+    let mut slow_observer =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach slow observer");
+
+    for transfer in 0..80 {
+        let (source, target) = if transfer % 2 == 0 {
+            (&mut first, &mut second)
+        } else {
+            (&mut second, &mut first)
+        };
+        let lease = source
+            .transfer_control(target.client_id())
+            .expect("transfer Control Lease under sustained event pressure");
+        for client in [source, target] {
+            let event = client
+                .wait_for_semantic_event(Duration::from_secs(10))
+                .expect("active UI Client semantic stream remains connected")
+                .expect("active UI Client receives every Control Lease event");
+            assert_eq!(
+                event.kind,
+                SemanticEventKind::ControlLeaseChanged {
+                    lease: lease.clone(),
+                }
+            );
+        }
+    }
+
+    let overflow = slow_observer
+        .snapshot()
+        .expect_err("a slow reliable-event consumer must fail closed");
+    assert!(
+        overflow.contains("reconnect and resnapshot required"),
+        "unexpected slow-observer recovery error: {overflow}"
+    );
+
+    let mut recovered = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("reattach slow observer after overflow");
+    recovered
+        .snapshot()
+        .expect("reattached observer takes an authoritative snapshot");
+
+    first
+        .input(b"echo CONTROLLER_SURVIVED_OBSERVER_PRESSURE\r")
+        .expect("controller writes after observer overflow");
+    wait_for_text(&mut first, "CONTROLLER_SURVIVED_OBSERVER_PRESSURE");
+
+    first.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
 }
 
@@ -234,8 +333,20 @@ fn snapshots_report_revisions_and_terminal_exit() {
     client
         .input(b"\rexit\r")
         .expect("release shell revision hold and exit");
+    let lifecycle_event = client
+        .wait_for_semantic_event(Duration::from_secs(10))
+        .expect("wait for Terminal Session lifecycle event")
+        .expect("terminal exit must publish a semantic event");
+    let lifecycle_revision = match lifecycle_event.kind {
+        SemanticEventKind::TerminalLifecycleChanged {
+            lifecycle: TerminalLifecycle::Exited,
+            terminal_revision,
+        } => terminal_revision,
+        event => panic!("expected Terminal Session exit event, got {event:?}"),
+    };
     let exited = wait_for_snapshot_after(&mut client, initial.revision);
     assert_eq!(exited.lifecycle, TerminalLifecycle::Exited);
+    assert!(exited.revision >= lifecycle_revision);
     client.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
 }

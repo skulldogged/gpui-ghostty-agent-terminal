@@ -31,10 +31,11 @@ use std::{
 
 mod wire;
 
-// Version 5 adds an explicit detach command so the client's pushed-response
-// reader can be shut down without owning Terminal Session lifetime.
-const PROTOCOL_VERSION: u16 = 5;
+// Version 6 adds sequenced reliable semantic events with an attachment
+// baseline and fail-closed overflow recovery.
+const PROTOCOL_VERSION: u16 = 6;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
+const SEMANTIC_EVENT_CAPACITY: usize = 64;
 const SESSION_TICK: Duration = Duration::from_millis(10);
 const AUTH_SECRET_BYTES: usize = 32;
 const AUTH_NONCE_BYTES: usize = 32;
@@ -325,6 +326,23 @@ pub struct TerminalChange {
     pub terminal_revision: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticEvent {
+    pub sequence: u64,
+    pub kind: SemanticEventKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SemanticEventKind {
+    ControlLeaseChanged {
+        lease: ControlLease,
+    },
+    TerminalLifecycleChanged {
+        lifecycle: TerminalLifecycle,
+        terminal_revision: u64,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UiClientId(u64);
 
@@ -373,9 +391,10 @@ impl std::fmt::Display for CoreCommandError {
 impl std::error::Error for CoreCommandError {}
 
 pub struct CoreClient {
-    connection: LocalSocketStream,
+    connection: Arc<Mutex<LocalSocketStream>>,
     responses: flume::Receiver<Result<Response, String>>,
     terminal_changes: flume::Receiver<TerminalChange>,
+    semantic_events: flume::Receiver<SemanticEvent>,
     snapshot: Option<TerminalSnapshot>,
     client_id: UiClientId,
     control_lease: ControlLease,
@@ -417,6 +436,7 @@ impl CoreClient {
                             proof,
                             client_id,
                             lease,
+                            semantic_sequence,
                         } => {
                             verify_server_proof(&auth_secret, endpoint, &nonce, &proof)?;
                             configure_stream_timeouts(connection.get_ref(), None)?;
@@ -424,9 +444,13 @@ impl CoreClient {
                                 .get_ref()
                                 .try_clone()
                                 .map_err(|error| format!("clone Resident Core stream: {error}"))?;
+                            let writer = Arc::new(Mutex::new(writer));
                             let (responses_tx, responses_rx) = flume::unbounded();
                             let (changes_tx, changes_rx) = flume::bounded(1);
                             let stale_changes = changes_rx.clone();
+                            let (semantic_tx, semantic_rx) =
+                                flume::bounded(SEMANTIC_EVENT_CAPACITY);
+                            let reader_writer = Arc::clone(&writer);
                             thread::Builder::new()
                                 .name("resident-core-responses".into())
                                 .spawn(move || {
@@ -435,6 +459,9 @@ impl CoreClient {
                                         responses_tx,
                                         changes_tx,
                                         stale_changes,
+                                        semantic_tx,
+                                        semantic_sequence,
+                                        reader_writer,
                                     )
                                 })
                                 .map_err(|error| {
@@ -444,6 +471,7 @@ impl CoreClient {
                                 connection: writer,
                                 responses: responses_rx,
                                 terminal_changes: changes_rx,
+                                semantic_events: semantic_rx,
                                 snapshot: None,
                                 client_id,
                                 control_lease: lease,
@@ -654,13 +682,52 @@ impl CoreClient {
         }
     }
 
+    pub fn wait_for_semantic_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<SemanticEvent>, String> {
+        match self.semantic_events.recv_timeout(timeout) {
+            Ok(event) => {
+                self.accept_semantic_event(&event);
+                Ok(Some(event))
+            }
+            Err(flume::RecvTimeoutError::Timeout) => Ok(None),
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                Err("Resident Core semantic event stream requires reconnect and resnapshot".into())
+            }
+        }
+    }
+
     pub(crate) fn terminal_changes(&self) -> flume::Receiver<TerminalChange> {
         self.terminal_changes.clone()
     }
 
+    pub(crate) fn semantic_events(&self) -> flume::Receiver<SemanticEvent> {
+        self.semantic_events.clone()
+    }
+
+    pub(crate) fn accept_semantic_event(&mut self, event: &SemanticEvent) {
+        if let SemanticEventKind::ControlLeaseChanged { lease } = &event.kind {
+            self.control_lease = lease.clone();
+        }
+    }
+
     fn request(&mut self, request: Request) -> Result<Response, String> {
-        wire::write_request(&mut self.connection, &request)
-            .map_err(|error| format!("send Resident Core command: {error}"))?;
+        if let Ok(pending) = self.responses.try_recv() {
+            return pending;
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "Resident Core command writer mutex poisoned".to_string())?;
+        if let Err(error) = wire::write_request(&mut *connection, &request) {
+            drop(connection);
+            if let Ok(pending) = self.responses.try_recv() {
+                return pending;
+            }
+            return Err(format!("send Resident Core command: {error}"));
+        }
+        drop(connection);
         self.responses
             .recv()
             .map_err(|_| "Resident Core disconnected before responding".to_string())?
@@ -687,7 +754,9 @@ impl Drop for CoreClient {
     fn drop(&mut self) {
         // The response reader owns a cloned stream. Ask the server to close its
         // end so that reader exits and the Control Lease is released promptly.
-        let _ = wire::write_request(&mut self.connection, &Request::Detach);
+        if let Ok(mut connection) = self.connection.lock() {
+            let _ = wire::write_request(&mut *connection, &Request::Detach);
+        }
     }
 }
 
@@ -696,11 +765,45 @@ fn read_core_responses(
     responses: flume::Sender<Result<Response, String>>,
     terminal_changes: flume::Sender<TerminalChange>,
     stale_terminal_changes: flume::Receiver<TerminalChange>,
+    semantic_events: flume::Sender<SemanticEvent>,
+    mut semantic_sequence: u64,
+    writer: Arc<Mutex<LocalSocketStream>>,
 ) {
     loop {
         match wire::read_response(&mut connection) {
             Ok(Some(Response::TerminalChanged(change))) => {
                 publish_latest_terminal_change(&terminal_changes, &stale_terminal_changes, change);
+            }
+            Ok(Some(Response::SemanticEvent(event))) => {
+                let expected = semantic_sequence.saturating_add(1);
+                if event.sequence != expected {
+                    fail_response_reader(
+                        &responses,
+                        &writer,
+                        format!(
+                            "Resident Core semantic event gap: expected {expected}, received {}; reconnect and resnapshot required",
+                            event.sequence
+                        ),
+                    );
+                    return;
+                }
+                semantic_sequence = event.sequence;
+                if semantic_events.try_send(event).is_err() {
+                    fail_response_reader(
+                        &responses,
+                        &writer,
+                        "Resident Core semantic event queue overflowed; reconnect and resnapshot required".into(),
+                    );
+                    return;
+                }
+            }
+            Ok(Some(Response::ResnapshotRequired)) => {
+                fail_response_reader(
+                    &responses,
+                    &writer,
+                    "Resident Core semantic event delivery overflowed; reconnect and resnapshot required".into(),
+                );
+                return;
             }
             Ok(Some(response)) => {
                 if responses.send(Ok(response)).is_err() {
@@ -718,6 +821,17 @@ fn read_core_responses(
                 return;
             }
         }
+    }
+}
+
+fn fail_response_reader(
+    responses: &flume::Sender<Result<Response, String>>,
+    writer: &Arc<Mutex<LocalSocketStream>>,
+    error: String,
+) {
+    let _ = responses.send(Err(error));
+    if let Ok(mut writer) = writer.lock() {
+        let _ = wire::write_request(&mut *writer, &Request::Detach);
     }
 }
 
@@ -1144,10 +1258,13 @@ enum Response {
         proof: [u8; 32],
         client_id: UiClientId,
         lease: ControlLease,
+        semantic_sequence: u64,
     },
     Ack,
     Snapshot(Option<TerminalUpdate>),
     TerminalChanged(TerminalChange),
+    SemanticEvent(SemanticEvent),
+    ResnapshotRequired,
     ControlLease(ControlLease),
     ControlLeaseDenied {
         reason: ControlLeaseDenial,
@@ -1178,6 +1295,7 @@ struct ResidentCore {
     subscribers: Arc<Mutex<Vec<TerminalSubscriber>>>,
     next_subscriber_id: AtomicU64,
     control: Arc<Mutex<ControlState>>,
+    semantic: Arc<Mutex<SemanticState>>,
     next_client_id: AtomicU64,
 }
 
@@ -1189,6 +1307,7 @@ struct ControlState {
 struct ClientRegistration {
     id: UiClientId,
     control: Arc<Mutex<ControlState>>,
+    semantic: Arc<Mutex<SemanticState>>,
 }
 
 impl Drop for ClientRegistration {
@@ -1198,10 +1317,47 @@ impl Drop for ClientRegistration {
             .lock()
             .expect("Resident Core Control Lease mutex poisoned");
         control.connected.remove(&self.id);
-        if control.lease.controller == Some(self.id) {
+        let changed = if control.lease.controller == Some(self.id) {
             control.lease.generation = control.lease.generation.saturating_add(1);
             control.lease.controller = None;
+            Some(control.lease.clone())
+        } else {
+            None
+        };
+        drop(control);
+        if let Some(lease) = changed {
+            publish_semantic_event(
+                &self.semantic,
+                SemanticEventKind::ControlLeaseChanged { lease },
+            );
         }
+    }
+}
+
+struct SemanticState {
+    sequence: u64,
+    subscribers: Vec<SemanticSubscriber>,
+    next_subscriber_id: u64,
+}
+
+struct SemanticSubscriber {
+    id: u64,
+    sender: flume::Sender<SemanticEvent>,
+    overflowed: Arc<AtomicBool>,
+}
+
+struct SemanticSubscription {
+    id: u64,
+    state: Arc<Mutex<SemanticState>>,
+}
+
+impl Drop for SemanticSubscription {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("Resident Core semantic subscriber mutex poisoned")
+            .subscribers
+            .retain(|subscriber| subscriber.id != self.id);
     }
 }
 
@@ -1230,6 +1386,12 @@ impl ResidentCore {
         let (ready_tx, ready_rx) = flume::bounded(1);
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         let worker_subscribers = Arc::clone(&subscribers);
+        let semantic = Arc::new(Mutex::new(SemanticState {
+            sequence: 0,
+            subscribers: Vec::new(),
+            next_subscriber_id: 1,
+        }));
+        let worker_semantic = Arc::clone(&semantic);
         thread::Builder::new()
             .name("resident-core-terminal".into())
             .spawn(move || {
@@ -1251,7 +1413,17 @@ impl ResidentCore {
 
                 loop {
                     let revision_before_refresh = revision;
+                    let lifecycle_before_refresh = lifecycle.clone();
                     refresh_terminal_state(&mut session, &events, &mut revision, &mut lifecycle);
+                    if lifecycle != lifecycle_before_refresh {
+                        publish_semantic_event(
+                            &worker_semantic,
+                            SemanticEventKind::TerminalLifecycleChanged {
+                                lifecycle: lifecycle.clone(),
+                                terminal_revision: revision,
+                            },
+                        );
+                    }
                     if revision != revision_before_refresh {
                         publish_terminal_change(&worker_subscribers, &mut event_sequence, revision);
                     }
@@ -1326,11 +1498,12 @@ impl ResidentCore {
                     controller: None,
                 },
             })),
+            semantic,
             next_client_id: AtomicU64::new(1),
         })
     }
 
-    fn attach_client(&self) -> (ClientRegistration, ControlLease) {
+    fn attach_client(&self) -> ClientRegistration {
         let id = UiClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed));
         let mut control = self
             .control
@@ -1338,19 +1511,25 @@ impl ResidentCore {
             .expect("Resident Core Control Lease mutex poisoned");
         let first_connection = control.connected.is_empty();
         control.connected.insert(id);
-        if first_connection && control.lease.controller.is_none() {
+        let changed = if first_connection && control.lease.controller.is_none() {
             control.lease.generation = control.lease.generation.saturating_add(1);
             control.lease.controller = Some(id);
-        }
-        let lease = control.lease.clone();
+            Some(control.lease.clone())
+        } else {
+            None
+        };
         drop(control);
-        (
-            ClientRegistration {
-                id,
-                control: Arc::clone(&self.control),
-            },
-            lease,
-        )
+        if let Some(lease) = changed {
+            publish_semantic_event(
+                &self.semantic,
+                SemanticEventKind::ControlLeaseChanged { lease },
+            );
+        }
+        ClientRegistration {
+            id,
+            control: Arc::clone(&self.control),
+            semantic: Arc::clone(&self.semantic),
+        }
     }
 
     fn control_lease(&self) -> ControlLease {
@@ -1422,7 +1601,15 @@ impl ResidentCore {
 
         control.lease.generation = control.lease.generation.saturating_add(1);
         control.lease.controller = Some(target);
-        Response::ControlLease(control.lease.clone())
+        let lease = control.lease.clone();
+        drop(control);
+        publish_semantic_event(
+            &self.semantic,
+            SemanticEventKind::ControlLeaseChanged {
+                lease: lease.clone(),
+            },
+        );
+        Response::ControlLease(lease)
     }
 
     fn acquire_control(&self, client_id: UiClientId, lease_generation: u64) -> Response {
@@ -1446,7 +1633,49 @@ impl ResidentCore {
 
         control.lease.generation = control.lease.generation.saturating_add(1);
         control.lease.controller = Some(client_id);
-        Response::ControlLease(control.lease.clone())
+        let lease = control.lease.clone();
+        drop(control);
+        publish_semantic_event(
+            &self.semantic,
+            SemanticEventKind::ControlLeaseChanged {
+                lease: lease.clone(),
+            },
+        );
+        Response::ControlLease(lease)
+    }
+
+    fn subscribe_semantic(
+        &self,
+    ) -> (
+        flume::Receiver<SemanticEvent>,
+        SemanticSubscription,
+        Arc<AtomicBool>,
+        u64,
+    ) {
+        let (sender, receiver) = flume::bounded(SEMANTIC_EVENT_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let mut state = self
+            .semantic
+            .lock()
+            .expect("Resident Core semantic subscriber mutex poisoned");
+        let id = state.next_subscriber_id;
+        state.next_subscriber_id = state.next_subscriber_id.saturating_add(1);
+        let sequence = state.sequence;
+        state.subscribers.push(SemanticSubscriber {
+            id,
+            sender,
+            overflowed: Arc::clone(&overflowed),
+        });
+        drop(state);
+        (
+            receiver,
+            SemanticSubscription {
+                id,
+                state: Arc::clone(&self.semantic),
+            },
+            overflowed,
+            sequence,
+        )
     }
 
     fn subscribe(&self) -> (flume::Receiver<TerminalChange>, TerminalSubscription) {
@@ -1477,6 +1706,27 @@ impl ResidentCore {
             .recv()
             .map_err(|_| "Resident Core terminal thread stopped before responding".to_string())?
     }
+}
+
+fn publish_semantic_event(state: &Arc<Mutex<SemanticState>>, kind: SemanticEventKind) {
+    let mut state = state
+        .lock()
+        .expect("Resident Core semantic subscriber mutex poisoned");
+    state.sequence = state.sequence.saturating_add(1);
+    let event = SemanticEvent {
+        sequence: state.sequence,
+        kind,
+    };
+    state.subscribers.retain(
+        |subscriber| match subscriber.sender.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(flume::TrySendError::Full(_)) => {
+                subscriber.overflowed.store(true, Ordering::Release);
+                false
+            }
+            Err(flume::TrySendError::Disconnected(_)) => false,
+        },
+    );
 }
 
 fn publish_terminal_change(
@@ -1723,8 +1973,11 @@ fn handle_client(
         )?;
         return Ok(ClientOutcome::Disconnected);
     }
-    let (registration, lease) = core.attach_client();
+    let registration = core.attach_client();
     let client_id = registration.id;
+    let (semantic_events, _semantic_subscription, semantic_overflowed, semantic_sequence) =
+        core.subscribe_semantic();
+    let lease = core.control_lease();
     write_shared_response(
         &writer,
         &Response::Ready {
@@ -1732,6 +1985,7 @@ fn handle_client(
             proof: server_proof(auth_secret, endpoint, &nonce),
             client_id,
             lease,
+            semantic_sequence,
         },
     )?;
     let (changes, _subscription) = core.subscribe();
@@ -1745,6 +1999,20 @@ fn handle_client(
                 {
                     break;
                 }
+            }
+        })?;
+    let semantic_writer = Arc::clone(&writer);
+    thread::Builder::new()
+        .name("resident-core-client-semantic-events".into())
+        .spawn(move || {
+            while let Ok(event) = semantic_events.recv() {
+                if write_shared_response(&semantic_writer, &Response::SemanticEvent(event)).is_err()
+                {
+                    return;
+                }
+            }
+            if semantic_overflowed.load(Ordering::Acquire) {
+                let _ = write_shared_response(&semantic_writer, &Response::ResnapshotRequired);
             }
         })?;
 
@@ -2044,6 +2312,7 @@ mod tests {
                 generation: 1,
                 controller: Some(super::UiClientId(1)),
             },
+            semantic_sequence: 1,
         })
         .expect("encode handshake response");
         let mut reader = TransientWouldBlock {

@@ -1,6 +1,6 @@
 use super::{
-    ControlLease, ControlLeaseDenial, MAX_MESSAGE_BYTES, Request, Response, TerminalCell,
-    TerminalChange, TerminalLifecycle, TerminalUpdate, UiClientId,
+    ControlLease, ControlLeaseDenial, MAX_MESSAGE_BYTES, Request, Response, SemanticEvent,
+    SemanticEventKind, TerminalCell, TerminalChange, TerminalLifecycle, TerminalUpdate, UiClientId,
 };
 use std::io::{self, Read, Write};
 
@@ -20,6 +20,8 @@ const RESPONSE_ERROR: u8 = 4;
 const RESPONSE_TERMINAL_CHANGED: u8 = 5;
 const RESPONSE_CONTROL_LEASE: u8 = 6;
 const RESPONSE_CONTROL_LEASE_DENIED: u8 = 7;
+const RESPONSE_SEMANTIC_EVENT: u8 = 8;
+const RESPONSE_RESNAPSHOT_REQUIRED: u8 = 9;
 
 pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
@@ -132,12 +134,14 @@ pub(super) fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
             proof,
             client_id,
             lease,
+            semantic_sequence,
         } => {
             payload.push(RESPONSE_READY);
             payload.extend_from_slice(&version.to_le_bytes());
             payload.extend_from_slice(proof);
             payload.extend_from_slice(&client_id.0.to_le_bytes());
             put_control_lease(&mut payload, lease);
+            payload.extend_from_slice(&semantic_sequence.to_le_bytes());
         }
         Response::Ack => payload.push(RESPONSE_ACK),
         Response::Snapshot(snapshot) => {
@@ -169,6 +173,25 @@ pub(super) fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
             });
             put_control_lease(&mut payload, lease);
         }
+        Response::SemanticEvent(event) => {
+            payload.push(RESPONSE_SEMANTIC_EVENT);
+            payload.extend_from_slice(&event.sequence.to_le_bytes());
+            match &event.kind {
+                SemanticEventKind::ControlLeaseChanged { lease } => {
+                    payload.push(0);
+                    put_control_lease(&mut payload, lease);
+                }
+                SemanticEventKind::TerminalLifecycleChanged {
+                    lifecycle,
+                    terminal_revision,
+                } => {
+                    payload.push(1);
+                    put_terminal_lifecycle(&mut payload, lifecycle)?;
+                    payload.extend_from_slice(&terminal_revision.to_le_bytes());
+                }
+            }
+        }
+        Response::ResnapshotRequired => payload.push(RESPONSE_RESNAPSHOT_REQUIRED),
         Response::Error(error) => {
             payload.push(RESPONSE_ERROR);
             put_string(&mut payload, error)?;
@@ -185,6 +208,7 @@ pub(super) fn decode_response(frame: &[u8]) -> io::Result<Response> {
             proof: decoder.array()?,
             client_id: UiClientId(decoder.u64()?),
             lease: decode_control_lease(&mut decoder)?,
+            semantic_sequence: decoder.u64()?,
         },
         RESPONSE_ACK => Response::Ack,
         RESPONSE_SNAPSHOT => Response::Snapshot(match decoder.u8()? {
@@ -208,6 +232,20 @@ pub(super) fn decode_response(frame: &[u8]) -> io::Result<Response> {
             },
             lease: decode_control_lease(&mut decoder)?,
         },
+        RESPONSE_SEMANTIC_EVENT => Response::SemanticEvent(SemanticEvent {
+            sequence: decoder.u64()?,
+            kind: match decoder.u8()? {
+                0 => SemanticEventKind::ControlLeaseChanged {
+                    lease: decode_control_lease(&mut decoder)?,
+                },
+                1 => SemanticEventKind::TerminalLifecycleChanged {
+                    lifecycle: decode_terminal_lifecycle(&mut decoder)?,
+                    terminal_revision: decoder.u64()?,
+                },
+                _ => return Err(invalid("invalid semantic event kind")),
+            },
+        }),
+        RESPONSE_RESNAPSHOT_REQUIRED => Response::ResnapshotRequired,
         _ => return Err(invalid("unknown Resident Core response kind")),
     };
     decoder.finish()?;
@@ -286,6 +324,27 @@ fn decode_control_lease(decoder: &mut Decoder<'_>) -> io::Result<ControlLease> {
     })
 }
 
+fn put_terminal_lifecycle(output: &mut Vec<u8>, lifecycle: &TerminalLifecycle) -> io::Result<()> {
+    match lifecycle {
+        TerminalLifecycle::Running => output.push(0),
+        TerminalLifecycle::Exited => output.push(1),
+        TerminalLifecycle::Failed(error) => {
+            output.push(2);
+            put_string(output, error)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_terminal_lifecycle(decoder: &mut Decoder<'_>) -> io::Result<TerminalLifecycle> {
+    match decoder.u8()? {
+        0 => Ok(TerminalLifecycle::Running),
+        1 => Ok(TerminalLifecycle::Exited),
+        2 => Ok(TerminalLifecycle::Failed(decoder.string()?.to_owned())),
+        _ => Err(invalid("invalid Terminal Session lifecycle")),
+    }
+}
+
 fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalUpdate) -> io::Result<()> {
     snapshot
         .validate()
@@ -298,14 +357,7 @@ fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalUpdate) -> io::Result<(
         None => output.push(0),
     }
     output.extend_from_slice(&snapshot.revision.to_le_bytes());
-    match &snapshot.lifecycle {
-        TerminalLifecycle::Running => output.push(0),
-        TerminalLifecycle::Exited => output.push(1),
-        TerminalLifecycle::Failed(error) => {
-            output.push(2);
-            put_string(output, error)?;
-        }
-    }
+    put_terminal_lifecycle(output, &snapshot.lifecycle)?;
     output.extend_from_slice(&snapshot.cols.to_le_bytes());
     output.extend_from_slice(&snapshot.rows.to_le_bytes());
     match snapshot.cursor {
@@ -346,12 +398,7 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalUpdate> {
         _ => return Err(invalid("invalid base revision presence flag")),
     };
     let revision = decoder.u64()?;
-    let lifecycle = match decoder.u8()? {
-        0 => TerminalLifecycle::Running,
-        1 => TerminalLifecycle::Exited,
-        2 => TerminalLifecycle::Failed(decoder.string()?.to_owned()),
-        _ => return Err(invalid("invalid Terminal Session lifecycle")),
-    };
+    let lifecycle = decode_terminal_lifecycle(decoder)?;
     let cols = decoder.u16()?;
     let rows = decoder.u16()?;
     let cursor = match decoder.u8()? {
@@ -531,8 +578,8 @@ mod tests {
         write_response,
     };
     use crate::resident_core::{
-        ControlLease, ControlLeaseDenial, Request, Response, TerminalCell, TerminalChange,
-        TerminalLifecycle, TerminalUpdate, UiClientId,
+        ControlLease, ControlLeaseDenial, Request, Response, SemanticEvent, SemanticEventKind,
+        TerminalCell, TerminalChange, TerminalLifecycle, TerminalUpdate, UiClientId,
     };
     use crate::terminal_session::TerminalSize;
 
@@ -627,6 +674,7 @@ mod tests {
                     generation: 18,
                     controller: Some(UiClientId(17)),
                 },
+                semantic_sequence: 19,
             },
             Response::Ack,
             Response::Snapshot(None),
@@ -646,6 +694,14 @@ mod tests {
                     controller: Some(UiClientId(27)),
                 },
             },
+            Response::SemanticEvent(SemanticEvent {
+                sequence: 28,
+                kind: SemanticEventKind::TerminalLifecycleChanged {
+                    lifecycle: TerminalLifecycle::Exited,
+                    terminal_revision: 29,
+                },
+            }),
+            Response::ResnapshotRequired,
             Response::Error("failed: λ".into()),
         ];
 
