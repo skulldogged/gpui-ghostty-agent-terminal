@@ -742,11 +742,12 @@ impl TerminalUpdate {
         for &row in &self.dirty_rows {
             dirty[usize::from(row)] = true;
         }
-        if self
-            .cells
-            .iter()
-            .any(|cell| cell.x >= self.cols || cell.y >= self.rows || !dirty[usize::from(cell.y)])
-        {
+        if self.cells.iter().any(|cell| {
+            cell.x >= self.cols
+                || cell.y >= self.rows
+                || cell.width > 2
+                || !dirty[usize::from(cell.y)]
+        }) {
             return Err("terminal update cell is outside its dirty rows".into());
         }
         if let Some((x, y)) = self.cursor
@@ -1268,6 +1269,7 @@ mod tests {
         TerminalCell {
             x,
             y,
+            width: 1,
             text: text.into(),
             fg: [0xdd; 3],
             bg: [0x11; 3],
