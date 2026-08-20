@@ -1,4 +1,6 @@
-use crate::{CoreClient, TerminalChange, TerminalSize, TerminalSnapshot};
+use crate::{
+    CoreClient, SemanticEvent, SemanticEventKind, TerminalChange, TerminalSize, TerminalSnapshot,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -55,6 +57,7 @@ enum Command {
 enum DriverEvent {
     Command(Result<Command, flume::RecvError>),
     TerminalChanged(Result<TerminalChange, flume::RecvError>),
+    Semantic(Result<SemanticEvent, flume::RecvError>),
 }
 
 impl CoreDriver {
@@ -137,10 +140,12 @@ fn run_driver(
     counters: Arc<DriverCounters>,
 ) {
     let mut terminal_changes = core.terminal_changes();
+    let mut semantic_events = core.semantic_events();
     loop {
         let event = flume::Selector::new()
             .recv(&commands, DriverEvent::Command)
             .recv(&terminal_changes, DriverEvent::TerminalChanged)
+            .recv(&semantic_events, DriverEvent::Semantic)
             .wait();
         let (result, reconnect) = match event {
             DriverEvent::Command(Err(_)) => break,
@@ -185,6 +190,33 @@ fn run_driver(
                 Err("Resident Core disconnected while waiting for a terminal change".into()),
                 true,
             ),
+            DriverEvent::Semantic(Ok(event)) => {
+                core.accept_semantic_event(&event);
+                let SemanticEventKind::TerminalLifecycleChanged {
+                    terminal_revision, ..
+                } = event.kind
+                else {
+                    continue;
+                };
+                if terminal_revision <= revision {
+                    continue;
+                }
+                counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
+                let result = core.snapshot_since(revision).map(|snapshot| {
+                    if let Some(snapshot) = &snapshot {
+                        revision = snapshot.revision;
+                    }
+                    snapshot.map(DriverUpdate::Snapshot)
+                });
+                let reconnect = result
+                    .as_ref()
+                    .is_err_and(|error| is_connection_failure(error));
+                (result, reconnect)
+            }
+            DriverEvent::Semantic(Err(_)) => (
+                Err("Resident Core disconnected while waiting for a semantic event".into()),
+                true,
+            ),
         };
         match result {
             Ok(Some(update)) => {
@@ -204,6 +236,7 @@ fn run_driver(
                 match recovered {
                     Ok((replacement, snapshot)) => {
                         terminal_changes = replacement.terminal_changes();
+                        semantic_events = replacement.semantic_events();
                         core = replacement;
                         revision = snapshot.revision;
                         counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
