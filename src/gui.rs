@@ -1,10 +1,13 @@
 use crate::{
     CoreClient, TerminalLifecycle, TerminalSize, TerminalSnapshot,
-    terminal_grid::{CellMetrics, GridDimensions, cell_offset, measured_cell_height},
+    core_driver::{CoreDriver, DriverUpdate},
+    terminal_frame::TerminalFrame,
+    terminal_grid::{CellMetrics, GridDimensions, measured_cell_height},
 };
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Pixels, Render,
-    SharedString, Task, Window, WindowBounds, WindowOptions, div, font, prelude::*, px, rgb, size,
+    SharedString, Task, TextRun, Window, WindowBounds, WindowOptions, canvas, div, fill, font,
+    point, prelude::*, px, rgb, size,
 };
 use std::time::Duration;
 
@@ -17,6 +20,7 @@ pub fn run() {
             TerminalFont::resolve(cx).expect("resolve an installed fixed-pitch terminal font");
         let mut core = CoreClient::connect_or_spawn().expect("attach to Resident Core");
         let snapshot = core.snapshot().expect("snapshot Terminal Session");
+        let driver = CoreDriver::start(core, snapshot.revision).expect("start UI Core driver");
         let terminal_error = lifecycle_message(&snapshot.lifecycle);
         let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
         let window = cx
@@ -29,7 +33,7 @@ pub fn run() {
                     let focus = cx.focus_handle();
                     focus.focus(window);
                     let view = cx.new(|_| TerminalView {
-                        core,
+                        driver,
                         snapshot,
                         focus,
                         refresh_task: Task::ready(()),
@@ -54,7 +58,7 @@ pub fn run() {
 }
 
 struct TerminalView {
-    core: CoreClient,
+    driver: CoreDriver,
     snapshot: TerminalSnapshot,
     focus: FocusHandle,
     refresh_task: Task<()>,
@@ -170,7 +174,7 @@ impl TerminalView {
             timer.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |view, _cx| {
-                    if let Err(error) = view.core.input(b"echo WINDOWS_CONPTY_LIVE\r") {
+                    if let Err(error) = view.driver.input(b"echo WINDOWS_CONPTY_LIVE\r".to_vec()) {
                         view.terminal_error = Some(error);
                     }
                 })
@@ -190,17 +194,18 @@ impl TerminalView {
                 };
                 if this
                     .update(cx, |view, cx| {
-                        match view.core.snapshot_since(view.snapshot.revision) {
-                            Ok(Some(snapshot)) => {
+                        view.driver.request_snapshot();
+                        match view.driver.latest_update() {
+                            Some(DriverUpdate::Snapshot(snapshot)) => {
                                 view.terminal_error = lifecycle_message(&snapshot.lifecycle);
                                 view.snapshot = snapshot;
                                 cx.notify();
                             }
-                            Ok(None) => {}
-                            Err(error) => {
+                            Some(DriverUpdate::Error(error)) => {
                                 view.terminal_error = Some(error);
                                 cx.notify();
                             }
+                            None => {}
                         }
                     })
                     .is_err()
@@ -233,7 +238,7 @@ impl TerminalView {
         };
 
         if let Some(bytes) = bytes {
-            if let Err(error) = self.core.input(&bytes) {
+            if let Err(error) = self.driver.input(bytes) {
                 self.terminal_error = Some(error);
                 cx.notify();
             }
@@ -248,26 +253,6 @@ fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
         TerminalLifecycle::Exited => Some("Terminal process exited".into()),
         TerminalLifecycle::Failed(error) => Some(format!("Terminal process failed: {error}")),
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WideTailCursor {
-    x: u16,
-    y: u16,
-    background: [u8; 3],
-}
-
-fn wide_tail_cursor(snapshot: &TerminalSnapshot) -> Option<WideTailCursor> {
-    let (x, y) = snapshot.cursor?;
-    let cell = snapshot
-        .cells
-        .iter()
-        .find(|cell| cell.x == x && cell.y == y && cell.width == 0)?;
-    Some(WideTailCursor {
-        x,
-        y,
-        background: cell.fg,
-    })
 }
 
 impl Render for TerminalView {
@@ -286,70 +271,99 @@ impl Render for TerminalView {
             self.terminal_font.cells.height_px,
         );
         if self.requested_size != Some(desired_size) {
-            match self.core.resize(desired_size) {
+            match self.driver.resize(desired_size) {
                 Ok(()) => self.requested_size = Some(desired_size),
                 Err(error) => self.terminal_error = Some(error),
             }
         }
 
-        let snapshot = &self.snapshot;
-        let cursor = snapshot.cursor;
-        let wide_tail_cursor = wide_tail_cursor(snapshot);
-        let default_bg = color(snapshot.default_bg);
-        let mut cells_by_offset =
-            vec![None; usize::from(snapshot.cols) * usize::from(snapshot.rows)];
-        for cell in &snapshot.cells {
-            if let Some(offset) = cell_offset(snapshot.cols, cell.x, cell.y)
-                && let Some(slot) = cells_by_offset.get_mut(offset)
-            {
-                *slot = Some(cell);
-            }
-        }
-
-        let rows = (0..snapshot.rows).map(|y| {
-            let cells = (0..snapshot.cols).map(|x| {
-                let cell = cell_offset(snapshot.cols, x, y)
-                    .and_then(|offset| cells_by_offset.get(offset))
-                    .copied()
-                    .flatten();
-                let text = cell
-                    .map(|cell| cell.text.as_str())
-                    .filter(|text| !text.is_empty())
-                    .unwrap_or(" ")
-                    .to_owned();
-                let foreground = cell.map(|cell| cell.fg).unwrap_or(snapshot.default_fg);
-                let background = if cursor == Some((x, y)) {
-                    foreground
-                } else {
-                    cell.map(|cell| cell.bg).unwrap_or(snapshot.default_bg)
-                };
-                let foreground = if cursor == Some((x, y)) {
-                    snapshot.default_bg
-                } else {
-                    foreground
-                };
-                let width = cell.map(|cell| cell.width).unwrap_or(1);
-
-                div()
-                    .w(px(
-                        f32::from(self.terminal_font.cells.width_px) * f32::from(width)
-                    ))
-                    .h(px(f32::from(self.terminal_font.cells.height_px)))
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(color(background))
-                    .text_color(color(foreground))
-                    .text_size(self.terminal_font.size)
-                    .line_height(px(f32::from(self.terminal_font.cells.height_px)))
-                    .font_family(self.terminal_font.family.clone())
-                    .child(text)
-            });
-            div()
-                .h(px(f32::from(self.terminal_font.cells.height_px)))
-                .flex()
-                .flex_row()
-                .children(cells)
-        });
+        let frame = TerminalFrame::from_snapshot(&self.snapshot);
+        let default_bg = color(self.snapshot.default_bg);
+        let terminal_font = self.terminal_font.clone();
+        let paint_font = terminal_font.clone();
+        let shape_frame = frame.clone();
+        let terminal_canvas = canvas(
+            move |_bounds, window, _cx| {
+                let font = font(terminal_font.family.clone());
+                shape_frame
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let runs = row
+                            .runs
+                            .iter()
+                            .map(|run| TextRun {
+                                len: run.len,
+                                font: font.clone(),
+                                color: color(run.color).into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            })
+                            .collect::<Vec<_>>();
+                        window.text_system().shape_line(
+                            row.text.clone().into(),
+                            terminal_font.size,
+                            &runs,
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            move |bounds, lines, window, cx| {
+                for background in &frame.backgrounds {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.left()
+                                    + px(f32::from(background.x)
+                                        * f32::from(paint_font.cells.width_px)),
+                                bounds.top()
+                                    + px(f32::from(background.y)
+                                        * f32::from(paint_font.cells.height_px)),
+                            ),
+                            size(
+                                px(f32::from(background.width)
+                                    * f32::from(paint_font.cells.width_px)),
+                                px(f32::from(paint_font.cells.height_px)),
+                            ),
+                        ),
+                        color(background.color),
+                    ));
+                }
+                for (y, line) in lines.iter().enumerate() {
+                    let _ = line.paint(
+                        point(
+                            bounds.left(),
+                            bounds.top() + px(y as f32 * f32::from(paint_font.cells.height_px)),
+                        ),
+                        px(f32::from(paint_font.cells.height_px)),
+                        window,
+                        cx,
+                    );
+                }
+                if let Some(cursor) = frame.cursor_overlay {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.left()
+                                    + px(f32::from(cursor.x)
+                                        * f32::from(paint_font.cells.width_px)),
+                                bounds.top()
+                                    + px(f32::from(cursor.y)
+                                        * f32::from(paint_font.cells.height_px)),
+                            ),
+                            size(
+                                px(f32::from(paint_font.cells.width_px)),
+                                px(f32::from(paint_font.cells.height_px)),
+                            ),
+                        ),
+                        color(cursor.color),
+                    ));
+                }
+            },
+        )
+        .size_full();
 
         div()
             .id("terminal")
@@ -361,22 +375,7 @@ impl Render for TerminalView {
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
-            .children(rows)
-            .when_some(wide_tail_cursor, |this, cursor| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left(px(TERMINAL_PADDING_PX
-                            + f32::from(cursor.x)
-                                * f32::from(self.terminal_font.cells.width_px)))
-                        .top(px(TERMINAL_PADDING_PX
-                            + f32::from(cursor.y)
-                                * f32::from(self.terminal_font.cells.height_px)))
-                        .w(px(f32::from(self.terminal_font.cells.width_px)))
-                        .h(px(f32::from(self.terminal_font.cells.height_px)))
-                        .bg(color(cursor.background)),
-                )
-            })
+            .child(terminal_canvas)
             .when_some(self.terminal_error.clone(), |this, error| {
                 this.child(
                     div()
@@ -392,51 +391,4 @@ impl Render for TerminalView {
 
 fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
     rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::wide_tail_cursor;
-    use crate::{TerminalCell, TerminalLifecycle, TerminalSnapshot};
-
-    #[test]
-    fn cursor_on_a_wide_glyph_tail_gets_an_independent_cell_overlay() {
-        let snapshot = TerminalSnapshot {
-            revision: 1,
-            lifecycle: TerminalLifecycle::Running,
-            cols: 4,
-            rows: 1,
-            cursor: Some((1, 0)),
-            default_fg: [0xdd, 0xdd, 0xdd],
-            default_bg: [0x11, 0x11, 0x11],
-            cells: vec![
-                TerminalCell {
-                    x: 0,
-                    y: 0,
-                    width: 2,
-                    text: "界".into(),
-                    fg: [0xaa, 0xbb, 0xcc],
-                    bg: [0x11, 0x11, 0x11],
-                    has_explicit_bg: false,
-                },
-                TerminalCell {
-                    x: 1,
-                    y: 0,
-                    width: 0,
-                    text: String::new(),
-                    fg: [0xaa, 0xbb, 0xcc],
-                    bg: [0x11, 0x11, 0x11],
-                    has_explicit_bg: false,
-                },
-            ],
-        };
-
-        let overlay = wide_tail_cursor(&snapshot).expect("wide-tail cursor overlay");
-        assert_eq!((overlay.x, overlay.y), (1, 0));
-        assert_eq!(overlay.background, [0xaa, 0xbb, 0xcc]);
-
-        let mut ordinary_cursor = snapshot;
-        ordinary_cursor.cursor = Some((0, 0));
-        assert!(wide_tail_cursor(&ordinary_cursor).is_none());
-    }
 }

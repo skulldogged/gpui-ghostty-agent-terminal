@@ -67,9 +67,10 @@ mightty is the closest native Rust/GPUI precedent.
 
 ## Remaining vertical-slice work
 
-- The current GPUI renderer uses measured fixed-cell geometry, constant-time
-  cell lookup, and live PTY resizing. Production rendering should batch glyphs
-  and backgrounds instead of retaining one GPUI element per terminal cell.
+- The GPUI renderer uses measured fixed-cell geometry, constant-time cell
+  lookup, one shaped draw per row, merged background runs, and live PTY
+  resizing. A bounded background driver coalesces visual refreshes so local IPC
+  and reconnect work never block GPUI's event thread.
 - Keyboard input covers text, control keys, and arrows. Full IME support needs
   a GPUI `InputHandler`, not only key-down events.
 - Agent TUIs remain ordinary PTY clients. Rich agent integration belongs in a

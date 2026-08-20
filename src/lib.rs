@@ -5,12 +5,16 @@ mod pty;
 #[cfg(feature = "gui")]
 mod resident_core;
 #[cfg(feature = "gui")]
+mod terminal_frame;
+#[cfg(feature = "gui")]
 mod terminal_grid;
 #[cfg(feature = "gui")]
 mod terminal_session;
 #[cfg(all(feature = "gui", windows))]
 mod windows_pty;
 
+#[cfg(feature = "gui")]
+mod core_driver;
 #[cfg(feature = "gui")]
 mod gui;
 
