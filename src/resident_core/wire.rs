@@ -1,6 +1,6 @@
 use super::{
-    MAX_MESSAGE_BYTES, Request, Response, TerminalCell, TerminalChange, TerminalLifecycle,
-    TerminalUpdate,
+    ControlLease, ControlLeaseDenial, MAX_MESSAGE_BYTES, Request, Response, TerminalCell,
+    TerminalChange, TerminalLifecycle, TerminalUpdate, UiClientId,
 };
 use std::io::{self, Read, Write};
 
@@ -9,11 +9,16 @@ const REQUEST_INPUT: u8 = 2;
 const REQUEST_RESIZE: u8 = 3;
 const REQUEST_SNAPSHOT: u8 = 4;
 const REQUEST_STOP_RESIDENT_CORE: u8 = 5;
+const REQUEST_CONTROL_LEASE: u8 = 6;
+const REQUEST_TRANSFER_CONTROL: u8 = 7;
+const REQUEST_ACQUIRE_CONTROL: u8 = 8;
 const RESPONSE_READY: u8 = 1;
 const RESPONSE_ACK: u8 = 2;
 const RESPONSE_SNAPSHOT: u8 = 3;
 const RESPONSE_ERROR: u8 = 4;
 const RESPONSE_TERMINAL_CHANGED: u8 = 5;
+const RESPONSE_CONTROL_LEASE: u8 = 6;
+const RESPONSE_CONTROL_LEASE_DENIED: u8 = 7;
 
 pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
@@ -23,12 +28,20 @@ pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
             payload.extend_from_slice(&version.to_le_bytes());
             payload.extend_from_slice(nonce);
         }
-        Request::Input { bytes } => {
+        Request::Input {
+            lease_generation,
+            bytes,
+        } => {
             payload.push(REQUEST_INPUT);
+            payload.extend_from_slice(&lease_generation.to_le_bytes());
             put_bytes(&mut payload, bytes)?;
         }
-        Request::Resize { size } => {
+        Request::Resize {
+            lease_generation,
+            size,
+        } => {
             payload.push(REQUEST_RESIZE);
+            payload.extend_from_slice(&lease_generation.to_le_bytes());
             for value in [
                 size.cols,
                 size.rows,
@@ -48,6 +61,19 @@ pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
                 None => payload.push(0),
             }
         }
+        Request::ControlLease => payload.push(REQUEST_CONTROL_LEASE),
+        Request::TransferControl {
+            lease_generation,
+            target,
+        } => {
+            payload.push(REQUEST_TRANSFER_CONTROL);
+            payload.extend_from_slice(&lease_generation.to_le_bytes());
+            payload.extend_from_slice(&target.0.to_le_bytes());
+        }
+        Request::AcquireControl { lease_generation } => {
+            payload.push(REQUEST_ACQUIRE_CONTROL);
+            payload.extend_from_slice(&lease_generation.to_le_bytes());
+        }
         Request::StopResidentCore => payload.push(REQUEST_STOP_RESIDENT_CORE),
     }
     frame(payload)
@@ -61,9 +87,11 @@ pub(super) fn decode_request(frame: &[u8]) -> io::Result<Request> {
             nonce: decoder.array()?,
         },
         REQUEST_INPUT => Request::Input {
+            lease_generation: decoder.u64()?,
             bytes: decoder.bytes()?.to_vec(),
         },
         REQUEST_RESIZE => Request::Resize {
+            lease_generation: decoder.u64()?,
             size: crate::terminal_session::TerminalSize::new(
                 decoder.u16()?,
                 decoder.u16()?,
@@ -78,6 +106,14 @@ pub(super) fn decode_request(frame: &[u8]) -> io::Result<Request> {
                 _ => return Err(invalid("invalid Snapshot revision flag")),
             },
         },
+        REQUEST_CONTROL_LEASE => Request::ControlLease,
+        REQUEST_TRANSFER_CONTROL => Request::TransferControl {
+            lease_generation: decoder.u64()?,
+            target: UiClientId(decoder.u64()?),
+        },
+        REQUEST_ACQUIRE_CONTROL => Request::AcquireControl {
+            lease_generation: decoder.u64()?,
+        },
         REQUEST_STOP_RESIDENT_CORE => Request::StopResidentCore,
         _ => return Err(invalid("unknown Resident Core request kind")),
     };
@@ -88,10 +124,17 @@ pub(super) fn decode_request(frame: &[u8]) -> io::Result<Request> {
 pub(super) fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
     match response {
-        Response::Ready { version, proof } => {
+        Response::Ready {
+            version,
+            proof,
+            client_id,
+            lease,
+        } => {
             payload.push(RESPONSE_READY);
             payload.extend_from_slice(&version.to_le_bytes());
             payload.extend_from_slice(proof);
+            payload.extend_from_slice(&client_id.0.to_le_bytes());
+            put_control_lease(&mut payload, lease);
         }
         Response::Ack => payload.push(RESPONSE_ACK),
         Response::Snapshot(snapshot) => {
@@ -109,6 +152,20 @@ pub(super) fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
             payload.extend_from_slice(&change.sequence.to_le_bytes());
             payload.extend_from_slice(&change.terminal_revision.to_le_bytes());
         }
+        Response::ControlLease(lease) => {
+            payload.push(RESPONSE_CONTROL_LEASE);
+            put_control_lease(&mut payload, lease);
+        }
+        Response::ControlLeaseDenied { reason, lease } => {
+            payload.push(RESPONSE_CONTROL_LEASE_DENIED);
+            payload.push(match reason {
+                ControlLeaseDenial::HeldByOther => 0,
+                ControlLeaseDenial::StaleGeneration => 1,
+                ControlLeaseDenial::TargetUnavailable => 2,
+                ControlLeaseDenial::NoController => 3,
+            });
+            put_control_lease(&mut payload, lease);
+        }
         Response::Error(error) => {
             payload.push(RESPONSE_ERROR);
             put_string(&mut payload, error)?;
@@ -123,6 +180,8 @@ pub(super) fn decode_response(frame: &[u8]) -> io::Result<Response> {
         RESPONSE_READY => Response::Ready {
             version: decoder.u16()?,
             proof: decoder.array()?,
+            client_id: UiClientId(decoder.u64()?),
+            lease: decode_control_lease(&mut decoder)?,
         },
         RESPONSE_ACK => Response::Ack,
         RESPONSE_SNAPSHOT => Response::Snapshot(match decoder.u8()? {
@@ -135,6 +194,17 @@ pub(super) fn decode_response(frame: &[u8]) -> io::Result<Response> {
             sequence: decoder.u64()?,
             terminal_revision: decoder.u64()?,
         }),
+        RESPONSE_CONTROL_LEASE => Response::ControlLease(decode_control_lease(&mut decoder)?),
+        RESPONSE_CONTROL_LEASE_DENIED => Response::ControlLeaseDenied {
+            reason: match decoder.u8()? {
+                0 => ControlLeaseDenial::HeldByOther,
+                1 => ControlLeaseDenial::StaleGeneration,
+                2 => ControlLeaseDenial::TargetUnavailable,
+                3 => ControlLeaseDenial::NoController,
+                _ => return Err(invalid("invalid Control Lease denial reason")),
+            },
+            lease: decode_control_lease(&mut decoder)?,
+        },
         _ => return Err(invalid("unknown Resident Core response kind")),
     };
     decoder.finish()?;
@@ -187,6 +257,30 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     frame.resize(frame_len, 0);
     reader.read_exact(&mut frame[4..])?;
     Ok(Some(frame))
+}
+
+fn put_control_lease(output: &mut Vec<u8>, lease: &ControlLease) {
+    output.extend_from_slice(&lease.generation.to_le_bytes());
+    match lease.controller {
+        Some(controller) => {
+            output.push(1);
+            output.extend_from_slice(&controller.0.to_le_bytes());
+        }
+        None => output.push(0),
+    }
+}
+
+fn decode_control_lease(decoder: &mut Decoder<'_>) -> io::Result<ControlLease> {
+    let generation = decoder.u64()?;
+    let controller = match decoder.u8()? {
+        0 => None,
+        1 => Some(UiClientId(decoder.u64()?)),
+        _ => return Err(invalid("invalid Control Lease controller flag")),
+    };
+    Ok(ControlLease {
+        generation,
+        controller,
+    })
 }
 
 fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalUpdate) -> io::Result<()> {
@@ -434,7 +528,8 @@ mod tests {
         write_response,
     };
     use crate::resident_core::{
-        Request, Response, TerminalCell, TerminalChange, TerminalLifecycle, TerminalUpdate,
+        ControlLease, ControlLeaseDenial, Request, Response, TerminalCell, TerminalChange,
+        TerminalLifecycle, TerminalUpdate, UiClientId,
     };
     use crate::terminal_session::TerminalSize;
 
@@ -460,14 +555,24 @@ mod tests {
                 nonce: [7; 32],
             },
             Request::Input {
+                lease_generation: 11,
                 bytes: vec![0, 0xff, b'\n', b'{', b'}'],
             },
             Request::Resize {
+                lease_generation: 12,
                 size: TerminalSize::new(132, 43, 9, 18),
             },
             Request::Snapshot { since: None },
             Request::Snapshot {
                 since: Some(0x0102_0304_0506_0708),
+            },
+            Request::ControlLease,
+            Request::TransferControl {
+                lease_generation: 13,
+                target: UiClientId(14),
+            },
+            Request::AcquireControl {
+                lease_generation: 15,
             },
             Request::StopResidentCore,
         ];
@@ -513,6 +618,11 @@ mod tests {
             Response::Ready {
                 version: 2,
                 proof: [9; 32],
+                client_id: UiClientId(17),
+                lease: ControlLease {
+                    generation: 18,
+                    controller: Some(UiClientId(17)),
+                },
             },
             Response::Ack,
             Response::Snapshot(None),
@@ -521,6 +631,17 @@ mod tests {
                 sequence: 23,
                 terminal_revision: 42,
             }),
+            Response::ControlLease(ControlLease {
+                generation: 24,
+                controller: Some(UiClientId(25)),
+            }),
+            Response::ControlLeaseDenied {
+                reason: ControlLeaseDenial::HeldByOther,
+                lease: ControlLease {
+                    generation: 26,
+                    controller: Some(UiClientId(27)),
+                },
+            },
             Response::Error("failed: λ".into()),
         ];
 

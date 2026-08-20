@@ -8,7 +8,8 @@ use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::{
-    Listener as LocalSocketListener, ListenerOptions, Stream as LocalSocketStream, prelude::*,
+    Listener as LocalSocketListener, ListenerNonblockingMode, ListenerOptions,
+    Stream as LocalSocketStream, prelude::*,
 };
 use ring::{
     hmac,
@@ -17,11 +18,12 @@ use ring::{
 #[cfg(any(unix, test))]
 use std::io::Read;
 use std::{
+    collections::HashSet,
     io::{self, BufReader, Write},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -29,10 +31,10 @@ use std::{
 
 mod wire;
 
-// Version 3 adds coalescible server-pushed terminal invalidations to the
-// binary dirty-row protocol. An old core must fail the handshake rather than
-// let a new UI misinterpret unsolicited frames as command responses.
-const PROTOCOL_VERSION: u16 = 3;
+// Version 4 adds explicit UI Client identity and generation-checked Control
+// Lease arbitration. An old core must fail the handshake rather than accept
+// input without the current lease generation.
+const PROTOCOL_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_TICK: Duration = Duration::from_millis(10);
 const AUTH_SECRET_BYTES: usize = 32;
@@ -324,10 +326,59 @@ pub struct TerminalChange {
     pub terminal_revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UiClientId(u64);
+
+impl UiClientId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlLease {
+    pub generation: u64,
+    pub controller: Option<UiClientId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlLeaseDenial {
+    HeldByOther,
+    NoController,
+    StaleGeneration,
+    TargetUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoreCommandError {
+    ControlLeaseDenied {
+        reason: ControlLeaseDenial,
+        lease: ControlLease,
+    },
+    Message(String),
+}
+
+impl std::fmt::Display for CoreCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ControlLeaseDenied { reason, lease } => write!(
+                formatter,
+                "Control Lease denied ({reason:?}); controller {:?}, generation {}",
+                lease.controller, lease.generation
+            ),
+            Self::Message(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CoreCommandError {}
+
 pub struct CoreClient {
     connection: BufReader<LocalSocketStream>,
     snapshot: Option<TerminalSnapshot>,
     pending_terminal_change: Option<TerminalChange>,
+    client_id: UiClientId,
+    control_lease: ControlLease,
 }
 
 impl CoreClient {
@@ -351,14 +402,23 @@ impl CoreClient {
                         connection: BufReader::new(stream),
                         snapshot: None,
                         pending_terminal_change: None,
+                        client_id: UiClientId(0),
+                        control_lease: ControlLease {
+                            generation: 0,
+                            controller: None,
+                        },
                     };
                     let nonce = random_bytes::<AUTH_NONCE_BYTES>()?;
                     match client.handshake(nonce, deadline)? {
                         Response::Ready {
                             version: PROTOCOL_VERSION,
                             proof,
+                            client_id,
+                            lease,
                         } => {
                             verify_server_proof(&auth_secret, endpoint, &nonce, &proof)?;
+                            client.client_id = client_id;
+                            client.control_lease = lease;
                             configure_stream_timeouts(client.connection.get_ref(), None)?;
                             return Ok(client);
                         }
@@ -395,21 +455,115 @@ impl CoreClient {
         Self::connect(&endpoint, Duration::from_secs(10))
     }
 
-    pub fn input(&mut self, bytes: &[u8]) -> Result<(), String> {
-        match self.request(Request::Input {
-            bytes: bytes.to_vec(),
-        })? {
+    pub fn client_id(&self) -> UiClientId {
+        self.client_id
+    }
+
+    pub fn control_lease(&self) -> &ControlLease {
+        &self.control_lease
+    }
+
+    pub fn input(&mut self, bytes: &[u8]) -> Result<(), CoreCommandError> {
+        match self
+            .request(Request::Input {
+                lease_generation: self.control_lease.generation,
+                bytes: bytes.to_vec(),
+            })
+            .map_err(CoreCommandError::Message)?
+        {
             Response::Ack => Ok(()),
-            Response::Error(error) => Err(error),
-            response => Err(format!("invalid input response: {response:?}")),
+            Response::ControlLeaseDenied { reason, lease } => {
+                self.control_lease = lease.clone();
+                Err(CoreCommandError::ControlLeaseDenied { reason, lease })
+            }
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid input response: {response:?}"
+            ))),
         }
     }
 
-    pub fn resize(&mut self, size: TerminalSize) -> Result<(), String> {
-        match self.request(Request::Resize { size })? {
+    pub fn resize(&mut self, size: TerminalSize) -> Result<(), CoreCommandError> {
+        match self
+            .request(Request::Resize {
+                lease_generation: self.control_lease.generation,
+                size,
+            })
+            .map_err(CoreCommandError::Message)?
+        {
             Response::Ack => Ok(()),
-            Response::Error(error) => Err(error),
-            response => Err(format!("invalid resize response: {response:?}")),
+            Response::ControlLeaseDenied { reason, lease } => {
+                self.control_lease = lease.clone();
+                Err(CoreCommandError::ControlLeaseDenied { reason, lease })
+            }
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid resize response: {response:?}"
+            ))),
+        }
+    }
+
+    pub fn refresh_control_lease(&mut self) -> Result<ControlLease, CoreCommandError> {
+        match self
+            .request(Request::ControlLease)
+            .map_err(CoreCommandError::Message)?
+        {
+            Response::ControlLease(lease) => {
+                self.control_lease = lease.clone();
+                Ok(lease)
+            }
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid Control Lease response: {response:?}"
+            ))),
+        }
+    }
+
+    pub fn transfer_control(
+        &mut self,
+        target: UiClientId,
+    ) -> Result<ControlLease, CoreCommandError> {
+        match self
+            .request(Request::TransferControl {
+                lease_generation: self.control_lease.generation,
+                target,
+            })
+            .map_err(CoreCommandError::Message)?
+        {
+            Response::ControlLease(lease) => {
+                self.control_lease = lease.clone();
+                Ok(lease)
+            }
+            Response::ControlLeaseDenied { reason, lease } => {
+                self.control_lease = lease.clone();
+                Err(CoreCommandError::ControlLeaseDenied { reason, lease })
+            }
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid Control Lease transfer response: {response:?}"
+            ))),
+        }
+    }
+
+    pub fn acquire_control(&mut self) -> Result<ControlLease, CoreCommandError> {
+        match self
+            .request(Request::AcquireControl {
+                lease_generation: self.control_lease.generation,
+            })
+            .map_err(CoreCommandError::Message)?
+        {
+            Response::ControlLease(lease) => {
+                self.control_lease = lease.clone();
+                Ok(lease)
+            }
+            Response::ControlLeaseDenied { reason, lease } => {
+                self.control_lease = lease.clone();
+                Err(CoreCommandError::ControlLeaseDenied { reason, lease })
+            }
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid Control Lease acquisition response: {response:?}"
+            ))),
         }
     }
 
@@ -942,28 +1096,47 @@ enum Request {
         nonce: [u8; AUTH_NONCE_BYTES],
     },
     Input {
+        lease_generation: u64,
         bytes: Vec<u8>,
     },
     Resize {
+        lease_generation: u64,
         size: TerminalSize,
     },
     Snapshot {
         since: Option<u64>,
+    },
+    ControlLease,
+    TransferControl {
+        lease_generation: u64,
+        target: UiClientId,
+    },
+    AcquireControl {
+        lease_generation: u64,
     },
     StopResidentCore,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Response {
-    Ready { version: u16, proof: [u8; 32] },
+    Ready {
+        version: u16,
+        proof: [u8; 32],
+        client_id: UiClientId,
+        lease: ControlLease,
+    },
     Ack,
     Snapshot(Option<TerminalUpdate>),
     TerminalChanged(TerminalChange),
+    ControlLease(ControlLease),
+    ControlLeaseDenied {
+        reason: ControlLeaseDenial,
+        lease: ControlLease,
+    },
     Error(String),
 }
 
 enum WorkerRequest {
-    Attach,
     Input(Vec<u8>),
     Resize(TerminalSize),
     Snapshot { since: Option<u64> },
@@ -984,6 +1157,32 @@ struct ResidentCore {
     commands: flume::Sender<WorkerCommand>,
     subscribers: Arc<Mutex<Vec<TerminalSubscriber>>>,
     next_subscriber_id: AtomicU64,
+    control: Arc<Mutex<ControlState>>,
+    next_client_id: AtomicU64,
+}
+
+struct ControlState {
+    connected: HashSet<UiClientId>,
+    lease: ControlLease,
+}
+
+struct ClientRegistration {
+    id: UiClientId,
+    control: Arc<Mutex<ControlState>>,
+}
+
+impl Drop for ClientRegistration {
+    fn drop(&mut self) {
+        let mut control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        control.connected.remove(&self.id);
+        if control.lease.controller == Some(self.id) {
+            control.lease.generation = control.lease.generation.saturating_add(1);
+            control.lease.controller = None;
+        }
+    }
 }
 
 struct TerminalSubscriber {
@@ -1041,10 +1240,6 @@ impl ResidentCore {
                             let stop = matches!(command.request, WorkerRequest::Stop);
                             let revision_before_command = revision;
                             let result = match command.request {
-                                WorkerRequest::Attach => {
-                                    last_snapshot_revision = None;
-                                    Ok(WorkerResponse::Ack)
-                                }
                                 WorkerRequest::Input(bytes) => {
                                     session.input(&bytes).map(|()| WorkerResponse::Ack)
                                 }
@@ -1104,7 +1299,134 @@ impl ResidentCore {
             commands: commands_tx,
             subscribers,
             next_subscriber_id: AtomicU64::new(1),
+            control: Arc::new(Mutex::new(ControlState {
+                connected: HashSet::new(),
+                lease: ControlLease {
+                    generation: 0,
+                    controller: None,
+                },
+            })),
+            next_client_id: AtomicU64::new(1),
         })
+    }
+
+    fn attach_client(&self) -> (ClientRegistration, ControlLease) {
+        let id = UiClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed));
+        let mut control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        let first_connection = control.connected.is_empty();
+        control.connected.insert(id);
+        if first_connection && control.lease.controller.is_none() {
+            control.lease.generation = control.lease.generation.saturating_add(1);
+            control.lease.controller = Some(id);
+        }
+        let lease = control.lease.clone();
+        drop(control);
+        (
+            ClientRegistration {
+                id,
+                control: Arc::clone(&self.control),
+            },
+            lease,
+        )
+    }
+
+    fn control_lease(&self) -> ControlLease {
+        self.control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned")
+            .lease
+            .clone()
+    }
+
+    fn controlled_call(
+        &self,
+        client_id: UiClientId,
+        lease_generation: u64,
+        request: WorkerRequest,
+    ) -> Response {
+        let control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        let reason = if control.lease.controller.is_none() {
+            Some(ControlLeaseDenial::NoController)
+        } else if control.lease.controller != Some(client_id) {
+            Some(ControlLeaseDenial::HeldByOther)
+        } else if control.lease.generation != lease_generation {
+            Some(ControlLeaseDenial::StaleGeneration)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Response::ControlLeaseDenied {
+                reason,
+                lease: control.lease.clone(),
+            };
+        }
+
+        // Keep the lease stable until this command is acknowledged by the
+        // terminal worker, so transfer cannot overtake authorized input/resize.
+        worker_response(self.call(request))
+    }
+
+    fn transfer_control(
+        &self,
+        client_id: UiClientId,
+        lease_generation: u64,
+        target: UiClientId,
+    ) -> Response {
+        let mut control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        let reason = if control.lease.controller.is_none() {
+            Some(ControlLeaseDenial::NoController)
+        } else if control.lease.controller != Some(client_id) {
+            Some(ControlLeaseDenial::HeldByOther)
+        } else if control.lease.generation != lease_generation {
+            Some(ControlLeaseDenial::StaleGeneration)
+        } else if !control.connected.contains(&target) {
+            Some(ControlLeaseDenial::TargetUnavailable)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Response::ControlLeaseDenied {
+                reason,
+                lease: control.lease.clone(),
+            };
+        }
+
+        control.lease.generation = control.lease.generation.saturating_add(1);
+        control.lease.controller = Some(target);
+        Response::ControlLease(control.lease.clone())
+    }
+
+    fn acquire_control(&self, client_id: UiClientId, lease_generation: u64) -> Response {
+        let mut control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        let reason = if control.lease.controller.is_some() {
+            Some(ControlLeaseDenial::HeldByOther)
+        } else if control.lease.generation != lease_generation {
+            Some(ControlLeaseDenial::StaleGeneration)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Response::ControlLeaseDenied {
+                reason,
+                lease: control.lease.clone(),
+            };
+        }
+
+        control.lease.generation = control.lease.generation.saturating_add(1);
+        control.lease.controller = Some(client_id);
+        Response::ControlLease(control.lease.clone())
     }
 
     fn subscribe(&self) -> (flume::Receiver<TerminalChange>, TerminalSubscription) {
@@ -1195,22 +1517,48 @@ pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
     let Some((listener, _endpoint_guard)) = create_listener(&endpoint, &auth_secret)? else {
         return Ok(());
     };
-    let core = ResidentCore::start()?;
+    listener
+        .set_nonblocking(ListenerNonblockingMode::Accept)
+        .map_err(|error| format!("configure Resident Core listener: {error}"))?;
+    let core = Arc::new(ResidentCore::start()?);
+    let stopping = Arc::new(AtomicBool::new(false));
 
-    loop {
-        let stream = listener
-            .accept()
-            .map_err(|error| format!("accept UI Client: {error}"))?;
-        if !same_user(&stream)? {
-            continue;
-        }
-        match handle_client(stream, &core, &endpoint, &auth_secret) {
-            Ok(ClientOutcome::Disconnected) => {}
-            Ok(ClientOutcome::StopResidentCore) => return Ok(()),
-            Err(error) if is_disconnect(&error) => {}
-            Err(error) => eprintln!("UI Client connection failed: {error}"),
+    while !stopping.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok(stream) => {
+                // BSD-derived Unix sockets may inherit O_NONBLOCK from the
+                // listener even when the cross-platform listener requests
+                // blocking streams. Client handlers use blocking framed I/O.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("configure UI Client stream: {error}"))?;
+                if !same_user(&stream)? {
+                    continue;
+                }
+                let core = Arc::clone(&core);
+                let endpoint = endpoint.clone();
+                let stopping = Arc::clone(&stopping);
+                thread::Builder::new()
+                    .name("resident-core-client".into())
+                    .spawn(
+                        move || match handle_client(stream, &core, &endpoint, &auth_secret) {
+                            Ok(ClientOutcome::Disconnected) => {}
+                            Ok(ClientOutcome::StopResidentCore) => {
+                                stopping.store(true, Ordering::Release);
+                            }
+                            Err(error) if is_disconnect(&error) => {}
+                            Err(error) => eprintln!("UI Client connection failed: {error}"),
+                        },
+                    )
+                    .map_err(|error| format!("spawn UI Client handler: {error}"))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("accept UI Client: {error}")),
         }
     }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1355,12 +1703,15 @@ fn handle_client(
         )?;
         return Ok(ClientOutcome::Disconnected);
     }
-    core.call(WorkerRequest::Attach).map_err(io::Error::other)?;
+    let (registration, lease) = core.attach_client();
+    let client_id = registration.id;
     write_shared_response(
         &writer,
         &Response::Ready {
             version: PROTOCOL_VERSION,
             proof: server_proof(auth_secret, endpoint, &nonce),
+            client_id,
+            lease,
         },
     )?;
     let (changes, _subscription) = core.subscribe();
@@ -1386,22 +1737,39 @@ fn handle_client(
                 Response::Error("UI Client already completed its handshake".into()),
                 None,
             ),
-            Request::Input { bytes } if bytes.len() > 1024 * 1024 => (
+            Request::Input { bytes, .. } if bytes.len() > 1024 * 1024 => (
                 Response::Error("terminal input command exceeds 1 MiB".into()),
                 None,
             ),
-            Request::Input { bytes } => (
-                worker_response(core.call(WorkerRequest::Input(bytes))),
+            Request::Input {
+                lease_generation,
+                bytes,
+            } => (
+                core.controlled_call(client_id, lease_generation, WorkerRequest::Input(bytes)),
                 None,
             ),
-            Request::Resize { size } => (
-                worker_response(core.call(WorkerRequest::Resize(size))),
+            Request::Resize {
+                lease_generation,
+                size,
+            } => (
+                core.controlled_call(client_id, lease_generation, WorkerRequest::Resize(size)),
                 None,
             ),
             Request::Snapshot { since } => (
                 worker_response(core.call(WorkerRequest::Snapshot { since })),
                 None,
             ),
+            Request::ControlLease => (Response::ControlLease(core.control_lease()), None),
+            Request::TransferControl {
+                lease_generation,
+                target,
+            } => (
+                core.transfer_control(client_id, lease_generation, target),
+                None,
+            ),
+            Request::AcquireControl { lease_generation } => {
+                (core.acquire_control(client_id, lease_generation), None)
+            }
             Request::StopResidentCore => (
                 worker_response(core.call(WorkerRequest::Stop)),
                 Some(ClientOutcome::StopResidentCore),
@@ -1650,6 +2018,11 @@ mod tests {
         let encoded = super::wire::encode_response(&super::Response::Ready {
             version: 2,
             proof: [7; 32],
+            client_id: super::UiClientId(1),
+            lease: super::ControlLease {
+                generation: 1,
+                controller: Some(super::UiClientId(1)),
+            },
         })
         .expect("encode handshake response");
         let mut reader = TransientWouldBlock {

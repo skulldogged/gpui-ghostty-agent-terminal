@@ -98,8 +98,14 @@ fn run_driver(
     while let Ok(command) = commands.recv() {
         let is_poll = matches!(command, Command::Poll);
         let result = match command {
-            Command::Input(bytes) => core.input(&bytes).map(|()| None),
-            Command::Resize(size) => core.resize(size).map(|()| None),
+            Command::Input(bytes) => core
+                .input(&bytes)
+                .map(|()| None)
+                .map_err(|error| error.to_string()),
+            Command::Resize(size) => core
+                .resize(size)
+                .map(|()| None)
+                .map_err(|error| error.to_string()),
             Command::Poll => core.snapshot_since(revision).map(|snapshot| {
                 if let Some(snapshot) = &snapshot {
                     revision = snapshot.revision;
