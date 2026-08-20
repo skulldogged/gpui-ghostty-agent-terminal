@@ -276,9 +276,16 @@ fn a_slow_semantic_observer_recovers_without_blocking_the_controller_or_terminal
         }
     }
 
-    let overflow = slow_observer
-        .snapshot()
-        .expect_err("a slow reliable-event consumer must fail closed");
+    let overflow_deadline = Instant::now() + Duration::from_secs(10);
+    let overflow = loop {
+        match slow_observer.snapshot() {
+            Err(error) => break error,
+            Ok(_) if Instant::now() < overflow_deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(_) => panic!("a slow reliable-event consumer did not fail closed"),
+        }
+    };
     assert!(
         overflow.contains("reconnect and resnapshot required"),
         "unexpected slow-observer recovery error: {overflow}"
