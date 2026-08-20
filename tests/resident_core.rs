@@ -52,9 +52,9 @@ fn snapshots_report_revisions_and_terminal_exit() {
         CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
 
     client
-        .input(b"echo RESIDENT_CORE_REVISION_READY\r")
-        .expect("request a shell readiness marker");
-    wait_for_text(&mut client, "RESIDENT_CORE_REVISION_READY");
+        .input(shell_revision_hold_command())
+        .expect("put the shell into a quiet revision hold");
+    wait_for_text(&mut client, "RESIDENT_CORE_RESIZE_HOLD");
 
     let initial = client.snapshot().expect("take initial snapshot");
     let initial = wait_for_idle_snapshot(&mut client, initial);
@@ -75,11 +75,23 @@ fn snapshots_report_revisions_and_terminal_exit() {
         "oversized grids must be rejected before reaching libghostty-vt"
     );
 
-    client.input(b"exit\r").expect("exit terminal shell");
+    client
+        .input(b"\rexit\r")
+        .expect("release shell revision hold and exit");
     let exited = wait_for_snapshot_after(&mut client, initial.revision);
     assert_eq!(exited.lifecycle, TerminalLifecycle::Exited);
     client.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
+}
+
+#[cfg(windows)]
+fn shell_revision_hold_command() -> &'static [u8] {
+    b"Write-Output ('RESIDENT_CORE_'+'RESIZE_HOLD'); Read-Host\r"
+}
+
+#[cfg(unix)]
+fn shell_revision_hold_command() -> &'static [u8] {
+    b"printf '%s%s\\n' RESIDENT_CORE_ RESIZE_HOLD; read _\r"
 }
 
 fn wait_for_idle_snapshot(
