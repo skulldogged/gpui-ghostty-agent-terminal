@@ -310,6 +310,7 @@ fn verify_server_proof(
 
 pub struct CoreClient {
     connection: BufReader<LocalSocketStream>,
+    snapshot: Option<TerminalSnapshot>,
 }
 
 impl CoreClient {
@@ -331,6 +332,7 @@ impl CoreClient {
                     )?;
                     let mut client = Self {
                         connection: BufReader::new(stream),
+                        snapshot: None,
                     };
                     let nonce = random_bytes::<AUTH_NONCE_BYTES>()?;
                     match client.handshake(nonce, deadline)? {
@@ -395,7 +397,7 @@ impl CoreClient {
 
     pub fn snapshot(&mut self) -> Result<TerminalSnapshot, String> {
         match self.request(Request::Snapshot { since: None })? {
-            Response::Snapshot(Some(snapshot)) => Ok(snapshot),
+            Response::Snapshot(Some(update)) => self.accept_update(update),
             Response::Snapshot(None) => {
                 Err("Resident Core omitted an unconditional snapshot".into())
             }
@@ -405,10 +407,26 @@ impl CoreClient {
     }
 
     pub fn snapshot_since(&mut self, revision: u64) -> Result<Option<TerminalSnapshot>, String> {
-        match self.request(Request::Snapshot {
-            since: Some(revision),
-        })? {
-            Response::Snapshot(snapshot) => Ok(snapshot),
+        if let Some(snapshot) = &self.snapshot
+            && snapshot.revision != revision
+        {
+            return Ok(Some(snapshot.clone()));
+        }
+        let since = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.revision == revision)
+            .map(|snapshot| snapshot.revision);
+        match self.request(Request::Snapshot { since })? {
+            Response::Snapshot(Some(update)) => match self.accept_update(update) {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(_) => match self.request(Request::Snapshot { since: None })? {
+                    Response::Snapshot(Some(update)) => self.accept_update(update).map(Some),
+                    Response::Error(error) => Err(error),
+                    response => Err(format!("invalid recovery snapshot response: {response:?}")),
+                },
+            },
+            Response::Snapshot(None) => Ok(None),
             Response::Error(error) => Err(error),
             response => Err(format!(
                 "invalid conditional snapshot response: {response:?}"
@@ -430,6 +448,22 @@ impl CoreClient {
         wire::read_response(&mut self.connection)
             .map_err(|error| format!("receive Resident Core response: {error}"))?
             .ok_or_else(|| "Resident Core disconnected before responding".into())
+    }
+
+    fn accept_update(&mut self, update: TerminalUpdate) -> Result<TerminalSnapshot, String> {
+        if update.base_revision.is_none() {
+            self.snapshot = Some(TerminalSnapshot::from_update(update)?);
+        } else {
+            self.snapshot
+                .as_mut()
+                .ok_or_else(|| "Resident Core sent a delta before a full snapshot".to_string())?
+                .apply_update(update)?;
+        }
+        Ok(self
+            .snapshot
+            .as_ref()
+            .expect("accepted update stores a snapshot")
+            .clone())
     }
 
     fn handshake(
@@ -598,15 +632,75 @@ impl TerminalSnapshot {
         }
         output
     }
+
+    fn from_update(update: TerminalUpdate) -> Result<Self, String> {
+        if update.base_revision.is_some() {
+            return Err("Resident Core sent a delta without a base snapshot".into());
+        }
+        update.validate()?;
+        Ok(Self {
+            revision: update.revision,
+            lifecycle: update.lifecycle,
+            cols: update.cols,
+            rows: update.rows,
+            cursor: update.cursor,
+            default_fg: update.default_fg,
+            default_bg: update.default_bg,
+            cells: update.cells,
+        })
+    }
+
+    fn apply_update(&mut self, update: TerminalUpdate) -> Result<(), String> {
+        update.validate()?;
+        if update.base_revision != Some(self.revision) {
+            return Err(format!(
+                "Resident Core terminal revision gap: local {}, update base {:?}",
+                self.revision, update.base_revision
+            ));
+        }
+        if (update.cols, update.rows) != (self.cols, self.rows) {
+            return Err("Resident Core sent changed geometry in a row delta".into());
+        }
+
+        let mut replace_row = vec![false; usize::from(self.rows)];
+        for &row in &update.dirty_rows {
+            replace_row[usize::from(row)] = true;
+        }
+        self.cells.retain(|cell| !replace_row[usize::from(cell.y)]);
+        self.cells.extend(update.cells);
+        self.cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
+        self.revision = update.revision;
+        self.lifecycle = update.lifecycle;
+        self.cursor = update.cursor;
+        self.default_fg = update.default_fg;
+        self.default_bg = update.default_bg;
+        Ok(())
+    }
 }
 
-impl TerminalSnapshot {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalUpdate {
+    base_revision: Option<u64>,
+    revision: u64,
+    lifecycle: TerminalLifecycle,
+    cols: u16,
+    rows: u16,
+    cursor: Option<(u16, u16)>,
+    default_fg: [u8; 3],
+    default_bg: [u8; 3],
+    dirty_rows: Vec<u16>,
+    cells: Vec<TerminalCell>,
+}
+
+impl TerminalUpdate {
     fn from_terminal(
         snapshot: ghostty::Snapshot,
+        base_revision: Option<u64>,
         revision: u64,
         lifecycle: TerminalLifecycle,
     ) -> Self {
         Self {
+            base_revision: if snapshot.full { None } else { base_revision },
             revision,
             lifecycle,
             cols: snapshot.cols,
@@ -614,8 +708,50 @@ impl TerminalSnapshot {
             cursor: snapshot.cursor,
             default_fg: snapshot.default_fg,
             default_bg: snapshot.default_bg,
+            dirty_rows: snapshot.dirty_rows,
             cells: snapshot.cells.into_iter().map(TerminalCell::from).collect(),
         }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.cols == 0 || self.rows == 0 {
+            return Err("terminal update has zero geometry".into());
+        }
+        if self.dirty_rows.windows(2).any(|rows| rows[0] >= rows[1])
+            || self.dirty_rows.iter().any(|&row| row >= self.rows)
+        {
+            return Err("terminal update has invalid dirty rows".into());
+        }
+        if self.base_revision.is_none() && self.dirty_rows.len() != usize::from(self.rows) {
+            return Err("full terminal update does not contain every row".into());
+        }
+        if self.base_revision.is_none()
+            && self
+                .dirty_rows
+                .iter()
+                .copied()
+                .enumerate()
+                .any(|(expected, actual)| usize::from(actual) != expected)
+        {
+            return Err("full terminal update rows are not complete".into());
+        }
+        let mut dirty = vec![false; usize::from(self.rows)];
+        for &row in &self.dirty_rows {
+            dirty[usize::from(row)] = true;
+        }
+        if self
+            .cells
+            .iter()
+            .any(|cell| cell.x >= self.cols || cell.y >= self.rows || !dirty[usize::from(cell.y)])
+        {
+            return Err("terminal update cell is outside its dirty rows".into());
+        }
+        if let Some((x, y)) = self.cursor
+            && (x >= self.cols || y >= self.rows)
+        {
+            return Err("terminal update cursor is outside the grid".into());
+        }
+        Ok(())
     }
 }
 
@@ -671,11 +807,12 @@ enum Request {
 enum Response {
     Ready { version: u16, proof: [u8; 32] },
     Ack,
-    Snapshot(Option<TerminalSnapshot>),
+    Snapshot(Option<TerminalUpdate>),
     Error(String),
 }
 
 enum WorkerRequest {
+    Attach,
     Input(Vec<u8>),
     Resize(TerminalSize),
     Snapshot { since: Option<u64> },
@@ -684,7 +821,7 @@ enum WorkerRequest {
 
 enum WorkerResponse {
     Ack,
-    Snapshot(Option<TerminalSnapshot>),
+    Snapshot(Option<TerminalUpdate>),
 }
 
 struct WorkerCommand {
@@ -716,6 +853,7 @@ impl ResidentCore {
                 };
                 let mut revision = 0_u64;
                 let mut lifecycle = TerminalLifecycle::Running;
+                let mut last_snapshot_revision = None;
 
                 loop {
                     refresh_terminal_state(&mut session, &events, &mut revision, &mut lifecycle);
@@ -723,6 +861,10 @@ impl ResidentCore {
                         Ok(command) => {
                             let stop = matches!(command.request, WorkerRequest::Stop);
                             let result = match command.request {
+                                WorkerRequest::Attach => {
+                                    last_snapshot_revision = None;
+                                    Ok(WorkerResponse::Ack)
+                                }
                                 WorkerRequest::Input(bytes) => {
                                     session.input(&bytes).map(|()| WorkerResponse::Ack)
                                 }
@@ -741,15 +883,18 @@ impl ResidentCore {
                                 WorkerRequest::Snapshot { since } if since == Some(revision) => {
                                     Ok(WorkerResponse::Snapshot(None))
                                 }
-                                WorkerRequest::Snapshot { .. } => {
-                                    session.snapshot_current().map(|snapshot| {
-                                        WorkerResponse::Snapshot(Some(
-                                            TerminalSnapshot::from_terminal(
-                                                snapshot,
-                                                revision,
-                                                lifecycle.clone(),
-                                            ),
-                                        ))
+                                WorkerRequest::Snapshot { since } => {
+                                    let force_full =
+                                        since.is_none() || since != last_snapshot_revision;
+                                    session.render_update(force_full).map(|snapshot| {
+                                        let update = TerminalUpdate::from_terminal(
+                                            snapshot,
+                                            last_snapshot_revision,
+                                            revision,
+                                            lifecycle.clone(),
+                                        );
+                                        last_snapshot_revision = Some(revision);
+                                        WorkerResponse::Snapshot(Some(update))
                                     })
                                 }
                                 WorkerRequest::Stop => Ok(WorkerResponse::Ack),
@@ -982,6 +1127,7 @@ fn handle_client(
         )?;
         return Ok(ClientOutcome::Disconnected);
     }
+    core.call(WorkerRequest::Attach).map_err(io::Error::other)?;
     wire::write_response(
         connection.get_mut(),
         &Response::Ready {
@@ -1108,7 +1254,91 @@ fn detach_command(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreEndpoint, protected_endpoint_name, server_proof, verify_server_proof};
+    use super::{
+        CoreEndpoint, TerminalCell, TerminalLifecycle, TerminalSnapshot, TerminalUpdate,
+        protected_endpoint_name, server_proof, verify_server_proof,
+    };
+
+    fn cell(x: u16, y: u16, text: &str) -> TerminalCell {
+        TerminalCell {
+            x,
+            y,
+            text: text.into(),
+            fg: [0xdd; 3],
+            bg: [0x11; 3],
+            has_explicit_bg: false,
+        }
+    }
+
+    #[test]
+    fn ordered_dirty_row_updates_replace_only_the_rows_they_name() {
+        let mut snapshot = TerminalSnapshot {
+            revision: 7,
+            lifecycle: TerminalLifecycle::Running,
+            cols: 2,
+            rows: 2,
+            cursor: Some((0, 0)),
+            default_fg: [0xdd; 3],
+            default_bg: [0x11; 3],
+            cells: vec![
+                cell(0, 0, "a"),
+                cell(1, 0, "b"),
+                cell(0, 1, "c"),
+                cell(1, 1, "d"),
+            ],
+        };
+        let update = TerminalUpdate {
+            base_revision: Some(7),
+            revision: 8,
+            lifecycle: TerminalLifecycle::Running,
+            cols: 2,
+            rows: 2,
+            cursor: Some((1, 1)),
+            default_fg: [0xdd; 3],
+            default_bg: [0x11; 3],
+            dirty_rows: vec![1],
+            cells: vec![cell(0, 1, "x"), cell(1, 1, "y")],
+        };
+
+        snapshot.apply_update(update).expect("apply ordered delta");
+
+        assert_eq!(snapshot.revision, 8);
+        assert_eq!(snapshot.cursor, Some((1, 1)));
+        assert_eq!(snapshot.text(), "ab\nxy\n");
+    }
+
+    #[test]
+    fn a_revision_gap_requires_a_full_recovery_snapshot() {
+        let mut snapshot = TerminalSnapshot {
+            revision: 7,
+            lifecycle: TerminalLifecycle::Running,
+            cols: 1,
+            rows: 1,
+            cursor: None,
+            default_fg: [0xdd; 3],
+            default_bg: [0x11; 3],
+            cells: vec![cell(0, 0, "a")],
+        };
+        let update = TerminalUpdate {
+            base_revision: Some(6),
+            revision: 8,
+            lifecycle: TerminalLifecycle::Running,
+            cols: 1,
+            rows: 1,
+            cursor: None,
+            default_fg: [0xdd; 3],
+            default_bg: [0x11; 3],
+            dirty_rows: vec![0],
+            cells: vec![cell(0, 0, "b")],
+        };
+
+        let error = snapshot
+            .apply_update(update)
+            .expect_err("reject out-of-order delta");
+        assert!(error.contains("revision gap"), "{error}");
+        assert_eq!(snapshot.revision, 7);
+        assert_eq!(snapshot.text(), "a\n");
+    }
 
     #[test]
     fn protected_endpoint_names_are_bound_to_the_authentication_secret() {

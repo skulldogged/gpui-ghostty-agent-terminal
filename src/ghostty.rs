@@ -33,6 +33,7 @@ struct RawSnapshot {
     default_bg_r: u8,
     default_bg_g: u8,
     default_bg_b: u8,
+    full: bool,
     cell_count: usize,
 }
 
@@ -49,6 +50,7 @@ unsafe extern "C" {
     ) -> i32;
     fn spike_terminal_snapshot(
         terminal: *mut c_void,
+        force_full: bool,
         snapshot: *mut RawSnapshot,
         cells: *mut RawCell,
         capacity: usize,
@@ -60,9 +62,12 @@ pub const SOURCE_REVISION: &str = env!("GHOSTTY_SOURCE_REVISION");
 
 pub struct Terminal {
     raw: NonNull<c_void>,
+    raw_cells: Box<[RawCell]>,
 }
 
 pub struct Snapshot {
+    pub full: bool,
+    pub dirty_rows: Vec<u16>,
     pub cols: u16,
     pub rows: u16,
     pub cursor: Option<(u16, u16)>,
@@ -87,6 +92,9 @@ impl Terminal {
         let raw = unsafe { spike_terminal_new(cols, rows, 10_000) };
         Ok(Self {
             raw: NonNull::new(raw).ok_or("libghostty-vt terminal allocation failed")?,
+            raw_cells: (0..SNAPSHOT_CELL_CAPACITY)
+                .map(|_| RawCell::default())
+                .collect(),
         })
     }
 
@@ -108,31 +116,33 @@ impl Terminal {
         result_ok(result, "resize")
     }
 
+    #[cfg_attr(feature = "gui", allow(dead_code))]
     pub fn snapshot(&mut self) -> Result<Snapshot, String> {
+        self.render_update(true)
+    }
+
+    pub(crate) fn render_update(&mut self, force_full: bool) -> Result<Snapshot, String> {
         let mut raw_snapshot = RawSnapshot::default();
-        let mut raw_cells: Vec<RawCell> = (0..SNAPSHOT_CELL_CAPACITY)
-            .map(|_| RawCell::default())
-            .collect();
         let result = unsafe {
             spike_terminal_snapshot(
                 self.raw.as_ptr(),
+                force_full,
                 &mut raw_snapshot,
-                raw_cells.as_mut_ptr(),
-                raw_cells.len(),
+                self.raw_cells.as_mut_ptr(),
+                self.raw_cells.len(),
             )
         };
         result_ok(result, "snapshot")?;
-        if raw_snapshot.cell_count > raw_cells.len() {
+        if raw_snapshot.cell_count > self.raw_cells.len() {
             return Err(format!(
                 "snapshot needs {} cells, prototype buffer has {}",
                 raw_snapshot.cell_count,
-                raw_cells.len()
+                self.raw_cells.len()
             ));
         }
-        raw_cells.truncate(raw_snapshot.cell_count);
 
-        let cells = raw_cells
-            .into_iter()
+        let cells: Vec<Cell> = self.raw_cells[..raw_snapshot.cell_count]
+            .iter()
             .map(|raw| Cell {
                 x: raw.x,
                 y: raw.y,
@@ -142,8 +152,12 @@ impl Terminal {
                 has_explicit_bg: raw.has_explicit_bg,
             })
             .collect();
+        let mut dirty_rows = cells.iter().map(|cell| cell.y).collect::<Vec<_>>();
+        dirty_rows.dedup();
 
         Ok(Snapshot {
+            full: raw_snapshot.full,
+            dirty_rows,
             cols: raw_snapshot.cols,
             rows: raw_snapshot.rows,
             cursor: raw_snapshot
@@ -195,4 +209,35 @@ pub fn snapshot_text(snapshot: &Snapshot) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Terminal;
+
+    #[test]
+    fn render_updates_consume_only_rows_marked_dirty_by_ghostty() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+
+        let initial = terminal.render_update(false).expect("initial update");
+        assert!(initial.full);
+        assert_eq!(initial.dirty_rows, vec![0, 1, 2]);
+        assert_eq!(initial.cells.len(), 24);
+
+        let clean = terminal.render_update(false).expect("clean update");
+        assert!(!clean.full);
+        assert!(clean.dirty_rows.is_empty());
+        assert!(clean.cells.is_empty());
+
+        terminal.feed(b"x");
+        let changed = terminal.render_update(false).expect("changed update");
+        assert!(!changed.full);
+        assert_eq!(changed.dirty_rows, vec![0]);
+        assert_eq!(changed.cells.len(), 8);
+
+        let forced = terminal.render_update(true).expect("forced full update");
+        assert!(forced.full);
+        assert_eq!(forced.dirty_rows, vec![0, 1, 2]);
+        assert_eq!(forced.cells.len(), 24);
+    }
 }

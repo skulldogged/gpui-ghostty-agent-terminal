@@ -1,5 +1,5 @@
 use super::{
-    MAX_MESSAGE_BYTES, Request, Response, TerminalCell, TerminalLifecycle, TerminalSnapshot,
+    MAX_MESSAGE_BYTES, Request, Response, TerminalCell, TerminalLifecycle, TerminalUpdate,
 };
 use std::io::{self, Read, Write};
 
@@ -178,7 +178,17 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(frame))
 }
 
-fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalSnapshot) -> io::Result<()> {
+fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalUpdate) -> io::Result<()> {
+    snapshot
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    match snapshot.base_revision {
+        Some(revision) => {
+            output.push(1);
+            output.extend_from_slice(&revision.to_le_bytes());
+        }
+        None => output.push(0),
+    }
     output.extend_from_slice(&snapshot.revision.to_le_bytes());
     match &snapshot.lifecycle {
         TerminalLifecycle::Running => output.push(0),
@@ -200,6 +210,12 @@ fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalSnapshot) -> io::Result
     }
     output.extend_from_slice(&snapshot.default_fg);
     output.extend_from_slice(&snapshot.default_bg);
+    let dirty_row_count = u16::try_from(snapshot.dirty_rows.len())
+        .map_err(|_| invalid("snapshot contains too many dirty rows"))?;
+    output.extend_from_slice(&dirty_row_count.to_le_bytes());
+    for row in &snapshot.dirty_rows {
+        output.extend_from_slice(&row.to_le_bytes());
+    }
     let cell_count = u32::try_from(snapshot.cells.len())
         .map_err(|_| invalid("snapshot contains too many cells"))?;
     output.extend_from_slice(&cell_count.to_le_bytes());
@@ -214,7 +230,12 @@ fn put_snapshot(output: &mut Vec<u8>, snapshot: &TerminalSnapshot) -> io::Result
     Ok(())
 }
 
-fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalSnapshot> {
+fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalUpdate> {
+    let base_revision = match decoder.u8()? {
+        0 => None,
+        1 => Some(decoder.u64()?),
+        _ => return Err(invalid("invalid base revision presence flag")),
+    };
     let revision = decoder.u64()?;
     let lifecycle = match decoder.u8()? {
         0 => TerminalLifecycle::Running,
@@ -231,6 +252,14 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalSnapshot> {
     };
     let default_fg = decoder.array()?;
     let default_bg = decoder.array()?;
+    let dirty_row_count = usize::from(decoder.u16()?);
+    if dirty_row_count > usize::from(rows) {
+        return Err(invalid("snapshot dirty row count exceeds grid height"));
+    }
+    let mut dirty_rows = Vec::with_capacity(dirty_row_count);
+    for _ in 0..dirty_row_count {
+        dirty_rows.push(decoder.u16()?);
+    }
     let cell_count = decoder.u32()? as usize;
     if cell_count > crate::ghostty::SNAPSHOT_CELL_CAPACITY {
         return Err(invalid("snapshot cell count exceeds capacity"));
@@ -259,7 +288,8 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalSnapshot> {
     {
         return Err(invalid("snapshot cursor is outside the terminal grid"));
     }
-    Ok(TerminalSnapshot {
+    let update = TerminalUpdate {
+        base_revision,
         revision,
         lifecycle,
         cols,
@@ -267,8 +297,13 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<TerminalSnapshot> {
         cursor,
         default_fg,
         default_bg,
+        dirty_rows,
         cells,
-    })
+    };
+    update
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(update)
 }
 
 fn frame(payload: Vec<u8>) -> io::Result<Vec<u8>> {
@@ -386,7 +421,7 @@ mod tests {
         write_response,
     };
     use crate::resident_core::{
-        Request, Response, TerminalCell, TerminalLifecycle, TerminalSnapshot,
+        Request, Response, TerminalCell, TerminalLifecycle, TerminalUpdate,
     };
     use crate::terminal_session::TerminalSize;
 
@@ -433,7 +468,8 @@ mod tests {
 
     #[test]
     fn every_response_round_trips_a_compact_unicode_snapshot() {
-        let snapshot = TerminalSnapshot {
+        let snapshot = TerminalUpdate {
+            base_revision: None,
             revision: 0x0102_0304_0506_0708,
             lifecycle: TerminalLifecycle::Running,
             cols: 80,
@@ -441,6 +477,7 @@ mod tests {
             cursor: Some((3, 4)),
             default_fg: [0xdd, 0xdd, 0xdd],
             default_bg: [0x11, 0x11, 0x11],
+            dirty_rows: (0..24).collect(),
             cells: (0..24)
                 .flat_map(|y| {
                     (0..80).map(move |x| TerminalCell {
@@ -527,6 +564,44 @@ mod tests {
         assert_eq!(
             decode_response(&writer.bytes).expect("decode written response"),
             Response::Error("one frame".into())
+        );
+    }
+
+    #[test]
+    fn a_single_dirty_row_is_a_small_wire_update() {
+        let update = TerminalUpdate {
+            base_revision: Some(41),
+            revision: 42,
+            lifecycle: TerminalLifecycle::Running,
+            cols: 80,
+            rows: 24,
+            cursor: Some((4, 7)),
+            default_fg: [0xdd; 3],
+            default_bg: [0x11; 3],
+            dirty_rows: vec![7],
+            cells: (0..80)
+                .map(|x| TerminalCell {
+                    x,
+                    y: 7,
+                    text: if x == 4 { "λ".into() } else { String::new() },
+                    fg: [0xdd; 3],
+                    bg: [0x11; 3],
+                    has_explicit_bg: false,
+                })
+                .collect(),
+        };
+
+        let encoded = encode_response(&Response::Snapshot(Some(update.clone())))
+            .expect("encode dirty-row update");
+
+        assert!(
+            encoded.len() < 1_500,
+            "one 80-cell row should remain compact, got {} bytes",
+            encoded.len()
+        );
+        assert_eq!(
+            decode_response(&encoded).expect("decode dirty-row update"),
+            Response::Snapshot(Some(update))
         );
     }
 }

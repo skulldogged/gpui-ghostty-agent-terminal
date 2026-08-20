@@ -59,8 +59,9 @@ static void set_color(uint8_t* r, uint8_t* g, uint8_t* b, GhosttyColorRgb color)
   *b = color.b;
 }
 
-int spike_terminal_snapshot(SpikeTerminal* spike, SpikeSnapshot* snapshot,
-                            SpikeCell* cells, size_t capacity) {
+int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
+                            SpikeSnapshot* snapshot, SpikeCell* cells,
+                            size_t capacity) {
   if (spike == NULL || snapshot == NULL || (cells == NULL && capacity > 0)) {
     return GHOSTTY_INVALID_VALUE;
   }
@@ -72,6 +73,12 @@ int spike_terminal_snapshot(SpikeTerminal* spike, SpikeSnapshot* snapshot,
                            &snapshot->cols);
   ghostty_render_state_get(spike->render, GHOSTTY_RENDER_STATE_DATA_ROWS,
                            &snapshot->rows);
+
+  GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
+  result = ghostty_render_state_get(
+      spike->render, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
+  if (!success(result)) return result;
+  snapshot->full = force_full || dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
 
   bool cursor_in_viewport = false;
   bool cursor_mode_visible = false;
@@ -107,6 +114,16 @@ int spike_terminal_snapshot(SpikeTerminal* spike, SpikeSnapshot* snapshot,
   size_t count = 0;
   uint16_t y = 0;
   while (ghostty_render_state_row_iterator_next(spike->rows)) {
+    bool row_dirty = false;
+    result = ghostty_render_state_row_get(
+        spike->rows, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &row_dirty);
+    if (!success(result)) return result;
+    if (!snapshot->full &&
+        (dirty != GHOSTTY_RENDER_STATE_DIRTY_PARTIAL || !row_dirty)) {
+      y++;
+      continue;
+    }
+
     result = ghostty_render_state_row_get(
         spike->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &spike->cells);
     if (!success(result)) return result;
@@ -152,6 +169,23 @@ int spike_terminal_snapshot(SpikeTerminal* spike, SpikeSnapshot* snapshot,
     }
     y++;
   }
+
+  if (count > capacity) return GHOSTTY_OUT_OF_MEMORY;
+
+  result = ghostty_render_state_get(spike->render,
+                                    GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+                                    &spike->rows);
+  if (!success(result)) return result;
+  while (ghostty_render_state_row_iterator_next(spike->rows)) {
+    bool clean = false;
+    result = ghostty_render_state_row_set(
+        spike->rows, GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
+    if (!success(result)) return result;
+  }
+  GhosttyRenderStateDirty clean = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+  result = ghostty_render_state_set(
+      spike->render, GHOSTTY_RENDER_STATE_OPTION_DIRTY, &clean);
+  if (!success(result)) return result;
 
   snapshot->cell_count = count;
   return GHOSTTY_SUCCESS;

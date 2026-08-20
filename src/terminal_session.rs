@@ -202,11 +202,11 @@ impl TerminalSession {
     #[cfg(test)]
     pub fn snapshot(&mut self) -> Result<ghostty::Snapshot, String> {
         let _changed = self.drain_output()?;
-        self.snapshot_current()
+        self.render_update(true)
     }
 
-    pub(crate) fn snapshot_current(&mut self) -> Result<ghostty::Snapshot, String> {
-        self.terminal.snapshot()
+    pub(crate) fn render_update(&mut self, force_full: bool) -> Result<ghostty::Snapshot, String> {
+        self.terminal.render_update(force_full)
     }
 
     pub(crate) fn drain_pending_output(&mut self) -> Result<bool, String> {
