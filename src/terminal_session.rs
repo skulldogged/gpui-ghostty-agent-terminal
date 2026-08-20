@@ -392,6 +392,7 @@ mod tests {
     fn normal_shell_exit_is_reported_as_exited() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
+        #[cfg(target_os = "linux")]
         let process_id = session.process_id();
         session
             .input(b"echo TERMINAL_SESSION_EXIT_OUTPUT; exit\r")
