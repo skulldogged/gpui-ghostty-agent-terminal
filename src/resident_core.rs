@@ -84,12 +84,20 @@ impl CoreEndpoint {
     }
 
     #[cfg(windows)]
-    fn name(&self) -> io::Result<interprocess::local_socket::Name<'_>> {
-        self.0.as_str().to_ns_name::<GenericNamespaced>()
+    fn name(
+        &self,
+        auth_secret: &[u8; AUTH_SECRET_BYTES],
+    ) -> io::Result<interprocess::local_socket::Name<'static>> {
+        protected_endpoint_name(auth_secret, self)
+            .to_ns_name::<GenericNamespaced>()
+            .map(interprocess::local_socket::Name::into_owned)
     }
 
     #[cfg(unix)]
-    fn name(&self) -> io::Result<interprocess::local_socket::Name<'static>> {
+    fn name(
+        &self,
+        _auth_secret: &[u8; AUTH_SECRET_BYTES],
+    ) -> io::Result<interprocess::local_socket::Name<'static>> {
         self.socket_path()?
             .to_fs_name::<GenericFilePath>()
             .map(interprocess::local_socket::Name::into_owned)
@@ -249,6 +257,24 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
     Ok(bytes)
 }
 
+#[cfg(any(windows, test))]
+fn protected_endpoint_name(
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
+    endpoint: &CoreEndpoint,
+) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, auth_secret);
+    let mut message = b"agent-terminal-core-endpoint-v1\0".to_vec();
+    message.extend_from_slice(endpoint.argument().as_bytes());
+    let digest = hmac::sign(&key, &message);
+    let mut name = String::from("agent-terminal-v1-");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest.as_ref() {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
 fn authentication_message(endpoint: &CoreEndpoint, nonce: &[u8; AUTH_NONCE_BYTES]) -> Vec<u8> {
     let mut message = b"agent-terminal-core-auth-v1\0".to_vec();
     message.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -293,7 +319,7 @@ impl CoreClient {
         loop {
             let connection_error = match LocalSocketStream::connect(
                 endpoint
-                    .name()
+                    .name(&auth_secret)
                     .map_err(|error| format!("name Resident Core endpoint: {error}"))?,
             ) {
                 Ok(stream) => {
@@ -766,7 +792,10 @@ fn refresh_terminal_state(
         match event {
             TerminalEvent::Changed => {}
             TerminalEvent::Exited => {
-                *lifecycle = TerminalLifecycle::Exited;
+                *lifecycle = match session.reap_process() {
+                    Ok(()) => TerminalLifecycle::Exited,
+                    Err(error) => TerminalLifecycle::Failed(error),
+                };
                 *revision = revision.saturating_add(1);
             }
             TerminalEvent::Failed(error) => {
@@ -779,7 +808,7 @@ fn refresh_terminal_state(
 
 pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
     let auth_secret = load_auth_secret()?;
-    let Some((listener, _endpoint_guard)) = create_listener(&endpoint)? else {
+    let Some((listener, _endpoint_guard)) = create_listener(&endpoint, &auth_secret)? else {
         return Ok(());
     };
     let core = ResidentCore::start()?;
@@ -811,6 +840,7 @@ struct EndpointGuard;
 #[cfg(unix)]
 fn create_listener(
     endpoint: &CoreEndpoint,
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
 ) -> Result<Option<(LocalSocketListener, EndpointGuard)>, String> {
     use std::os::{fd::AsRawFd, unix::fs::FileTypeExt};
 
@@ -834,7 +864,7 @@ fn create_listener(
     }
     let guard = EndpointGuard { _lock: lock };
 
-    match bind_listener(endpoint) {
+    match bind_listener(endpoint, auth_secret) {
         Ok(listener) => Ok(Some((listener, guard))),
         Err(error)
             if matches!(
@@ -842,7 +872,7 @@ fn create_listener(
                 io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists
             ) =>
         {
-            if endpoint_is_reachable(endpoint)? {
+            if endpoint_is_reachable(endpoint, auth_secret)? {
                 return Ok(None);
             }
 
@@ -861,7 +891,7 @@ fn create_listener(
             }
             std::fs::remove_file(&socket_path)
                 .map_err(|error| format!("reclaim stale Resident Core endpoint: {error}"))?;
-            bind_listener(endpoint)
+            bind_listener(endpoint, auth_secret)
                 .map(|listener| Some((listener, guard)))
                 .map_err(|error| format!("listen at reclaimed Resident Core endpoint: {error}"))
         }
@@ -872,21 +902,30 @@ fn create_listener(
 #[cfg(windows)]
 fn create_listener(
     endpoint: &CoreEndpoint,
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
 ) -> Result<Option<(LocalSocketListener, EndpointGuard)>, String> {
-    bind_listener(endpoint)
+    bind_listener(endpoint, auth_secret)
         .map(|listener| Some((listener, EndpointGuard)))
         .map_err(|error| format!("listen at Resident Core endpoint: {error}"))
 }
 
-fn bind_listener(endpoint: &CoreEndpoint) -> io::Result<LocalSocketListener> {
-    ListenerOptions::new().name(endpoint.name()?).create_sync()
+fn bind_listener(
+    endpoint: &CoreEndpoint,
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
+) -> io::Result<LocalSocketListener> {
+    ListenerOptions::new()
+        .name(endpoint.name(auth_secret)?)
+        .create_sync()
 }
 
 #[cfg(unix)]
-fn endpoint_is_reachable(endpoint: &CoreEndpoint) -> Result<bool, String> {
+fn endpoint_is_reachable(
+    endpoint: &CoreEndpoint,
+    auth_secret: &[u8; AUTH_SECRET_BYTES],
+) -> Result<bool, String> {
     match LocalSocketStream::connect(
         endpoint
-            .name()
+            .name(auth_secret)
             .map_err(|error| format!("name existing Resident Core endpoint: {error}"))?,
     ) {
         Ok(_) => Ok(true),
@@ -1086,7 +1125,19 @@ fn detach_command(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreEndpoint, server_proof, verify_server_proof};
+    use super::{CoreEndpoint, protected_endpoint_name, server_proof, verify_server_proof};
+
+    #[test]
+    fn protected_endpoint_names_are_bound_to_the_authentication_secret() {
+        let endpoint = CoreEndpoint::for_profile("endpoint-binding-test").unwrap();
+        let first = protected_endpoint_name(&[7_u8; 32], &endpoint);
+        let repeated = protected_endpoint_name(&[7_u8; 32], &endpoint);
+        let other_secret = protected_endpoint_name(&[8_u8; 32], &endpoint);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_secret);
+        assert!(!first.contains(endpoint.argument()));
+    }
 
     #[test]
     fn server_proof_binds_the_secret_endpoint_and_nonce() {
@@ -1107,13 +1158,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn client_handshake_deadline_survives_a_silent_named_pipe() {
-        use super::{CoreClient, bind_listener};
+        use super::{CoreClient, bind_listener, load_auth_secret};
         use interprocess::local_socket::traits::Listener;
         use std::time::{Duration, Instant};
 
         let endpoint =
             CoreEndpoint::for_profile(&format!("silent-handshake-{}", std::process::id())).unwrap();
-        let listener = bind_listener(&endpoint).unwrap();
+        let auth_secret = load_auth_secret().unwrap();
+        let listener = bind_listener(&endpoint, &auth_secret).unwrap();
         let server = std::thread::spawn(move || {
             let _connection = listener.accept().unwrap();
             std::thread::sleep(Duration::from_millis(250));

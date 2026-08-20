@@ -80,6 +80,13 @@ trait TerminalTransport: Send {
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
+    #[cfg(test)]
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+    fn reap(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl TerminalTransport for PtySession {
@@ -97,6 +104,15 @@ impl TerminalTransport for PtySession {
 
     fn resume_reader(&mut self) -> Result<(), String> {
         PtySession::resume_reader(self)
+    }
+
+    #[cfg(test)]
+    fn process_id(&self) -> Option<u32> {
+        PtySession::process_id(self)
+    }
+
+    fn reap(&mut self) -> Result<(), String> {
+        PtySession::reap(self)
     }
 }
 
@@ -197,6 +213,15 @@ impl TerminalSession {
 
     pub(crate) fn drain_pending_output(&mut self) -> Result<bool, String> {
         self.drain_output()
+    }
+
+    pub(crate) fn reap_process(&mut self) -> Result<(), String> {
+        self.process.reap()
+    }
+
+    #[cfg(test)]
+    fn process_id(&self) -> Option<u32> {
+        self.process.process_id()
     }
 
     fn drain_output(&mut self) -> Result<bool, String> {
@@ -367,6 +392,7 @@ mod tests {
     fn normal_shell_exit_is_reported_as_exited() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
+        let process_id = session.process_id();
         session
             .input(b"echo TERMINAL_SESSION_EXIT_OUTPUT; exit\r")
             .expect("write shell exit command");
@@ -379,10 +405,18 @@ mod tests {
                 }
                 Ok(TerminalEvent::Exited) => {
                     let snapshot = session.snapshot().expect("drain final terminal output");
+                    session.reap_process().expect("reap exited shell");
                     assert!(
                         snapshot_text(&snapshot).contains("TERMINAL_SESSION_EXIT_OUTPUT"),
                         "shell exit was reported before final output was available"
                     );
+                    #[cfg(target_os = "linux")]
+                    if let Some(process_id) = process_id {
+                        assert!(
+                            !std::path::Path::new(&format!("/proc/{process_id}")).exists(),
+                            "reaped shell must not remain as a zombie"
+                        );
+                    }
                     return;
                 }
                 Ok(TerminalEvent::Failed(error)) => {

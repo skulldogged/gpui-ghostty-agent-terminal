@@ -66,7 +66,7 @@ mod unix {
     pub struct PtySession {
         _master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
-        child: Box<dyn Child + Send>,
+        child: Option<Box<dyn Child + Send>>,
         control: flume::Sender<ReaderControl>,
         shutdown: Option<flume::Sender<()>>,
     }
@@ -165,7 +165,7 @@ mod unix {
                 Self {
                     _master: pair.master,
                     writer,
-                    child,
+                    child: Some(child),
                     control: control_tx,
                     shutdown: Some(shutdown_tx),
                 },
@@ -197,12 +197,30 @@ mod unix {
                 .send(ReaderControl::Resume)
                 .map_err(|_| "resume PTY reader: reader stopped".to_string())
         }
+
+        #[cfg(test)]
+        pub fn process_id(&self) -> Option<u32> {
+            self.child.as_ref().and_then(|child| child.process_id())
+        }
+
+        pub fn reap(&mut self) -> Result<(), String> {
+            let Some(mut child) = self.child.take() else {
+                return Ok(());
+            };
+            child
+                .wait()
+                .map(|_| ())
+                .map_err(|error| format!("reap terminal process: {error}"))
+        }
     }
 
     impl Drop for PtySession {
         fn drop(&mut self) {
             drop(self.shutdown.take());
-            let _ = self.child.kill();
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 

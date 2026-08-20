@@ -6,7 +6,7 @@ This document resolves the protocol choice tracked in issue #2 and defines the t
 
 The Resident Core is a separately restartable, unelevated per-user process. It owns all domain state, PTY/ConPTY transports, libghostty-vt state, process lifecycle, persistence, and agent-integration authority. GPUI runs only in a UI Client process.
 
-`CoreClient` is the UI-facing interface. Its adapter uses a Unix-domain local socket on macOS/Linux and a named pipe on Windows through a cross-platform local-socket implementation. The Resident Core keeps Unix sockets in an owner-verified private runtime directory and restricts peers by effective user ID; the Windows duplex pipe requires creator-authorized write access. A per-user 256-bit secret in that protected runtime/profile directory authenticates every server handshake with a fresh HMAC challenge before the client sends any commands. Platform transport types, raw terminal bytes, and libghostty-vt types do not cross the interface.
+`CoreClient` is the UI-facing interface. Its adapter uses a Unix-domain local socket on macOS/Linux and a named pipe on Windows through a cross-platform local-socket implementation. The Resident Core keeps Unix sockets in an owner-verified private runtime directory and restricts peers by effective user ID; the Windows duplex pipe requires creator-authorized write access and derives its otherwise opaque name from the protected per-user secret, preventing another local user from predictably claiming the endpoint first. That 256-bit secret authenticates every server handshake with a fresh HMAC challenge before the client sends any commands. Platform transport types, raw terminal bytes, and libghostty-vt types do not cross the interface.
 
 ## Versioning and attachment
 
@@ -27,6 +27,7 @@ The Resident Core is a separately restartable, unelevated per-user process. It o
 ## Failure behavior
 
 - UI Client disconnect, crash, or normal quit releases its lease while the Resident Core and terminals continue.
+- After final PTY output reaches libghostty-vt, the Resident Core reaps an exited child while keeping its terminal snapshot available for reconnecting clients.
 - Resident Core failure ends live-process continuity. Restart restores only persisted structure and explicitly supported agent resumes.
 - A stale endpoint is never overwritten merely from a PID file. On Unix, the core holds an exclusive per-endpoint startup lock for its lifetime; only that lock owner may reclaim a same-user socket after a live connection probe fails. Windows named-pipe lifetime is managed by the kernel.
 - Stopping the Resident Core is a separate acknowledged destructive command; closing a window, Pane presentation, or Desktop Shell never aliases it.
