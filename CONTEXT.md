@@ -28,6 +28,10 @@ _Avoid_: Hidden Window, GUI Process
 An attachable GPUI front end whose windows can present any Space without owning that Space or its terminal lifetimes.
 _Avoid_: Main Process, Space Window
 
+**Desktop Shell**:
+An independently restartable presentation host for one OS login and application profile. It may have zero windows and never owns Spaces or Terminal Sessions.
+_Avoid_: Tray Process, Hidden Window
+
 **Detach**:
 Closing a UI view while its Space, Panes, and Terminal Sessions continue running in the Resident Core. Detach never means closing a Pane.
 _Avoid_: Quit, Stop
