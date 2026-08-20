@@ -13,6 +13,8 @@ use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
 };
+#[cfg(any(unix, test))]
+use std::io::Read;
 use std::{
     io::{self, BufReader, Write},
     process::{Command, Stdio},
@@ -491,9 +493,78 @@ impl CoreClient {
 #[cfg(unix)]
 fn read_handshake_response(
     connection: &mut BufReader<LocalSocketStream>,
-    _deadline: Instant,
+    deadline: Instant,
 ) -> io::Result<Option<Response>> {
-    wire::read_response(connection)
+    read_response_until(connection, deadline)
+}
+
+#[cfg(any(unix, test))]
+fn read_response_until<R: Read>(reader: &mut R, deadline: Instant) -> io::Result<Option<Response>> {
+    let mut bytes = Vec::new();
+    let mut expected_len = None;
+    let mut chunk = [0_u8; 8 * 1024];
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Resident Core handshake deadline elapsed",
+            ));
+        }
+
+        let read_capacity = expected_len
+            .map(|expected_len| expected_len - bytes.len())
+            .unwrap_or(chunk.len())
+            .min(chunk.len());
+        match reader.read(&mut chunk[..read_capacity]) {
+            Ok(0) if bytes.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Resident Core disconnected inside its handshake frame",
+                ));
+            }
+            Ok(read) => {
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.len() as u64 > MAX_MESSAGE_BYTES + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Resident Core protocol message exceeds 16 MiB",
+                    ));
+                }
+                if expected_len.is_none() && bytes.len() >= 4 {
+                    expected_len = Some(wire::expected_frame_len(
+                        bytes[..4].try_into().expect("four-byte frame prefix"),
+                    )?);
+                }
+                if let Some(expected_len) = expected_len {
+                    if bytes.len() == expected_len {
+                        return wire::decode_response(&bytes).map(Some);
+                    }
+                    if bytes.len() > expected_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Resident Core handshake contains trailing frame bytes",
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1262,8 +1333,33 @@ fn detach_command(command: &mut Command) {
 mod tests {
     use super::{
         CoreEndpoint, TerminalCell, TerminalLifecycle, TerminalSnapshot, TerminalUpdate,
-        protected_endpoint_name, server_proof, verify_server_proof,
+        protected_endpoint_name, read_response_until, server_proof, verify_server_proof,
     };
+
+    struct TransientWouldBlock {
+        bytes: std::io::Cursor<Vec<u8>>,
+        would_block_next: bool,
+    }
+
+    impl std::io::Read for TransientWouldBlock {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.would_block_next {
+                self.would_block_next = false;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.would_block_next = true;
+            let capacity = output.len().min(2);
+            self.bytes.read(&mut output[..capacity])
+        }
+    }
+
+    struct AlwaysWouldBlock;
+
+    impl std::io::Read for AlwaysWouldBlock {
+        fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+    }
 
     fn cell(x: u16, y: u16, text: &str) -> TerminalCell {
         TerminalCell {
@@ -1373,6 +1469,40 @@ mod tests {
         assert!(verify_server_proof(&other_secret, &endpoint, &nonce, &proof).is_err());
         assert!(verify_server_proof(&secret, &other_endpoint, &nonce, &proof).is_err());
         assert!(verify_server_proof(&secret, &endpoint, &other_nonce, &proof).is_err());
+    }
+
+    #[test]
+    fn handshake_reader_survives_transient_would_block() {
+        let encoded = super::wire::encode_response(&super::Response::Ready {
+            version: 2,
+            proof: [7; 32],
+        })
+        .expect("encode handshake response");
+        let mut reader = TransientWouldBlock {
+            bytes: std::io::Cursor::new(encoded),
+            would_block_next: true,
+        };
+
+        let response = read_response_until(
+            &mut reader,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("transient WouldBlock must not abort the handshake");
+
+        assert!(matches!(response, Some(super::Response::Ready { .. })));
+    }
+
+    #[test]
+    fn handshake_reader_enforces_its_deadline_while_would_blocked() {
+        let mut reader = AlwaysWouldBlock;
+
+        let error = read_response_until(
+            &mut reader,
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .expect_err("a silent handshake must reach its deadline");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[cfg(windows)]
