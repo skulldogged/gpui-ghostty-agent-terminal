@@ -1,4 +1,6 @@
-use agent_terminal::{CoreClient, CoreEndpoint, TerminalLifecycle, TerminalSize};
+use agent_terminal::{
+    ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, TerminalLifecycle, TerminalSize,
+};
 use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -79,6 +81,122 @@ fn terminal_changes_wake_the_ui_client_without_snapshot_polling() {
     assert!(snapshot.revision >= change.terminal_revision);
     wait_for_text(&mut client, "PUSHED_TERMINAL_CHANGE");
     client.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn observer_can_attach_and_receive_an_explicit_control_lease_transfer() {
+    let endpoint = isolated_endpoint("control-lease-transfer");
+    let mut core = spawn_core(&endpoint);
+    let mut controller = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("attach controlling UI Client");
+    let mut observer =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach observer UI Client");
+
+    let initial_lease = controller.control_lease().clone();
+    let initial_generation = initial_lease.generation;
+    assert_eq!(initial_lease.controller, Some(controller.client_id()));
+    assert_eq!(observer.control_lease(), &initial_lease);
+    observer
+        .snapshot()
+        .expect("observer reads terminal snapshot");
+
+    assert_eq!(
+        observer
+            .input(b"echo OBSERVER_MUST_NOT_CONTROL\r")
+            .expect_err("observer input must be rejected"),
+        CoreCommandError::ControlLeaseDenied {
+            reason: ControlLeaseDenial::HeldByOther,
+            lease: initial_lease.clone(),
+        }
+    );
+
+    let transferred = controller
+        .transfer_control(observer.client_id())
+        .expect("transfer Control Lease to observer");
+    assert_eq!(transferred.controller, Some(observer.client_id()));
+    assert!(transferred.generation > initial_generation);
+    assert_eq!(
+        observer
+            .refresh_control_lease()
+            .expect("observer refreshes transferred Control Lease"),
+        transferred
+    );
+
+    assert_eq!(
+        controller
+            .input(b"echo PREVIOUS_CONTROLLER_MUST_NOT_CONTROL\r")
+            .expect_err("previous controller input must be rejected"),
+        CoreCommandError::ControlLeaseDenied {
+            reason: ControlLeaseDenial::HeldByOther,
+            lease: transferred.clone(),
+        }
+    );
+    observer
+        .input(b"echo TRANSFERRED_CONTROL_LIVE\r")
+        .expect("new controller writes terminal input");
+    wait_for_text(&mut observer, "TRANSFERRED_CONTROL_LIVE");
+
+    observer.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn observer_can_acquire_the_control_lease_after_controller_detaches() {
+    let endpoint = isolated_endpoint("control-lease-reacquire");
+    let mut core = spawn_core(&endpoint);
+    let controller = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("attach controlling UI Client");
+    let mut observer =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach observer UI Client");
+
+    assert_eq!(
+        observer
+            .acquire_control()
+            .expect_err("held Control Lease must not be stolen"),
+        CoreCommandError::ControlLeaseDenied {
+            reason: ControlLeaseDenial::HeldByOther,
+            lease: controller.control_lease().clone(),
+        }
+    );
+    drop(controller);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let vacant = loop {
+        let lease = observer
+            .refresh_control_lease()
+            .expect("refresh Control Lease after controller detach");
+        if lease.controller.is_none() {
+            break lease;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "controller detach did not release the Control Lease"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(
+        observer
+            .input(b"echo VACANT_LEASE_MUST_NOT_CONTROL\r")
+            .expect_err("input without a controller must be rejected"),
+        CoreCommandError::ControlLeaseDenied {
+            reason: ControlLeaseDenial::NoController,
+            lease: vacant.clone(),
+        }
+    );
+
+    let acquired = observer
+        .acquire_control()
+        .expect("observer acquires vacant Control Lease");
+    assert_eq!(acquired.controller, Some(observer.client_id()));
+    assert!(acquired.generation > vacant.generation);
+    observer
+        .input(b"echo REACQUIRED_CONTROL_LIVE\r")
+        .expect("new controller writes after detach");
+    wait_for_text(&mut observer, "REACQUIRED_CONTROL_LIVE");
+
+    observer.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
 }
 
