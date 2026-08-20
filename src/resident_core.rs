@@ -1526,6 +1526,12 @@ pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
     while !stopping.load(Ordering::Acquire) {
         match listener.accept() {
             Ok(stream) => {
+                // BSD-derived Unix sockets may inherit O_NONBLOCK from the
+                // listener even when the cross-platform listener requests
+                // blocking streams. Client handlers use blocking framed I/O.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("configure UI Client stream: {error}"))?;
                 if !same_user(&stream)? {
                     continue;
                 }
