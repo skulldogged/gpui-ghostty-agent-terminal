@@ -1,15 +1,15 @@
-use crate::{CoreClient, TerminalSize, TerminalSnapshot};
+use crate::{CoreClient, TerminalChange, TerminalSize, TerminalSnapshot};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 const COMMAND_CAPACITY: usize = 256;
 
 pub(crate) struct CoreDriver {
     commands: flume::Sender<Command>,
-    updates: flume::Receiver<DriverUpdate>,
-    poll_pending: Arc<AtomicBool>,
+    updates: DriverUpdates,
+    counters: Arc<DriverCounters>,
 }
 
 pub(crate) enum DriverUpdate {
@@ -17,10 +17,44 @@ pub(crate) enum DriverUpdate {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DriverStats {
+    pushed_changes: u64,
+    snapshot_requests: u64,
+    snapshots_published: u64,
+}
+
+#[derive(Default)]
+struct DriverCounters {
+    pushed_changes: AtomicU64,
+    snapshot_requests: AtomicU64,
+    snapshots_published: AtomicU64,
+}
+
+#[derive(Clone)]
+pub(crate) struct DriverUpdates {
+    receiver: flume::Receiver<DriverUpdate>,
+}
+
+impl DriverUpdates {
+    pub(crate) async fn next(&self) -> Option<DriverUpdate> {
+        self.receiver.recv_async().await.ok()
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(&self, timeout: std::time::Duration) -> Option<DriverUpdate> {
+        self.receiver.recv_timeout(timeout).ok()
+    }
+}
+
 enum Command {
     Input(Vec<u8>),
     Resize(TerminalSize),
-    Poll,
+}
+
+enum DriverEvent {
+    Command(Result<Command, flume::RecvError>),
+    TerminalChanged(Result<TerminalChange, flume::RecvError>),
 }
 
 impl CoreDriver {
@@ -28,8 +62,8 @@ impl CoreDriver {
         let (commands_tx, commands_rx) = flume::bounded(COMMAND_CAPACITY);
         let (updates_tx, updates_rx) = flume::bounded(1);
         let stale_updates = updates_rx.clone();
-        let poll_pending = Arc::new(AtomicBool::new(false));
-        let worker_poll_pending = poll_pending.clone();
+        let counters = Arc::new(DriverCounters::default());
+        let worker_counters = Arc::clone(&counters);
         std::thread::Builder::new()
             .name("ui-core-driver".into())
             .spawn(move || {
@@ -39,14 +73,16 @@ impl CoreDriver {
                     commands_rx,
                     updates_tx,
                     stale_updates,
-                    worker_poll_pending,
+                    worker_counters,
                 )
             })
             .map_err(|error| format!("spawn UI Core driver: {error}"))?;
         Ok(Self {
             commands: commands_tx,
-            updates: updates_rx,
-            poll_pending,
+            updates: DriverUpdates {
+                receiver: updates_rx,
+            },
+            counters,
         })
     }
 
@@ -58,23 +94,16 @@ impl CoreDriver {
         self.send(Command::Resize(size))
     }
 
-    pub(crate) fn request_snapshot(&self) {
-        if self
-            .poll_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            && self.commands.try_send(Command::Poll).is_err()
-        {
-            self.poll_pending.store(false, Ordering::Release);
-        }
+    pub(crate) fn updates(&self) -> DriverUpdates {
+        self.updates.clone()
     }
 
-    pub(crate) fn latest_update(&self) -> Option<DriverUpdate> {
-        let mut latest = None;
-        while let Ok(update) = self.updates.try_recv() {
-            latest = Some(update);
+    fn stats(&self) -> DriverStats {
+        DriverStats {
+            pushed_changes: self.counters.pushed_changes.load(Ordering::Relaxed),
+            snapshot_requests: self.counters.snapshot_requests.load(Ordering::Relaxed),
+            snapshots_published: self.counters.snapshots_published.load(Ordering::Relaxed),
         }
-        latest
     }
 
     fn send(&self, command: Command) -> Result<(), String> {
@@ -87,40 +116,83 @@ impl CoreDriver {
     }
 }
 
+impl Drop for CoreDriver {
+    fn drop(&mut self) {
+        if std::env::var_os("AGENT_TERMINAL_DRIVER_STATS").is_some() {
+            let stats = self.stats();
+            eprintln!(
+                "UI Core driver: {} pushed changes, {} snapshot requests, {} snapshots published",
+                stats.pushed_changes, stats.snapshot_requests, stats.snapshots_published
+            );
+        }
+    }
+}
+
 fn run_driver(
     mut core: CoreClient,
     mut revision: u64,
     commands: flume::Receiver<Command>,
     updates: flume::Sender<DriverUpdate>,
     stale_updates: flume::Receiver<DriverUpdate>,
-    poll_pending: Arc<AtomicBool>,
+    counters: Arc<DriverCounters>,
 ) {
-    while let Ok(command) = commands.recv() {
-        let is_poll = matches!(command, Command::Poll);
-        let result = match command {
-            Command::Input(bytes) => core
-                .input(&bytes)
-                .map(|()| None)
-                .map_err(|error| error.to_string()),
-            Command::Resize(size) => core
-                .resize(size)
-                .map(|()| None)
-                .map_err(|error| error.to_string()),
-            Command::Poll => core.snapshot_since(revision).map(|snapshot| {
-                if let Some(snapshot) = &snapshot {
-                    revision = snapshot.revision;
+    let mut terminal_changes = core.terminal_changes();
+    loop {
+        let event = flume::Selector::new()
+            .recv(&commands, DriverEvent::Command)
+            .recv(&terminal_changes, DriverEvent::TerminalChanged)
+            .wait();
+        let (result, reconnect) = match event {
+            DriverEvent::Command(Err(_)) => break,
+            DriverEvent::Command(Ok(Command::Input(bytes))) => {
+                let result = core
+                    .input(&bytes)
+                    .map(|()| None)
+                    .map_err(|error| error.to_string());
+                let reconnect = result
+                    .as_ref()
+                    .is_err_and(|error| is_connection_failure(error));
+                (result, reconnect)
+            }
+            DriverEvent::Command(Ok(Command::Resize(size))) => {
+                let result = core
+                    .resize(size)
+                    .map(|()| None)
+                    .map_err(|error| error.to_string());
+                let reconnect = result
+                    .as_ref()
+                    .is_err_and(|error| is_connection_failure(error));
+                (result, reconnect)
+            }
+            DriverEvent::TerminalChanged(Ok(change)) => {
+                counters.pushed_changes.fetch_add(1, Ordering::Relaxed);
+                if change.terminal_revision <= revision {
+                    continue;
                 }
-                snapshot.map(DriverUpdate::Snapshot)
-            }),
+                counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
+                let result = core.snapshot_since(revision).map(|snapshot| {
+                    if let Some(snapshot) = &snapshot {
+                        revision = snapshot.revision;
+                    }
+                    snapshot.map(DriverUpdate::Snapshot)
+                });
+                let reconnect = result
+                    .as_ref()
+                    .is_err_and(|error| is_connection_failure(error));
+                (result, reconnect)
+            }
+            DriverEvent::TerminalChanged(Err(_)) => (
+                Err("Resident Core disconnected while waiting for a terminal change".into()),
+                true,
+            ),
         };
-        if is_poll {
-            poll_pending.store(false, Ordering::Release);
-        }
         match result {
-            Ok(Some(update)) => publish_latest(&updates, &stale_updates, update),
+            Ok(Some(update)) => {
+                counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
+                publish_latest(&updates, &stale_updates, update);
+            }
             Ok(None) => {}
             Err(error) => {
-                let reconnect = is_connection_failure(&error);
                 publish_latest(&updates, &stale_updates, DriverUpdate::Error(error));
                 if !reconnect {
                     continue;
@@ -131,15 +203,20 @@ fn run_driver(
                 });
                 match recovered {
                     Ok((replacement, snapshot)) => {
+                        terminal_changes = replacement.terminal_changes();
                         core = replacement;
                         revision = snapshot.revision;
+                        counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
                         publish_latest(&updates, &stale_updates, DriverUpdate::Snapshot(snapshot));
                     }
-                    Err(error) => publish_latest(
-                        &updates,
-                        &stale_updates,
-                        DriverUpdate::Error(format!("Resident Core reconnect failed: {error}")),
-                    ),
+                    Err(error) => {
+                        publish_latest(
+                            &updates,
+                            &stale_updates,
+                            DriverUpdate::Error(format!("Resident Core reconnect failed: {error}")),
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -165,7 +242,100 @@ fn publish_latest<T>(updates: &flume::Sender<T>, stale_updates: &flume::Receiver
 
 #[cfg(test)]
 mod tests {
-    use super::{is_connection_failure, publish_latest};
+    use super::{CoreDriver, DriverUpdate, is_connection_failure, publish_latest};
+    use crate::{CoreClient, CoreEndpoint, run_resident_core};
+    use std::{
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    struct TestCore {
+        endpoint: CoreEndpoint,
+        thread: Option<thread::JoinHandle<Result<(), String>>>,
+    }
+
+    impl TestCore {
+        fn start(scenario: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let endpoint = CoreEndpoint::for_profile(&format!(
+                "core-driver-{scenario}-{}-{nonce}",
+                std::process::id()
+            ))
+            .expect("create isolated Resident Core endpoint");
+            let server_endpoint = endpoint.clone();
+            let thread = thread::spawn(move || run_resident_core(server_endpoint));
+            Self {
+                endpoint,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for TestCore {
+        fn drop(&mut self) {
+            if let Ok(mut client) = CoreClient::connect(&self.endpoint, Duration::from_secs(10)) {
+                let _ = client.stop_resident_core();
+            }
+            if let Some(thread) = self.thread.take() {
+                assert_eq!(thread.join().expect("join Resident Core thread"), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_output_reaches_the_view_without_snapshot_polling() {
+        let core = TestCore::start("pushed-update");
+        let mut client =
+            CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach UI Client");
+        let mut initial = client.snapshot().expect("take initial snapshot");
+        while client
+            .wait_for_terminal_change(Duration::from_millis(100))
+            .expect("wait for a quiet terminal baseline")
+            .is_some()
+        {
+            if let Some(snapshot) = client
+                .snapshot_since(initial.revision)
+                .expect("refresh terminal baseline")
+            {
+                initial = snapshot;
+            }
+        }
+        let driver = CoreDriver::start(client, initial.revision).expect("start UI Core driver");
+        let updates = driver.updates();
+
+        assert!(
+            updates.recv_timeout(Duration::from_millis(100)).is_none(),
+            "an idle UI Core driver must not publish polling updates"
+        );
+        let idle = driver.stats();
+        assert_eq!(idle.snapshot_requests, 0);
+        assert_eq!(idle.snapshots_published, 0);
+
+        driver
+            .input(b"echo DRIVER_PUSHED_UPDATE\r".to_vec())
+            .expect("send terminal input");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match updates.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Some(DriverUpdate::Snapshot(snapshot))
+                    if snapshot.text().contains("DRIVER_PUSHED_UPDATE") =>
+                {
+                    break;
+                }
+                Some(DriverUpdate::Error(error)) => panic!("UI Core driver failed: {error}"),
+                _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                _ => panic!("UI Core driver did not publish pushed terminal output"),
+            }
+        }
+        let active = driver.stats();
+        assert!(active.pushed_changes > 0);
+        assert!(active.snapshot_requests > 0);
+        assert!(active.snapshots_published > 0);
+    }
 
     #[test]
     fn slow_views_receive_only_the_latest_coalescible_update() {

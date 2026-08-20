@@ -12,6 +12,7 @@ const REQUEST_STOP_RESIDENT_CORE: u8 = 5;
 const REQUEST_CONTROL_LEASE: u8 = 6;
 const REQUEST_TRANSFER_CONTROL: u8 = 7;
 const REQUEST_ACQUIRE_CONTROL: u8 = 8;
+const REQUEST_DETACH: u8 = 9;
 const RESPONSE_READY: u8 = 1;
 const RESPONSE_ACK: u8 = 2;
 const RESPONSE_SNAPSHOT: u8 = 3;
@@ -74,6 +75,7 @@ pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
             payload.push(REQUEST_ACQUIRE_CONTROL);
             payload.extend_from_slice(&lease_generation.to_le_bytes());
         }
+        Request::Detach => payload.push(REQUEST_DETACH),
         Request::StopResidentCore => payload.push(REQUEST_STOP_RESIDENT_CORE),
     }
     frame(payload)
@@ -114,6 +116,7 @@ pub(super) fn decode_request(frame: &[u8]) -> io::Result<Request> {
         REQUEST_ACQUIRE_CONTROL => Request::AcquireControl {
             lease_generation: decoder.u64()?,
         },
+        REQUEST_DETACH => Request::Detach,
         REQUEST_STOP_RESIDENT_CORE => Request::StopResidentCore,
         _ => return Err(invalid("unknown Resident Core request kind")),
     };
@@ -574,6 +577,7 @@ mod tests {
             Request::AcquireControl {
                 lease_generation: 15,
             },
+            Request::Detach,
             Request::StopResidentCore,
         ];
 
