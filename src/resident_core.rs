@@ -1,4 +1,7 @@
-use crate::{ghostty, terminal_session::TerminalSize};
+use crate::{
+    CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, TerminalSessionId, ghostty,
+    terminal_session::TerminalSize,
+};
 use interprocess::TryClone;
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
@@ -14,7 +17,7 @@ use ring::{
 };
 use std::io::Read;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, BufReader, Write},
     process::{Command, Stdio},
     sync::{
@@ -30,9 +33,9 @@ mod wire;
 
 use runtime::{CoreRuntime, RuntimeEvent};
 
-// Version 6 adds sequenced reliable semantic events with an attachment
-// baseline and fail-closed overflow recovery.
-const PROTOCOL_VERSION: u16 = 6;
+// Version 7 makes the authoritative hierarchy and stable Terminal Session IDs
+// part of the attachment, command, snapshot, lease, and event protocol.
+const PROTOCOL_VERSION: u16 = 7;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SEMANTIC_EVENT_CAPACITY: usize = 64;
 const SESSION_TICK: Duration = Duration::from_millis(10);
@@ -322,6 +325,7 @@ fn verify_server_proof(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalChange {
     pub sequence: u64,
+    pub terminal_session_id: TerminalSessionId,
     pub terminal_revision: u64,
 }
 
@@ -337,8 +341,12 @@ pub enum SemanticEventKind {
         lease: ControlLease,
     },
     TerminalLifecycleChanged {
+        terminal_session_id: TerminalSessionId,
         lifecycle: TerminalLifecycle,
         terminal_revision: u64,
+    },
+    HierarchyChanged {
+        revision: u64,
     },
 }
 
@@ -353,8 +361,17 @@ impl UiClientId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlLease {
+    pub terminal_session_id: TerminalSessionId,
     pub generation: u64,
     pub controller: Option<UiClientId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreCommandOutcome {
+    pub revision: u64,
+    pub snapshot: CoreSnapshot,
+    pub created: CreatedResource,
+    pub control_leases: Vec<ControlLease>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +388,7 @@ pub enum CoreCommandError {
         reason: ControlLeaseDenial,
         lease: ControlLease,
     },
+    Rejected(CoreModelError),
     Message(String),
 }
 
@@ -382,6 +400,7 @@ impl std::fmt::Display for CoreCommandError {
                 "Control Lease denied ({reason:?}); controller {:?}, generation {}",
                 lease.controller, lease.generation
             ),
+            Self::Rejected(error) => error.fmt(formatter),
             Self::Message(message) => formatter.write_str(message),
         }
     }
@@ -394,9 +413,11 @@ pub struct CoreClient {
     responses: flume::Receiver<Result<Response, String>>,
     terminal_changes: flume::Receiver<TerminalChange>,
     semantic_events: flume::Receiver<SemanticEvent>,
-    snapshot: Option<TerminalSnapshot>,
+    terminal_snapshots: HashMap<TerminalSessionId, TerminalSnapshot>,
+    core_snapshot: CoreSnapshot,
+    active_terminal_session_id: Option<TerminalSessionId>,
     client_id: UiClientId,
-    control_lease: ControlLease,
+    control_leases: HashMap<TerminalSessionId, ControlLease>,
 }
 
 impl CoreClient {
@@ -434,7 +455,8 @@ impl CoreClient {
                             version: PROTOCOL_VERSION,
                             proof,
                             client_id,
-                            lease,
+                            snapshot,
+                            leases,
                             semantic_sequence,
                         } => {
                             verify_server_proof(&auth_secret, endpoint, &nonce, &proof)?;
@@ -446,7 +468,21 @@ impl CoreClient {
                             let writer = Arc::new(Mutex::new(writer));
                             let (responses_tx, responses_rx) = flume::unbounded();
                             let (changes_tx, changes_rx) = flume::bounded(1);
-                            let stale_changes = changes_rx.clone();
+                            let (change_wake_tx, change_wake_rx) = flume::bounded(1);
+                            let pending_changes = Arc::new(Mutex::new(HashMap::new()));
+                            let dispatch_pending = Arc::clone(&pending_changes);
+                            thread::Builder::new()
+                                .name("resident-core-terminal-changes".into())
+                                .spawn(move || {
+                                    dispatch_terminal_changes(
+                                        change_wake_rx,
+                                        dispatch_pending,
+                                        changes_tx,
+                                    )
+                                })
+                                .map_err(|error| {
+                                    format!("spawn Resident Core terminal dispatcher: {error}")
+                                })?;
                             let (semantic_tx, semantic_rx) =
                                 flume::bounded(SEMANTIC_EVENT_CAPACITY);
                             let reader_writer = Arc::clone(&writer);
@@ -456,8 +492,8 @@ impl CoreClient {
                                     read_core_responses(
                                         connection,
                                         responses_tx,
-                                        changes_tx,
-                                        stale_changes,
+                                        pending_changes,
+                                        change_wake_tx,
                                         semantic_tx,
                                         semantic_sequence,
                                         reader_writer,
@@ -466,14 +502,21 @@ impl CoreClient {
                                 .map_err(|error| {
                                     format!("spawn Resident Core response reader: {error}")
                                 })?;
+                            let active_terminal_session_id =
+                                snapshot.terminal_sessions.first().map(|session| session.id);
                             return Ok(Self {
                                 connection: writer,
                                 responses: responses_rx,
                                 terminal_changes: changes_rx,
                                 semantic_events: semantic_rx,
-                                snapshot: None,
+                                terminal_snapshots: HashMap::new(),
+                                core_snapshot: snapshot,
+                                active_terminal_session_id,
                                 client_id,
-                                control_lease: lease,
+                                control_leases: leases
+                                    .into_iter()
+                                    .map(|lease| (lease.terminal_session_id, lease))
+                                    .collect(),
                             });
                         }
                         Response::Ready { version, .. } => {
@@ -513,21 +556,80 @@ impl CoreClient {
         self.client_id
     }
 
-    pub fn control_lease(&self) -> &ControlLease {
-        &self.control_lease
+    pub fn control_lease(&self) -> Option<&ControlLease> {
+        self.active_terminal_session_id
+            .and_then(|terminal_session_id| self.control_lease_for(terminal_session_id))
+    }
+
+    pub fn control_lease_for(
+        &self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Option<&ControlLease> {
+        self.control_leases.get(&terminal_session_id)
+    }
+
+    pub fn core_snapshot(&self) -> &CoreSnapshot {
+        &self.core_snapshot
+    }
+
+    pub fn active_terminal_session_id(&self) -> Option<TerminalSessionId> {
+        self.active_terminal_session_id
+    }
+
+    pub fn set_active_terminal_session(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Result<(), String> {
+        if self
+            .core_snapshot
+            .terminal_sessions
+            .iter()
+            .any(|session| session.id == terminal_session_id)
+        {
+            self.active_terminal_session_id = Some(terminal_session_id);
+            Ok(())
+        } else {
+            Err(format!(
+                "Terminal Session {} does not exist",
+                terminal_session_id.as_u64()
+            ))
+        }
     }
 
     pub fn input(&mut self, bytes: &[u8]) -> Result<(), CoreCommandError> {
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| CoreCommandError::Message("no active Terminal Session".into()))?;
+        self.input_to(terminal_session_id, bytes)
+    }
+
+    pub fn input_to(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        bytes: &[u8],
+    ) -> Result<(), CoreCommandError> {
+        let lease_generation = self
+            .control_leases
+            .get(&terminal_session_id)
+            .ok_or_else(|| {
+                CoreCommandError::Message(format!(
+                    "Terminal Session {} has no Control Lease",
+                    terminal_session_id.as_u64()
+                ))
+            })?
+            .generation;
         match self
             .request(Request::Input {
-                lease_generation: self.control_lease.generation,
+                terminal_session_id,
+                lease_generation,
                 bytes: bytes.to_vec(),
             })
             .map_err(CoreCommandError::Message)?
         {
             Response::Ack => Ok(()),
             Response::ControlLeaseDenied { reason, lease } => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Err(CoreCommandError::ControlLeaseDenied { reason, lease })
             }
             Response::Error(error) => Err(CoreCommandError::Message(error)),
@@ -538,16 +640,39 @@ impl CoreClient {
     }
 
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), CoreCommandError> {
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| CoreCommandError::Message("no active Terminal Session".into()))?;
+        self.resize_terminal(terminal_session_id, size)
+    }
+
+    pub fn resize_terminal(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        size: TerminalSize,
+    ) -> Result<(), CoreCommandError> {
+        let lease_generation = self
+            .control_leases
+            .get(&terminal_session_id)
+            .ok_or_else(|| {
+                CoreCommandError::Message(format!(
+                    "Terminal Session {} has no Control Lease",
+                    terminal_session_id.as_u64()
+                ))
+            })?
+            .generation;
         match self
             .request(Request::Resize {
-                lease_generation: self.control_lease.generation,
+                terminal_session_id,
+                lease_generation,
                 size,
             })
             .map_err(CoreCommandError::Message)?
         {
             Response::Ack => Ok(()),
             Response::ControlLeaseDenied { reason, lease } => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Err(CoreCommandError::ControlLeaseDenied { reason, lease })
             }
             Response::Error(error) => Err(CoreCommandError::Message(error)),
@@ -558,12 +683,25 @@ impl CoreClient {
     }
 
     pub fn refresh_control_lease(&mut self) -> Result<ControlLease, CoreCommandError> {
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| CoreCommandError::Message("no active Terminal Session".into()))?;
+        self.refresh_control_lease_for(terminal_session_id)
+    }
+
+    pub fn refresh_control_lease_for(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Result<ControlLease, CoreCommandError> {
         match self
-            .request(Request::ControlLease)
+            .request(Request::ControlLease {
+                terminal_session_id,
+            })
             .map_err(CoreCommandError::Message)?
         {
             Response::ControlLease(lease) => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Ok(lease)
             }
             Response::Error(error) => Err(CoreCommandError::Message(error)),
@@ -577,19 +715,38 @@ impl CoreClient {
         &mut self,
         target: UiClientId,
     ) -> Result<ControlLease, CoreCommandError> {
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| CoreCommandError::Message("no active Terminal Session".into()))?;
+        self.transfer_terminal_control(terminal_session_id, target)
+    }
+
+    pub fn transfer_terminal_control(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        target: UiClientId,
+    ) -> Result<ControlLease, CoreCommandError> {
+        let lease_generation = self
+            .control_leases
+            .get(&terminal_session_id)
+            .ok_or_else(|| CoreCommandError::Message("Control Lease is unavailable".into()))?
+            .generation;
         match self
             .request(Request::TransferControl {
-                lease_generation: self.control_lease.generation,
+                terminal_session_id,
+                lease_generation,
                 target,
             })
             .map_err(CoreCommandError::Message)?
         {
             Response::ControlLease(lease) => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Ok(lease)
             }
             Response::ControlLeaseDenied { reason, lease } => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Err(CoreCommandError::ControlLeaseDenied { reason, lease })
             }
             Response::Error(error) => Err(CoreCommandError::Message(error)),
@@ -600,18 +757,36 @@ impl CoreClient {
     }
 
     pub fn acquire_control(&mut self) -> Result<ControlLease, CoreCommandError> {
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| CoreCommandError::Message("no active Terminal Session".into()))?;
+        self.acquire_terminal_control(terminal_session_id)
+    }
+
+    pub fn acquire_terminal_control(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Result<ControlLease, CoreCommandError> {
+        let lease_generation = self
+            .control_leases
+            .get(&terminal_session_id)
+            .ok_or_else(|| CoreCommandError::Message("Control Lease is unavailable".into()))?
+            .generation;
         match self
             .request(Request::AcquireControl {
-                lease_generation: self.control_lease.generation,
+                terminal_session_id,
+                lease_generation,
             })
             .map_err(CoreCommandError::Message)?
         {
             Response::ControlLease(lease) => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Ok(lease)
             }
             Response::ControlLeaseDenied { reason, lease } => {
-                self.control_lease = lease.clone();
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
                 Err(CoreCommandError::ControlLeaseDenied { reason, lease })
             }
             Response::Error(error) => Err(CoreCommandError::Message(error)),
@@ -622,8 +797,21 @@ impl CoreClient {
     }
 
     pub fn snapshot(&mut self) -> Result<TerminalSnapshot, String> {
-        match self.request(Request::Snapshot { since: None })? {
-            Response::Snapshot(Some(update)) => self.accept_update(update),
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| "no active Terminal Session".to_string())?;
+        self.terminal_snapshot(terminal_session_id)
+    }
+
+    pub fn terminal_snapshot(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+    ) -> Result<TerminalSnapshot, String> {
+        match self.request(Request::Snapshot {
+            terminal_session_id,
+            since: None,
+        })? {
+            Response::Snapshot(Some(update)) => self.accept_update(terminal_session_id, update),
             Response::Snapshot(None) => {
                 Err("Resident Core omitted an unconditional snapshot".into())
             }
@@ -633,21 +821,42 @@ impl CoreClient {
     }
 
     pub fn snapshot_since(&mut self, revision: u64) -> Result<Option<TerminalSnapshot>, String> {
-        if let Some(snapshot) = &self.snapshot
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| "no active Terminal Session".to_string())?;
+        self.terminal_snapshot_since(terminal_session_id, revision)
+    }
+
+    pub fn terminal_snapshot_since(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        revision: u64,
+    ) -> Result<Option<TerminalSnapshot>, String> {
+        if let Some(snapshot) = self.terminal_snapshots.get(&terminal_session_id)
             && snapshot.revision != revision
         {
             return Ok(Some(snapshot.clone()));
         }
         let since = self
-            .snapshot
-            .as_ref()
+            .terminal_snapshots
+            .get(&terminal_session_id)
             .filter(|snapshot| snapshot.revision == revision)
             .map(|snapshot| snapshot.revision);
-        match self.request(Request::Snapshot { since })? {
-            Response::Snapshot(Some(update)) => match self.accept_update(update) {
+        match self.request(Request::Snapshot {
+            terminal_session_id,
+            since,
+        })? {
+            Response::Snapshot(Some(update)) => match self
+                .accept_update(terminal_session_id, update)
+            {
                 Ok(snapshot) => Ok(Some(snapshot)),
-                Err(_) => match self.request(Request::Snapshot { since: None })? {
-                    Response::Snapshot(Some(update)) => self.accept_update(update).map(Some),
+                Err(_) => match self.request(Request::Snapshot {
+                    terminal_session_id,
+                    since: None,
+                })? {
+                    Response::Snapshot(Some(update)) => {
+                        self.accept_update(terminal_session_id, update).map(Some)
+                    }
                     Response::Error(error) => Err(error),
                     response => Err(format!("invalid recovery snapshot response: {response:?}")),
                 },
@@ -657,6 +866,44 @@ impl CoreClient {
             response => Err(format!(
                 "invalid conditional snapshot response: {response:?}"
             )),
+        }
+    }
+
+    pub fn refresh_core_snapshot(&mut self) -> Result<CoreSnapshot, String> {
+        match self.request(Request::CoreSnapshot)? {
+            Response::CoreSnapshot(snapshot) => {
+                self.accept_core_snapshot(snapshot.clone());
+                Ok(snapshot)
+            }
+            Response::Error(error) => Err(error),
+            response => Err(format!("invalid Core snapshot response: {response:?}")),
+        }
+    }
+
+    pub fn apply_core_command(
+        &mut self,
+        command: CoreCommand,
+    ) -> Result<CoreCommandOutcome, CoreCommandError> {
+        match self
+            .request(Request::ApplyCoreCommand {
+                expected_revision: self.core_snapshot.revision,
+                command,
+            })
+            .map_err(CoreCommandError::Message)?
+        {
+            Response::CoreCommandAccepted(outcome) => {
+                self.accept_core_snapshot(outcome.snapshot.clone());
+                for lease in &outcome.control_leases {
+                    self.control_leases
+                        .insert(lease.terminal_session_id, lease.clone());
+                }
+                Ok(outcome)
+            }
+            Response::CoreCommandRejected(error) => Err(CoreCommandError::Rejected(error)),
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid Core command response: {response:?}"
+            ))),
         }
     }
 
@@ -707,7 +954,8 @@ impl CoreClient {
 
     pub(crate) fn accept_semantic_event(&mut self, event: &SemanticEvent) {
         if let SemanticEventKind::ControlLeaseChanged { lease } = &event.kind {
-            self.control_lease = lease.clone();
+            self.control_leases
+                .insert(lease.terminal_session_id, lease.clone());
         }
     }
 
@@ -732,20 +980,45 @@ impl CoreClient {
             .map_err(|_| "Resident Core disconnected before responding".to_string())?
     }
 
-    fn accept_update(&mut self, update: TerminalUpdate) -> Result<TerminalSnapshot, String> {
+    fn accept_update(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        update: TerminalUpdate,
+    ) -> Result<TerminalSnapshot, String> {
         if update.base_revision.is_none() {
-            self.snapshot = Some(TerminalSnapshot::from_update(update)?);
+            self.terminal_snapshots
+                .insert(terminal_session_id, TerminalSnapshot::from_update(update)?);
         } else {
-            self.snapshot
-                .as_mut()
+            self.terminal_snapshots
+                .get_mut(&terminal_session_id)
                 .ok_or_else(|| "Resident Core sent a delta before a full snapshot".to_string())?
                 .apply_update(update)?;
         }
         Ok(self
-            .snapshot
-            .as_ref()
+            .terminal_snapshots
+            .get(&terminal_session_id)
             .expect("accepted update stores a snapshot")
             .clone())
+    }
+
+    fn accept_core_snapshot(&mut self, snapshot: CoreSnapshot) {
+        let session_ids = snapshot
+            .terminal_sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        self.terminal_snapshots
+            .retain(|terminal_session_id, _| session_ids.contains(terminal_session_id));
+        self.control_leases
+            .retain(|terminal_session_id, _| session_ids.contains(terminal_session_id));
+        if self
+            .active_terminal_session_id
+            .is_none_or(|terminal_session_id| !session_ids.contains(&terminal_session_id))
+        {
+            self.active_terminal_session_id =
+                snapshot.terminal_sessions.first().map(|session| session.id);
+        }
+        self.core_snapshot = snapshot;
     }
 }
 
@@ -762,8 +1035,8 @@ impl Drop for CoreClient {
 fn read_core_responses(
     mut connection: BufReader<LocalSocketStream>,
     responses: flume::Sender<Result<Response, String>>,
-    terminal_changes: flume::Sender<TerminalChange>,
-    stale_terminal_changes: flume::Receiver<TerminalChange>,
+    terminal_changes: Arc<Mutex<HashMap<TerminalSessionId, TerminalChange>>>,
+    terminal_change_wake: flume::Sender<()>,
     semantic_events: flume::Sender<SemanticEvent>,
     mut semantic_sequence: u64,
     writer: Arc<Mutex<LocalSocketStream>>,
@@ -771,7 +1044,11 @@ fn read_core_responses(
     loop {
         match wire::read_response(&mut connection) {
             Ok(Some(Response::TerminalChanged(change))) => {
-                publish_latest_terminal_change(&terminal_changes, &stale_terminal_changes, change);
+                terminal_changes
+                    .lock()
+                    .expect("UI terminal pending-map mutex poisoned")
+                    .insert(change.terminal_session_id, change);
+                let _ = terminal_change_wake.try_send(());
             }
             Ok(Some(Response::SemanticEvent(event))) => {
                 let expected = semantic_sequence.saturating_add(1);
@@ -823,6 +1100,27 @@ fn read_core_responses(
     }
 }
 
+fn dispatch_terminal_changes(
+    wakes: flume::Receiver<()>,
+    pending: Arc<Mutex<HashMap<TerminalSessionId, TerminalChange>>>,
+    changes: flume::Sender<TerminalChange>,
+) {
+    while wakes.recv().is_ok() {
+        let mut batch = pending
+            .lock()
+            .expect("UI terminal pending-map mutex poisoned")
+            .drain()
+            .map(|(_, change)| change)
+            .collect::<Vec<_>>();
+        batch.sort_unstable_by_key(|change| change.sequence);
+        for change in batch {
+            if changes.send(change).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn fail_response_reader(
     responses: &flume::Sender<Result<Response, String>>,
     writer: &Arc<Mutex<LocalSocketStream>>,
@@ -831,21 +1129,6 @@ fn fail_response_reader(
     let _ = responses.send(Err(error));
     if let Ok(mut writer) = writer.lock() {
         let _ = wire::write_request(&mut *writer, &Request::Detach);
-    }
-}
-
-fn publish_latest_terminal_change(
-    changes: &flume::Sender<TerminalChange>,
-    stale_changes: &flume::Receiver<TerminalChange>,
-    change: TerminalChange,
-) {
-    match changes.try_send(change) {
-        Ok(()) => {}
-        Err(flume::TrySendError::Full(change)) => {
-            let _ = stale_changes.try_recv();
-            let _ = changes.try_send(change);
-        }
-        Err(flume::TrySendError::Disconnected(_)) => {}
     }
 }
 
@@ -1235,22 +1518,34 @@ enum Request {
         nonce: [u8; AUTH_NONCE_BYTES],
     },
     Input {
+        terminal_session_id: TerminalSessionId,
         lease_generation: u64,
         bytes: Vec<u8>,
     },
     Resize {
+        terminal_session_id: TerminalSessionId,
         lease_generation: u64,
         size: TerminalSize,
     },
     Snapshot {
+        terminal_session_id: TerminalSessionId,
         since: Option<u64>,
     },
-    ControlLease,
+    CoreSnapshot,
+    ApplyCoreCommand {
+        expected_revision: u64,
+        command: CoreCommand,
+    },
+    ControlLease {
+        terminal_session_id: TerminalSessionId,
+    },
     TransferControl {
+        terminal_session_id: TerminalSessionId,
         lease_generation: u64,
         target: UiClientId,
     },
     AcquireControl {
+        terminal_session_id: TerminalSessionId,
         lease_generation: u64,
     },
     Detach,
@@ -1263,11 +1558,15 @@ enum Response {
         version: u16,
         proof: [u8; 32],
         client_id: UiClientId,
-        lease: ControlLease,
+        snapshot: CoreSnapshot,
+        leases: Vec<ControlLease>,
         semantic_sequence: u64,
     },
     Ack,
     Snapshot(Option<TerminalUpdate>),
+    CoreSnapshot(CoreSnapshot),
+    CoreCommandAccepted(CoreCommandOutcome),
+    CoreCommandRejected(CoreModelError),
     TerminalChanged(TerminalChange),
     SemanticEvent(SemanticEvent),
     ResnapshotRequired,
@@ -1280,15 +1579,32 @@ enum Response {
 }
 
 enum WorkerRequest {
-    Input(Vec<u8>),
-    Resize(TerminalSize),
-    Snapshot { since: Option<u64> },
+    Input {
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        terminal_session_id: TerminalSessionId,
+        size: TerminalSize,
+    },
+    Snapshot {
+        terminal_session_id: TerminalSessionId,
+        since: Option<u64>,
+    },
+    CoreSnapshot,
+    ApplyCoreCommand {
+        expected_revision: u64,
+        command: CoreCommand,
+    },
     Stop,
 }
 
 enum WorkerResponse {
     Ack,
     Snapshot(Option<TerminalUpdate>),
+    CoreSnapshot(CoreSnapshot),
+    CoreCommandAccepted(CoreCommandOutcome),
+    CoreCommandRejected(CoreModelError),
 }
 
 struct WorkerCommand {
@@ -1298,6 +1614,7 @@ struct WorkerCommand {
 
 struct ResidentCore {
     commands: flume::Sender<WorkerCommand>,
+    model_commands: Mutex<()>,
     subscribers: Arc<Mutex<Vec<TerminalSubscriber>>>,
     next_subscriber_id: AtomicU64,
     control: Arc<Mutex<ControlState>>,
@@ -1307,7 +1624,7 @@ struct ResidentCore {
 
 struct ControlState {
     connected: HashSet<UiClientId>,
-    lease: ControlLease,
+    leases: HashMap<TerminalSessionId, ControlLease>,
 }
 
 struct ClientRegistration {
@@ -1323,15 +1640,21 @@ impl Drop for ClientRegistration {
             .lock()
             .expect("Resident Core Control Lease mutex poisoned");
         control.connected.remove(&self.id);
-        let changed = if control.lease.controller == Some(self.id) {
-            control.lease.generation = control.lease.generation.saturating_add(1);
-            control.lease.controller = None;
-            Some(control.lease.clone())
-        } else {
-            None
-        };
+        let changed = control
+            .leases
+            .values_mut()
+            .filter_map(|lease| {
+                if lease.controller == Some(self.id) {
+                    lease.generation = lease.generation.saturating_add(1);
+                    lease.controller = None;
+                    Some(lease.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         drop(control);
-        if let Some(lease) = changed {
+        for lease in changed {
             publish_semantic_event(
                 &self.semantic,
                 SemanticEventKind::ControlLeaseChanged { lease },
@@ -1369,12 +1692,19 @@ impl Drop for SemanticSubscription {
 
 struct TerminalSubscriber {
     id: u64,
-    sender: flume::Sender<TerminalChange>,
+    wake: flume::Sender<()>,
+    pending: Arc<Mutex<HashMap<TerminalSessionId, TerminalChange>>>,
 }
 
 struct TerminalSubscription {
     id: u64,
     subscribers: Arc<Mutex<Vec<TerminalSubscriber>>>,
+}
+
+struct TerminalChangeSubscription {
+    wakes: flume::Receiver<()>,
+    pending: Arc<Mutex<HashMap<TerminalSessionId, TerminalChange>>>,
+    registration: TerminalSubscription,
 }
 
 impl Drop for TerminalSubscription {
@@ -1406,7 +1736,7 @@ impl ResidentCore {
                     .and_then(|directory| CoreRuntime::start(&directory));
                 let mut runtime = match started {
                     Ok(runtime) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(runtime.model_snapshot()));
                         runtime
                     }
                     Err(error) => {
@@ -1414,7 +1744,6 @@ impl ResidentCore {
                         return;
                     }
                 };
-                let default_terminal = runtime.default_terminal();
                 let mut event_sequence = 0_u64;
 
                 loop {
@@ -1424,10 +1753,11 @@ impl ResidentCore {
                                 terminal_session_id,
                                 lifecycle,
                                 terminal_revision,
-                            } if terminal_session_id == default_terminal => {
+                            } => {
                                 publish_semantic_event(
                                     &worker_semantic,
                                     SemanticEventKind::TerminalLifecycleChanged {
+                                        terminal_session_id,
                                         lifecycle,
                                         terminal_revision,
                                     },
@@ -1436,47 +1766,72 @@ impl ResidentCore {
                             RuntimeEvent::TerminalChanged {
                                 terminal_session_id,
                                 terminal_revision,
-                            } if terminal_session_id == default_terminal => {
+                            } => {
                                 publish_terminal_change(
                                     &worker_subscribers,
                                     &mut event_sequence,
+                                    terminal_session_id,
                                     terminal_revision,
                                 );
                             }
-                            RuntimeEvent::TerminalLifecycleChanged { .. }
-                            | RuntimeEvent::TerminalChanged { .. } => {}
                         }
                     }
                     match commands_rx.recv_timeout(SESSION_TICK) {
                         Ok(command) => {
                             let stop = matches!(command.request, WorkerRequest::Stop);
-                            let mut changed_revision = None;
+                            let mut changed_terminal = None;
                             let result = match command.request {
-                                WorkerRequest::Input(bytes) => runtime
-                                    .input(default_terminal, &bytes)
+                                WorkerRequest::Input {
+                                    terminal_session_id,
+                                    bytes,
+                                } => runtime
+                                    .input(terminal_session_id, &bytes)
                                     .map(|()| WorkerResponse::Ack),
-                                WorkerRequest::Resize(size) => {
-                                    match runtime.resize(default_terminal, size) {
-                                        Ok(changed) => {
-                                            if changed {
-                                                changed_revision = runtime
-                                                    .terminal_revision(default_terminal)
-                                                    .ok();
-                                            }
-                                            Ok(WorkerResponse::Ack)
+                                WorkerRequest::Resize {
+                                    terminal_session_id,
+                                    size,
+                                } => match runtime.resize(terminal_session_id, size) {
+                                    Ok(changed) => {
+                                        if changed {
+                                            changed_terminal = runtime
+                                                .terminal_revision(terminal_session_id)
+                                                .ok()
+                                                .map(|revision| (terminal_session_id, revision));
                                         }
-                                        Err(error) => Err(error),
+                                        Ok(WorkerResponse::Ack)
                                     }
-                                }
-                                WorkerRequest::Snapshot { since } => runtime
-                                    .snapshot(default_terminal, since)
+                                    Err(error) => Err(error),
+                                },
+                                WorkerRequest::Snapshot {
+                                    terminal_session_id,
+                                    since,
+                                } => runtime
+                                    .snapshot(terminal_session_id, since)
                                     .map(WorkerResponse::Snapshot),
+                                WorkerRequest::CoreSnapshot => {
+                                    Ok(WorkerResponse::CoreSnapshot(runtime.model_snapshot()))
+                                }
+                                WorkerRequest::ApplyCoreCommand {
+                                    expected_revision,
+                                    command,
+                                } => match runtime.apply(expected_revision, command) {
+                                    Ok(commit) => Ok(WorkerResponse::CoreCommandAccepted(
+                                        CoreCommandOutcome {
+                                            revision: commit.revision,
+                                            snapshot: commit.snapshot,
+                                            created: commit.created,
+                                            control_leases: Vec::new(),
+                                        },
+                                    )),
+                                    Err(error) => Ok(WorkerResponse::CoreCommandRejected(error)),
+                                },
                                 WorkerRequest::Stop => Ok(WorkerResponse::Ack),
                             };
-                            if let Some(revision) = changed_revision {
+                            if let Some((terminal_session_id, revision)) = changed_terminal {
                                 publish_terminal_change(
                                     &worker_subscribers,
                                     &mut event_sequence,
+                                    terminal_session_id,
                                     revision,
                                 );
                             }
@@ -1491,19 +1846,30 @@ impl ResidentCore {
                 }
             })
             .map_err(|error| format!("spawn Resident Core terminal thread: {error}"))?;
-        ready_rx
+        let initial_snapshot = ready_rx
             .recv()
             .map_err(|_| "Resident Core terminal thread stopped during startup".to_string())??;
         Ok(Self {
             commands: commands_tx,
+            model_commands: Mutex::new(()),
             subscribers,
             next_subscriber_id: AtomicU64::new(1),
             control: Arc::new(Mutex::new(ControlState {
                 connected: HashSet::new(),
-                lease: ControlLease {
-                    generation: 0,
-                    controller: None,
-                },
+                leases: initial_snapshot
+                    .terminal_sessions
+                    .into_iter()
+                    .map(|session| {
+                        (
+                            session.id,
+                            ControlLease {
+                                terminal_session_id: session.id,
+                                generation: 0,
+                                controller: None,
+                            },
+                        )
+                    })
+                    .collect(),
             })),
             semantic,
             next_client_id: AtomicU64::new(1),
@@ -1518,15 +1884,25 @@ impl ResidentCore {
             .expect("Resident Core Control Lease mutex poisoned");
         let first_connection = control.connected.is_empty();
         control.connected.insert(id);
-        let changed = if first_connection && control.lease.controller.is_none() {
-            control.lease.generation = control.lease.generation.saturating_add(1);
-            control.lease.controller = Some(id);
-            Some(control.lease.clone())
+        let changed = if first_connection {
+            control
+                .leases
+                .values_mut()
+                .filter_map(|lease| {
+                    if lease.controller.is_none() {
+                        lease.generation = lease.generation.saturating_add(1);
+                        lease.controller = Some(id);
+                        Some(lease.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
         } else {
-            None
+            Vec::new()
         };
         drop(control);
-        if let Some(lease) = changed {
+        for lease in changed {
             publish_semantic_event(
                 &self.semantic,
                 SemanticEventKind::ControlLeaseChanged { lease },
@@ -1539,17 +1915,32 @@ impl ResidentCore {
         }
     }
 
-    fn control_lease(&self) -> ControlLease {
+    fn control_lease(&self, terminal_session_id: TerminalSessionId) -> Option<ControlLease> {
         self.control
             .lock()
             .expect("Resident Core Control Lease mutex poisoned")
-            .lease
-            .clone()
+            .leases
+            .get(&terminal_session_id)
+            .cloned()
+    }
+
+    fn control_leases(&self) -> Vec<ControlLease> {
+        let mut leases = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned")
+            .leases
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        leases.sort_unstable_by_key(|lease| lease.terminal_session_id);
+        leases
     }
 
     fn controlled_call(
         &self,
         client_id: UiClientId,
+        terminal_session_id: TerminalSessionId,
         lease_generation: u64,
         request: WorkerRequest,
     ) -> Response {
@@ -1557,11 +1948,17 @@ impl ResidentCore {
             .control
             .lock()
             .expect("Resident Core Control Lease mutex poisoned");
-        let reason = if control.lease.controller.is_none() {
+        let Some(lease) = control.leases.get(&terminal_session_id) else {
+            return Response::Error(format!(
+                "Terminal Session {} does not exist",
+                terminal_session_id.as_u64()
+            ));
+        };
+        let reason = if lease.controller.is_none() {
             Some(ControlLeaseDenial::NoController)
-        } else if control.lease.controller != Some(client_id) {
+        } else if lease.controller != Some(client_id) {
             Some(ControlLeaseDenial::HeldByOther)
-        } else if control.lease.generation != lease_generation {
+        } else if lease.generation != lease_generation {
             Some(ControlLeaseDenial::StaleGeneration)
         } else {
             None
@@ -1569,7 +1966,7 @@ impl ResidentCore {
         if let Some(reason) = reason {
             return Response::ControlLeaseDenied {
                 reason,
-                lease: control.lease.clone(),
+                lease: lease.clone(),
             };
         }
 
@@ -1581,6 +1978,7 @@ impl ResidentCore {
     fn transfer_control(
         &self,
         client_id: UiClientId,
+        terminal_session_id: TerminalSessionId,
         lease_generation: u64,
         target: UiClientId,
     ) -> Response {
@@ -1588,13 +1986,20 @@ impl ResidentCore {
             .control
             .lock()
             .expect("Resident Core Control Lease mutex poisoned");
-        let reason = if control.lease.controller.is_none() {
+        let connected_target = control.connected.contains(&target);
+        let Some(lease) = control.leases.get_mut(&terminal_session_id) else {
+            return Response::Error(format!(
+                "Terminal Session {} does not exist",
+                terminal_session_id.as_u64()
+            ));
+        };
+        let reason = if lease.controller.is_none() {
             Some(ControlLeaseDenial::NoController)
-        } else if control.lease.controller != Some(client_id) {
+        } else if lease.controller != Some(client_id) {
             Some(ControlLeaseDenial::HeldByOther)
-        } else if control.lease.generation != lease_generation {
+        } else if lease.generation != lease_generation {
             Some(ControlLeaseDenial::StaleGeneration)
-        } else if !control.connected.contains(&target) {
+        } else if !connected_target {
             Some(ControlLeaseDenial::TargetUnavailable)
         } else {
             None
@@ -1602,13 +2007,13 @@ impl ResidentCore {
         if let Some(reason) = reason {
             return Response::ControlLeaseDenied {
                 reason,
-                lease: control.lease.clone(),
+                lease: lease.clone(),
             };
         }
 
-        control.lease.generation = control.lease.generation.saturating_add(1);
-        control.lease.controller = Some(target);
-        let lease = control.lease.clone();
+        lease.generation = lease.generation.saturating_add(1);
+        lease.controller = Some(target);
+        let lease = lease.clone();
         drop(control);
         publish_semantic_event(
             &self.semantic,
@@ -1619,14 +2024,25 @@ impl ResidentCore {
         Response::ControlLease(lease)
     }
 
-    fn acquire_control(&self, client_id: UiClientId, lease_generation: u64) -> Response {
+    fn acquire_control(
+        &self,
+        client_id: UiClientId,
+        terminal_session_id: TerminalSessionId,
+        lease_generation: u64,
+    ) -> Response {
         let mut control = self
             .control
             .lock()
             .expect("Resident Core Control Lease mutex poisoned");
-        let reason = if control.lease.controller.is_some() {
+        let Some(lease) = control.leases.get_mut(&terminal_session_id) else {
+            return Response::Error(format!(
+                "Terminal Session {} does not exist",
+                terminal_session_id.as_u64()
+            ));
+        };
+        let reason = if lease.controller.is_some() {
             Some(ControlLeaseDenial::HeldByOther)
-        } else if control.lease.generation != lease_generation {
+        } else if lease.generation != lease_generation {
             Some(ControlLeaseDenial::StaleGeneration)
         } else {
             None
@@ -1634,13 +2050,13 @@ impl ResidentCore {
         if let Some(reason) = reason {
             return Response::ControlLeaseDenied {
                 reason,
-                lease: control.lease.clone(),
+                lease: lease.clone(),
             };
         }
 
-        control.lease.generation = control.lease.generation.saturating_add(1);
-        control.lease.controller = Some(client_id);
-        let lease = control.lease.clone();
+        lease.generation = lease.generation.saturating_add(1);
+        lease.controller = Some(client_id);
+        let lease = lease.clone();
         drop(control);
         publish_semantic_event(
             &self.semantic,
@@ -1649,6 +2065,93 @@ impl ResidentCore {
             },
         );
         Response::ControlLease(lease)
+    }
+
+    fn apply_core_command(
+        &self,
+        client_id: UiClientId,
+        expected_revision: u64,
+        command: CoreCommand,
+    ) -> Response {
+        // Keep model mutation, runtime effects, lease reconciliation, and the
+        // acknowledged hierarchy event in one service-level order even when
+        // multiple UI Client handler threads submit concurrently.
+        let _model_command = self
+            .model_commands
+            .lock()
+            .expect("Resident Core model command mutex poisoned");
+        let result = self.call(WorkerRequest::ApplyCoreCommand {
+            expected_revision,
+            command,
+        });
+        let mut outcome = match result {
+            Ok(WorkerResponse::CoreCommandAccepted(outcome)) => outcome,
+            Ok(WorkerResponse::CoreCommandRejected(error)) => {
+                return Response::CoreCommandRejected(error);
+            }
+            Ok(_) => return Response::Error("invalid Core command worker response".into()),
+            Err(error) => return Response::Error(error),
+        };
+
+        let session_ids = outcome
+            .snapshot
+            .terminal_sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        let mut created_leases = Vec::new();
+        let mut control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        control
+            .leases
+            .retain(|terminal_session_id, _| session_ids.contains(terminal_session_id));
+        for terminal_session_id in session_ids {
+            control
+                .leases
+                .entry(terminal_session_id)
+                .or_insert_with(|| {
+                    let lease = ControlLease {
+                        terminal_session_id,
+                        generation: 1,
+                        controller: Some(client_id),
+                    };
+                    created_leases.push(lease.clone());
+                    lease
+                });
+        }
+        outcome.control_leases = control.leases.values().cloned().collect();
+        outcome
+            .control_leases
+            .sort_unstable_by_key(|lease| lease.terminal_session_id);
+        drop(control);
+
+        publish_semantic_event(
+            &self.semantic,
+            SemanticEventKind::HierarchyChanged {
+                revision: outcome.revision,
+            },
+        );
+        for lease in created_leases {
+            publish_semantic_event(
+                &self.semantic,
+                SemanticEventKind::ControlLeaseChanged { lease },
+            );
+        }
+        Response::CoreCommandAccepted(outcome)
+    }
+
+    fn hierarchy_snapshot(&self) -> Result<(CoreSnapshot, Vec<ControlLease>), String> {
+        let _model_command = self
+            .model_commands
+            .lock()
+            .expect("Resident Core model command mutex poisoned");
+        let snapshot = match self.call(WorkerRequest::CoreSnapshot)? {
+            WorkerResponse::CoreSnapshot(snapshot) => snapshot,
+            _ => return Err("invalid Core snapshot worker response".into()),
+        };
+        Ok((snapshot, self.control_leases()))
     }
 
     fn subscribe_semantic(
@@ -1685,20 +2188,26 @@ impl ResidentCore {
         )
     }
 
-    fn subscribe(&self) -> (flume::Receiver<TerminalChange>, TerminalSubscription) {
-        let (sender, receiver) = flume::bounded(1);
+    fn subscribe(&self) -> TerminalChangeSubscription {
+        let (wake, receiver) = flume::bounded(1);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
         self.subscribers
             .lock()
             .expect("Resident Core subscriber mutex poisoned")
-            .push(TerminalSubscriber { id, sender });
-        (
-            receiver,
-            TerminalSubscription {
+            .push(TerminalSubscriber {
+                id,
+                wake,
+                pending: Arc::clone(&pending),
+            });
+        TerminalChangeSubscription {
+            wakes: receiver,
+            pending,
+            registration: TerminalSubscription {
                 id,
                 subscribers: Arc::clone(&self.subscribers),
             },
-        )
+        }
     }
 
     fn call(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
@@ -1739,22 +2248,29 @@ fn publish_semantic_event(state: &Arc<Mutex<SemanticState>>, kind: SemanticEvent
 fn publish_terminal_change(
     subscribers: &Arc<Mutex<Vec<TerminalSubscriber>>>,
     sequence: &mut u64,
+    terminal_session_id: TerminalSessionId,
     terminal_revision: u64,
 ) {
     *sequence = sequence.saturating_add(1);
     let change = TerminalChange {
         sequence: *sequence,
+        terminal_session_id,
         terminal_revision,
     };
     subscribers
         .lock()
         .expect("Resident Core subscriber mutex poisoned")
-        .retain(
-            |subscriber| match subscriber.sender.try_send(change.clone()) {
-                Ok(()) | Err(flume::TrySendError::Full(_)) => true,
-                Err(flume::TrySendError::Disconnected(_)) => false,
-            },
-        );
+        .retain(|subscriber| {
+            subscriber
+                .pending
+                .lock()
+                .expect("Resident Core terminal pending-map mutex poisoned")
+                .insert(terminal_session_id, change.clone());
+            !matches!(
+                subscriber.wake.try_send(()),
+                Err(flume::TrySendError::Disconnected(_))
+            )
+        });
 }
 
 pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
@@ -1968,27 +2484,47 @@ fn handle_client(
     let client_id = registration.id;
     let (semantic_events, _semantic_subscription, semantic_overflowed, semantic_sequence) =
         core.subscribe_semantic();
-    let lease = core.control_lease();
+    let (snapshot, leases) = match core.hierarchy_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            write_shared_response(&writer, &Response::Error(error))?;
+            return Ok(ClientOutcome::Disconnected);
+        }
+    };
     write_shared_response(
         &writer,
         &Response::Ready {
             version: PROTOCOL_VERSION,
             proof: server_proof(auth_secret, endpoint, &nonce),
             client_id,
-            lease,
+            snapshot,
+            leases,
             semantic_sequence,
         },
     )?;
-    let (changes, _subscription) = core.subscribe();
+    let TerminalChangeSubscription {
+        wakes: change_wakes,
+        pending: pending_changes,
+        registration: _terminal_subscription,
+    } = core.subscribe();
     let change_writer = Arc::clone(&writer);
     thread::Builder::new()
         .name("resident-core-client-events".into())
         .spawn(move || {
-            while let Ok(change) = changes.recv() {
-                if write_shared_response(&change_writer, &Response::TerminalChanged(change))
-                    .is_err()
-                {
-                    break;
+            while change_wakes.recv().is_ok() {
+                let mut changes = pending_changes
+                    .lock()
+                    .expect("Resident Core terminal pending-map mutex poisoned")
+                    .drain()
+                    .map(|(_, change)| change)
+                    .collect::<Vec<_>>();
+                changes.sort_unstable_by_key(|change| change.sequence);
+                for change in changes {
+                    if write_shared_response(&change_writer, &Response::TerminalChanged(change))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         })?;
@@ -2021,34 +2557,86 @@ fn handle_client(
                 None,
             ),
             Request::Input {
+                terminal_session_id,
                 lease_generation,
                 bytes,
             } => (
-                core.controlled_call(client_id, lease_generation, WorkerRequest::Input(bytes)),
+                core.controlled_call(
+                    client_id,
+                    terminal_session_id,
+                    lease_generation,
+                    WorkerRequest::Input {
+                        terminal_session_id,
+                        bytes,
+                    },
+                ),
                 None,
             ),
             Request::Resize {
+                terminal_session_id,
                 lease_generation,
                 size,
             } => (
-                core.controlled_call(client_id, lease_generation, WorkerRequest::Resize(size)),
+                core.controlled_call(
+                    client_id,
+                    terminal_session_id,
+                    lease_generation,
+                    WorkerRequest::Resize {
+                        terminal_session_id,
+                        size,
+                    },
+                ),
                 None,
             ),
-            Request::Snapshot { since } => (
-                worker_response(core.call(WorkerRequest::Snapshot { since })),
+            Request::Snapshot {
+                terminal_session_id,
+                since,
+            } => (
+                worker_response(core.call(WorkerRequest::Snapshot {
+                    terminal_session_id,
+                    since,
+                })),
                 None,
             ),
-            Request::ControlLease => (Response::ControlLease(core.control_lease()), None),
+            Request::CoreSnapshot => match core.hierarchy_snapshot() {
+                Ok((snapshot, _)) => (Response::CoreSnapshot(snapshot), None),
+                Err(error) => (Response::Error(error), None),
+            },
+            Request::ApplyCoreCommand {
+                expected_revision,
+                command,
+            } => (
+                core.apply_core_command(client_id, expected_revision, command),
+                None,
+            ),
+            Request::ControlLease {
+                terminal_session_id,
+            } => (
+                core.control_lease(terminal_session_id)
+                    .map(Response::ControlLease)
+                    .unwrap_or_else(|| {
+                        Response::Error(format!(
+                            "Terminal Session {} does not exist",
+                            terminal_session_id.as_u64()
+                        ))
+                    }),
+                None,
+            ),
             Request::TransferControl {
+                terminal_session_id,
                 lease_generation,
                 target,
             } => (
-                core.transfer_control(client_id, lease_generation, target),
+                core.transfer_control(client_id, terminal_session_id, lease_generation, target),
                 None,
             ),
-            Request::AcquireControl { lease_generation } => {
-                (core.acquire_control(client_id, lease_generation), None)
-            }
+            Request::AcquireControl {
+                terminal_session_id,
+                lease_generation,
+            } => (
+                core.acquire_control(client_id, terminal_session_id, lease_generation),
+                None,
+            ),
             Request::Detach => (Response::Ack, Some(ClientOutcome::Disconnected)),
             Request::StopResidentCore => (
                 worker_response(core.call(WorkerRequest::Stop)),
@@ -2076,6 +2664,9 @@ fn worker_response(response: Result<WorkerResponse, String>) -> Response {
     match response {
         Ok(WorkerResponse::Ack) => Response::Ack,
         Ok(WorkerResponse::Snapshot(snapshot)) => Response::Snapshot(snapshot),
+        Ok(WorkerResponse::CoreSnapshot(snapshot)) => Response::CoreSnapshot(snapshot),
+        Ok(WorkerResponse::CoreCommandAccepted(outcome)) => Response::CoreCommandAccepted(outcome),
+        Ok(WorkerResponse::CoreCommandRejected(error)) => Response::CoreCommandRejected(error),
         Err(error) => Response::Error(error),
     }
 }
@@ -2299,10 +2890,16 @@ mod tests {
             version: 2,
             proof: [7; 32],
             client_id: super::UiClientId(1),
-            lease: super::ControlLease {
+            snapshot: crate::CoreSnapshot {
+                revision: 0,
+                spaces: Vec::new(),
+                terminal_sessions: Vec::new(),
+            },
+            leases: vec![super::ControlLease {
+                terminal_session_id: crate::TerminalSessionId::from_u64(1),
                 generation: 1,
                 controller: Some(super::UiClientId(1)),
-            },
+            }],
             semantic_sequence: 1,
         })
         .expect("encode handshake response");

@@ -62,6 +62,9 @@ enum DriverEvent {
 
 impl CoreDriver {
     pub(crate) fn start(core: CoreClient, revision: u64) -> Result<Self, String> {
+        if core.active_terminal_session_id().is_none() {
+            return Err("cannot start a terminal driver without an active Terminal Session".into());
+        }
         let (commands_tx, commands_rx) = flume::bounded(COMMAND_CAPACITY);
         let (updates_tx, updates_rx) = flume::bounded(1);
         let stale_updates = updates_rx.clone();
@@ -139,6 +142,9 @@ fn run_driver(
     stale_updates: flume::Receiver<DriverUpdate>,
     counters: Arc<DriverCounters>,
 ) {
+    let mut terminal_session_id = core
+        .active_terminal_session_id()
+        .expect("CoreDriver starts only with an active Terminal Session");
     let mut terminal_changes = core.terminal_changes();
     let mut semantic_events = core.semantic_events();
     loop {
@@ -170,6 +176,9 @@ fn run_driver(
                 (result, reconnect)
             }
             DriverEvent::TerminalChanged(Ok(change)) => {
+                if change.terminal_session_id != terminal_session_id {
+                    continue;
+                }
                 counters.pushed_changes.fetch_add(1, Ordering::Relaxed);
                 if change.terminal_revision <= revision {
                     continue;
@@ -193,11 +202,16 @@ fn run_driver(
             DriverEvent::Semantic(Ok(event)) => {
                 core.accept_semantic_event(&event);
                 let SemanticEventKind::TerminalLifecycleChanged {
-                    terminal_revision, ..
+                    terminal_session_id: changed_terminal_session_id,
+                    terminal_revision,
+                    ..
                 } = event.kind
                 else {
                     continue;
                 };
+                if changed_terminal_session_id != terminal_session_id {
+                    continue;
+                }
                 if terminal_revision <= revision {
                     continue;
                 }
@@ -238,6 +252,20 @@ fn run_driver(
                         terminal_changes = replacement.terminal_changes();
                         semantic_events = replacement.semantic_events();
                         core = replacement;
+                        let Some(reconnected_terminal_session_id) =
+                            core.active_terminal_session_id()
+                        else {
+                            publish_latest(
+                                &updates,
+                                &stale_updates,
+                                DriverUpdate::Error(
+                                    "Resident Core reconnected without an active Terminal Session"
+                                        .into(),
+                                ),
+                            );
+                            break;
+                        };
+                        terminal_session_id = reconnected_terminal_session_id;
                         revision = snapshot.revision;
                         counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
                         publish_latest(&updates, &stale_updates, DriverUpdate::Snapshot(snapshot));

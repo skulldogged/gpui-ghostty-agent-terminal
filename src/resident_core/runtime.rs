@@ -3,8 +3,7 @@ use crate::{
     CoreCommand, CoreEffect, CoreModel, TerminalSessionId,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
-#[cfg(test)]
-use crate::{CoreCommit, CoreModelError};
+use crate::{CoreCommit, CoreModelError, CoreSnapshot};
 use std::{collections::HashMap, path::Path};
 
 pub(super) struct CoreRuntime {
@@ -72,6 +71,7 @@ impl CoreRuntime {
         Ok(runtime)
     }
 
+    #[cfg(test)]
     pub(super) fn default_terminal(&self) -> TerminalSessionId {
         self.model
             .snapshot()
@@ -81,8 +81,7 @@ impl CoreRuntime {
             .expect("a running Core has an initial Terminal Session")
     }
 
-    #[cfg(test)]
-    pub(super) fn model_snapshot(&self) -> crate::CoreSnapshot {
+    pub(super) fn model_snapshot(&self) -> CoreSnapshot {
         self.model.snapshot()
     }
 
@@ -101,7 +100,6 @@ impl CoreRuntime {
             })
     }
 
-    #[cfg(test)]
     pub(super) fn apply(
         &mut self,
         expected_revision: u64,
