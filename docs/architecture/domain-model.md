@@ -18,8 +18,13 @@ This document resolves the structural decisions tracked in issue #9. `CONTEXT.md
 - Closing a Pane is an explicit destructive command. The UI confirms when work may be active; after acknowledgement the Resident Core stops the referenced Terminal Session and removes the Pane atomically.
 - Moving a Pane atomically removes and reinserts the same Pane placement and Terminal Session reference. Launch-time environment hints may become stale and never confer identity or authority.
 - A live Terminal Session is `Running`, `Stopping`, `Exited`, or `Failed`. Structural cold restoration creates a new Terminal Session identity and must not claim live-process continuity.
+- Restore Disposition is durable intent independent of that live lifecycle. `Relaunch` creates a new Running Terminal Session during cold restore; `RemainEnded` creates a new ended representation without launching a process. Natural exit/failure changes the disposition to `RemainEnded`; Core shutdown, logout, or update cleanup does not change it merely because the Core stops the child.
 - Tabs and Panes have stable explicit ordering. Reordering does not change IDs. Focus, selected Tab, window geometry, sidebar state, and transient selection belong to each UI Client rather than the Resident Core.
 
 ## Persistence
 
-The Resident Core persists Space identity and directory, Tab identity/name/order, split trees, Pane identity, Terminal Session launch intent and working directory, and optional agent-native resume references. It does not persist PTY/ConPTY handles, live process identity, UI focus, window state, or implicit repository identity. Terminal history is a separate opt-in store because it may contain secrets.
+The Resident Core persists Space identity and directory, Tab identity/name/order, split trees, Pane identity, Terminal Session launch intent and working directory, Restore Disposition, and optional agent-native resume references. It does not persist PTY/ConPTY handles, live process identity, UI focus, window state, or implicit repository identity. Terminal history is a separate opt-in store because it may contain secrets.
+
+Persistence is generation-based. A quiet debounce may coalesce mutations, but a non-resetting hard deadline starts a checkpoint no later than five seconds after the first unsaved mutation. Clean Core shutdown waits for the newest generation to publish. Natural Terminal Session exit/failure is a persistent mutation; shutdown-induced process exit is not.
+
+Snapshot publication guarantees that an application crash exposes either the prior complete snapshot or the new complete snapshot, never a partially serialized target. Machine-crash and sudden-power-loss durability are best effort through platform-specific flush and replacement adapters. A newer-schema or corrupt snapshot is a write-blocking load outcome rather than an empty profile; the original remains untouched until upgrade, validated recovery, or explicit reset.
