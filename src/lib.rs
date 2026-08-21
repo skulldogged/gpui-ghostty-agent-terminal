@@ -16,6 +16,8 @@ mod windows_pty;
 #[cfg(feature = "gui")]
 mod core_driver;
 #[cfg(feature = "gui")]
+mod desktop_presence;
+#[cfg(feature = "gui")]
 mod desktop_shell;
 #[cfg(feature = "gui")]
 mod gui;

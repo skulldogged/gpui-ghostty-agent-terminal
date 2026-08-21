@@ -1,11 +1,7 @@
-use crate::gui;
-use gpui::{App, QuitMode};
+use crate::{desktop_presence::DesktopPresence, gui};
+use gpui::{App, Global, QuitMode, Task};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the platform presence adapter constructs the quit intent in the next stacked slice"
-)]
 pub(crate) enum DesktopIntent {
     OpenOrFocus,
     QuitDesktopShell,
@@ -18,10 +14,44 @@ enum DesktopAction {
     Quit,
 }
 
+struct DesktopShellRuntime {
+    _presence: Option<DesktopPresence>,
+    _intent_task: Task<()>,
+}
+
+impl Global for DesktopShellRuntime {}
+
 pub(crate) fn run() {
     let application = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
     application.on_reopen(|cx| handle_intent(DesktopIntent::OpenOrFocus, cx));
-    application.run(|cx| handle_intent(DesktopIntent::OpenOrFocus, cx));
+    application.run(|cx| {
+        install_desktop_presence(cx);
+        handle_intent(DesktopIntent::OpenOrFocus, cx);
+    });
+}
+
+fn install_desktop_presence(cx: &mut App) {
+    let (intent_sender, intent_receiver) = flume::unbounded();
+    let presence = match DesktopPresence::start(intent_sender) {
+        Ok(presence) => {
+            cx.set_quit_mode(QuitMode::Explicit);
+            Some(presence)
+        }
+        Err(error) => {
+            eprintln!("Desktop presence unavailable: {error}");
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+            None
+        }
+    };
+    let intent_task = cx.spawn(async move |cx| {
+        while let Ok(intent) = intent_receiver.recv_async().await {
+            cx.update(|cx| handle_intent(intent, cx));
+        }
+    });
+    cx.set_global(DesktopShellRuntime {
+        _presence: presence,
+        _intent_task: intent_task,
+    });
 }
 
 pub(crate) fn handle_intent(intent: DesktopIntent, cx: &mut App) {
