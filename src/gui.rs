@@ -1,36 +1,38 @@
 use crate::{
-    CoreClient, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
-    core_driver::{CoreDriver, DriverUpdate},
+    CoreClient, CoreSnapshot, PaneId, PaneLayout, SpaceId, SplitAxis, TabId, TerminalLifecycle,
+    TerminalSessionId, TerminalSize, TerminalSnapshot,
+    core_driver::{CoreDriver, CoreProjection, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
 };
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke,
-    Pixels, Point, Render, ShapedLine, SharedString, Task, TextRun, Window, WindowBounds,
-    WindowOptions, canvas, div, fill, font, point, prelude::*, px, rgb, size,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent,
+    Keystroke, Pixels, Point, Render, ShapedLine, SharedString, Task, TextRun, Window,
+    WindowBounds, WindowOptions, canvas, div, fill, font, point, prelude::*, px, rgb, size,
 };
+use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::time::Duration;
 
-const TERMINAL_PADDING_PX: f32 = 12.0;
+const TERMINAL_PADDING_PX: f32 = 10.0;
+const SIDEBAR_WIDTH_PX: f32 = 188.0;
+const TAB_BAR_HEIGHT_PX: f32 = 38.0;
+const SPLIT_GAP_PX: f32 = 1.0;
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
 pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, String> {
     let terminal_font = TerminalFont::resolve(cx)?;
     let core = CoreClient::connect_or_spawn()?;
-    let (driver, mut projection) = CoreDriver::start(core)?;
-    let terminal_session_id = projection
-        .hierarchy
-        .terminal_sessions
-        .first()
-        .map(|session| session.id)
-        .ok_or_else(|| "the initial hierarchy has no Terminal Session".to_string())?;
-    let snapshot = projection
+    let (driver, projection) = CoreDriver::start(core)?;
+    let selection = UiSelection::initial(&projection.hierarchy);
+    let terminal_errors = projection
         .terminals
-        .remove(&terminal_session_id)
-        .ok_or_else(|| "the initial Terminal Session has no rendered snapshot".to_string())?;
-    let terminal_error = lifecycle_message(&snapshot.lifecycle);
-    let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
+        .iter()
+        .filter_map(|(&terminal_session_id, snapshot)| {
+            lifecycle_message(&snapshot.lifecycle).map(|message| (terminal_session_id, message))
+        })
+        .collect();
+    let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
     let window = cx
         .open_window(
             WindowOptions {
@@ -40,15 +42,17 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
             move |window, cx| {
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
-                let view = cx.new(|_| TerminalView {
+                let view = cx.new(|_| MultiplexerView {
                     driver,
-                    terminal_session_id,
-                    snapshot,
+                    hierarchy: projection.hierarchy,
+                    terminals: projection.terminals,
+                    selection,
                     focus,
                     refresh_task: Task::ready(()),
-                    terminal_error,
+                    terminal_errors,
+                    global_error: None,
                     terminal_font,
-                    requested_size: None,
+                    requested_sizes: HashMap::new(),
                 });
                 view.update(cx, |view, cx| {
                     view.start_refresh_task(cx);
@@ -66,15 +70,50 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
     Ok(window.into())
 }
 
-struct TerminalView {
+struct MultiplexerView {
     driver: CoreDriver,
-    terminal_session_id: TerminalSessionId,
-    snapshot: TerminalSnapshot,
+    hierarchy: CoreSnapshot,
+    terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
+    selection: UiSelection,
     focus: FocusHandle,
     refresh_task: Task<()>,
-    terminal_error: Option<String>,
+    terminal_errors: HashMap<TerminalSessionId, String>,
+    global_error: Option<String>,
     terminal_font: TerminalFont,
-    requested_size: Option<TerminalSize>,
+    requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UiSelection {
+    space_id: Option<SpaceId>,
+    tab_id: Option<TabId>,
+    pane_id: Option<PaneId>,
+}
+
+impl UiSelection {
+    fn initial(hierarchy: &CoreSnapshot) -> Self {
+        Self::default().normalized(hierarchy)
+    }
+
+    fn normalized(mut self, hierarchy: &CoreSnapshot) -> Self {
+        let space = self
+            .space_id
+            .and_then(|space_id| hierarchy.spaces.iter().find(|space| space.id == space_id))
+            .or_else(|| hierarchy.spaces.first());
+        self.space_id = space.map(|space| space.id);
+        let tab = space.and_then(|space| {
+            self.tab_id
+                .and_then(|tab_id| space.tabs.iter().find(|tab| tab.id == tab_id))
+                .or_else(|| space.tabs.first())
+        });
+        self.tab_id = tab.map(|tab| tab.id);
+        self.pane_id = tab.and_then(|tab| {
+            self.pane_id
+                .filter(|pane_id| layout_contains_pane(&tab.layout, *pane_id))
+                .or_else(|| first_pane_id(&tab.layout))
+        });
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -176,7 +215,7 @@ fn terminal_font_candidates() -> &'static [&'static str] {
     &["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"]
 }
 
-impl TerminalView {
+impl MultiplexerView {
     #[cfg(windows)]
     fn start_windows_probe(&mut self, cx: &mut Context<Self>) {
         let timer = cx.background_executor().timer(Duration::from_millis(750));
@@ -184,11 +223,12 @@ impl TerminalView {
             timer.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |view, _cx| {
-                    if let Err(error) = view.driver.input_to(
-                        view.terminal_session_id,
-                        b"echo WINDOWS_CONPTY_LIVE\r".to_vec(),
-                    ) {
-                        view.terminal_error = Some(error);
+                    if let Some(terminal_session_id) = view.focused_terminal_session_id()
+                        && let Err(error) = view
+                            .driver
+                            .input_to(terminal_session_id, b"echo WINDOWS_CONPTY_LIVE\r".to_vec())
+                    {
+                        view.global_error = Some(error);
                     }
                 });
             }
@@ -204,106 +244,318 @@ impl TerminalView {
                     break;
                 };
                 this.update(cx, move |view, cx| {
-                    match update {
-                        DriverUpdate::Terminal {
-                            terminal_session_id,
-                            snapshot,
-                        } if terminal_session_id == view.terminal_session_id => {
-                            view.terminal_error = lifecycle_message(&snapshot.lifecycle);
-                            view.snapshot = snapshot;
-                        }
-                        DriverUpdate::Projection(mut projection) => {
-                            if let Some(terminal_session_id) = projection
-                                .hierarchy
-                                .terminal_sessions
-                                .first()
-                                .map(|session| session.id)
-                                && let Some(snapshot) =
-                                    projection.terminals.remove(&terminal_session_id)
-                            {
-                                view.terminal_session_id = terminal_session_id;
-                                view.terminal_error = lifecycle_message(&snapshot.lifecycle);
-                                view.snapshot = snapshot;
-                                view.requested_size = None;
-                            }
-                        }
-                        DriverUpdate::Terminal { .. } | DriverUpdate::Hierarchy(_) => {}
-                        DriverUpdate::Error(error) => view.terminal_error = Some(error),
-                    }
+                    view.accept_driver_update(update);
                     cx.notify();
                 });
             }
         });
     }
 
+    fn accept_driver_update(&mut self, update: DriverUpdate) {
+        match update {
+            DriverUpdate::Projection(projection) => self.replace_projection(projection),
+            DriverUpdate::Hierarchy(hierarchy) => {
+                self.hierarchy = hierarchy;
+                self.retain_live_terminals();
+                self.selection = self.selection.normalized(&self.hierarchy);
+            }
+            DriverUpdate::Terminal {
+                terminal_session_id,
+                snapshot,
+            } => {
+                if let Some(message) = lifecycle_message(&snapshot.lifecycle) {
+                    self.terminal_errors.insert(terminal_session_id, message);
+                } else {
+                    self.terminal_errors.remove(&terminal_session_id);
+                }
+                self.terminals.insert(terminal_session_id, snapshot);
+            }
+            DriverUpdate::Error(error) => self.global_error = Some(error),
+        }
+    }
+
+    fn replace_projection(&mut self, projection: CoreProjection) {
+        self.hierarchy = projection.hierarchy;
+        self.terminals = projection.terminals;
+        self.terminal_errors = self
+            .terminals
+            .iter()
+            .filter_map(|(&terminal_session_id, snapshot)| {
+                lifecycle_message(&snapshot.lifecycle).map(|message| (terminal_session_id, message))
+            })
+            .collect();
+        self.requested_sizes.clear();
+        self.selection = self.selection.normalized(&self.hierarchy);
+    }
+
+    fn retain_live_terminals(&mut self) {
+        let terminal_ids = self
+            .hierarchy
+            .terminal_sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        self.terminals
+            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+        self.terminal_errors
+            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+        self.requested_sizes
+            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(terminal_session_id) = self.focused_terminal_session_id() else {
+            return;
+        };
         if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
-            if let Err(error) = self.driver.input_to(self.terminal_session_id, bytes) {
-                self.terminal_error = Some(error);
+            if let Err(error) = self.driver.input_to(terminal_session_id, bytes) {
+                self.global_error = Some(error);
                 cx.notify();
             }
             cx.stop_propagation();
         }
     }
-}
 
-fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
-    if key.modifiers.control && key.key.len() == 1 {
-        let byte = key.key.as_bytes()[0].to_ascii_uppercase();
-        (b'@'..=b'_').contains(&byte).then(|| vec![byte - b'@'])
-    } else if key.modifiers.platform || key.modifiers.alt {
-        None
-    } else {
-        match key.key.as_str() {
-            "enter" => Some(vec![b'\r']),
-            "space" => Some(vec![b' ']),
-            "backspace" => Some(vec![0x7f]),
-            "tab" => Some(vec![b'\t']),
-            "escape" => Some(vec![0x1b]),
-            "up" => Some(b"\x1b[A".to_vec()),
-            "down" => Some(b"\x1b[B".to_vec()),
-            "right" => Some(b"\x1b[C".to_vec()),
-            "left" => Some(b"\x1b[D".to_vec()),
-            _ => key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
-        }
+    fn focused_terminal_session_id(&self) -> Option<TerminalSessionId> {
+        let pane_id = self.selection.pane_id?;
+        self.selected_tab()
+            .and_then(|tab| terminal_for_pane(&tab.layout, pane_id))
     }
-}
 
-fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
-    match lifecycle {
-        TerminalLifecycle::Running => None,
-        TerminalLifecycle::Exited => Some("Terminal process exited".into()),
-        TerminalLifecycle::Failed(error) => Some(format!("Terminal process failed: {error}")),
+    fn selected_space(&self) -> Option<&crate::SpaceSnapshot> {
+        let space_id = self.selection.space_id?;
+        self.hierarchy
+            .spaces
+            .iter()
+            .find(|space| space.id == space_id)
     }
-}
 
-impl Render for TerminalView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let viewport = window.viewport_size();
-        let dimensions = GridDimensions::fit(
-            f32::from(viewport.width),
-            f32::from(viewport.height),
-            TERMINAL_PADDING_PX,
-            self.terminal_font.cells,
-        );
-        let desired_size = TerminalSize::new(
-            dimensions.cols,
-            dimensions.rows,
-            self.terminal_font.cells.width_px,
-            self.terminal_font.cells.height_px,
-        );
-        if self.requested_size != Some(desired_size) {
-            match self
-                .driver
-                .resize_terminal(self.terminal_session_id, desired_size)
-            {
-                Ok(()) => self.requested_size = Some(desired_size),
-                Err(error) => self.terminal_error = Some(error),
+    fn selected_tab(&self) -> Option<&crate::TabSnapshot> {
+        let tab_id = self.selection.tab_id?;
+        self.selected_space()?
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+    }
+
+    fn select_space(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection.space_id = Some(space_id);
+        self.selection.tab_id = None;
+        self.selection.pane_id = None;
+        self.selection = self.selection.normalized(&self.hierarchy);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_tab(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection.tab_id = Some(tab_id);
+        self.selection.pane_id = None;
+        self.selection = self.selection.normalized(&self.hierarchy);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection.pane_id = Some(pane_id);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn resize_visible_terminals(&mut self, viewport: gpui::Size<Pixels>) {
+        let Some(layout) = self.selected_tab().map(|tab| tab.layout.clone()) else {
+            return;
+        };
+        let width = (f32::from(viewport.width) - SIDEBAR_WIDTH_PX).max(1.0);
+        let height = (f32::from(viewport.height) - TAB_BAR_HEIGHT_PX).max(1.0);
+        let mut panes = Vec::new();
+        pane_extents(&layout, width, height, &mut panes);
+        for (terminal_session_id, width, height) in panes {
+            let dimensions =
+                GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
+            let size = TerminalSize::new(
+                dimensions.cols,
+                dimensions.rows,
+                self.terminal_font.cells.width_px,
+                self.terminal_font.cells.height_px,
+            );
+            if self.requested_sizes.get(&terminal_session_id) != Some(&size) {
+                match self.driver.resize_terminal(terminal_session_id, size) {
+                    Ok(()) => {
+                        self.requested_sizes.insert(terminal_session_id, size);
+                    }
+                    Err(error) => self.global_error = Some(error),
+                }
             }
         }
+    }
 
-        let frame = TerminalFrame::from_snapshot(&self.snapshot);
-        let default_bg = color(self.snapshot.default_bg);
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut sidebar = div()
+            .flex()
+            .flex_col()
+            .w(px(SIDEBAR_WIDTH_PX))
+            .h_full()
+            .flex_none()
+            .bg(rgb(0x11151d))
+            .border_r_1()
+            .border_color(rgb(0x2b3240))
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(0x8993a4))
+                    .child("SPACES"),
+            );
+        for space in &self.hierarchy.spaces {
+            let space_id = space.id;
+            let selected = self.selection.space_id == Some(space_id);
+            sidebar = sidebar.child(
+                div()
+                    .id(("space", space_id.as_u64()))
+                    .cursor_pointer()
+                    .rounded_md()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(13.))
+                    .text_color(if selected {
+                        rgb(0xf4f7fb)
+                    } else {
+                        rgb(0xb4bdca)
+                    })
+                    .when(selected, |this| this.bg(rgb(0x273247)))
+                    .on_click(cx.listener(move |view, _event, window, cx| {
+                        view.select_space(space_id, window, cx)
+                    }))
+                    .child(space.name.clone()),
+            );
+        }
+        sidebar.into_any_element()
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut tabs = div()
+            .flex()
+            .flex_row()
+            .h(px(TAB_BAR_HEIGHT_PX))
+            .w_full()
+            .flex_none()
+            .items_end()
+            .bg(rgb(0x151a23))
+            .border_b_1()
+            .border_color(rgb(0x2b3240))
+            .px_2()
+            .gap_1();
+        if let Some(space) = self.selected_space() {
+            for tab in &space.tabs {
+                let tab_id = tab.id;
+                let selected = self.selection.tab_id == Some(tab_id);
+                tabs = tabs.child(
+                    div()
+                        .id(("tab", tab_id.as_u64()))
+                        .cursor_pointer()
+                        .px_3()
+                        .py_2()
+                        .rounded_t_md()
+                        .text_size(px(13.))
+                        .text_color(if selected {
+                            rgb(0xf4f7fb)
+                        } else {
+                            rgb(0x929cac)
+                        })
+                        .when(selected, |this| this.bg(rgb(0x0b0e13)))
+                        .on_click(cx.listener(move |view, _event, window, cx| {
+                            view.select_tab(tab_id, window, cx)
+                        }))
+                        .child(tab.name.clone()),
+                );
+            }
+        }
+        tabs.into_any_element()
+    }
+
+    fn render_selected_layout(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.selected_tab() {
+            Some(tab) => self.render_pane_layout(&tab.layout, cx),
+            None => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0x0b0e13))
+                .text_color(rgb(0x8993a4))
+                .child("No Spaces yet")
+                .into_any_element(),
+        }
+    }
+
+    fn render_pane_layout(&self, layout: &PaneLayout, cx: &mut Context<Self>) -> AnyElement {
+        match layout {
+            PaneLayout::Pane(pane) => self.render_terminal_pane(pane, cx),
+            PaneLayout::Split(split) => {
+                let first = self.render_pane_layout(&split.first, cx);
+                let second = self.render_pane_layout(&split.second, cx);
+                let first_grow = f32::from(split.ratio.parts_per_thousand());
+                let second_grow = 1000.0 - first_grow;
+                let first = match split.axis {
+                    SplitAxis::Horizontal => div()
+                        .h_full()
+                        .min_w_0()
+                        .flex_basis(px(0.))
+                        .flex_grow(first_grow)
+                        .child(first),
+                    SplitAxis::Vertical => div()
+                        .w_full()
+                        .min_h_0()
+                        .flex_basis(px(0.))
+                        .flex_grow(first_grow)
+                        .child(first),
+                };
+                div()
+                    .flex()
+                    .when(split.axis == SplitAxis::Horizontal, |this| this.flex_row())
+                    .when(split.axis == SplitAxis::Vertical, |this| this.flex_col())
+                    .size_full()
+                    .gap(px(SPLIT_GAP_PX))
+                    .bg(rgb(0x343c4a))
+                    .child(first)
+                    .child(
+                        div()
+                            .flex_basis(px(0.))
+                            .flex_grow(second_grow)
+                            .min_w_0()
+                            .min_h_0()
+                            .child(second),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_terminal_pane(
+        &self,
+        pane: &crate::PaneSnapshot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane_id = pane.id;
+        let terminal_session_id = pane.terminal_session_id;
+        let focused = self.selection.pane_id == Some(pane_id);
+        let Some(snapshot) = self.terminals.get(&terminal_session_id) else {
+            return div()
+                .id(("pane", pane_id.as_u64()))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0x0b0e13))
+                .text_color(rgb(0x8993a4))
+                .child("Starting terminal…")
+                .into_any_element();
+        };
+        let frame = TerminalFrame::from_snapshot(snapshot);
+        let default_bg = color(snapshot.default_bg);
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
         let shape_frame = frame.clone();
@@ -393,26 +645,158 @@ impl Render for TerminalView {
         .size_full();
 
         div()
-            .id("terminal")
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
+            .id(("pane", pane_id.as_u64()))
             .size_full()
+            .min_w_0()
+            .min_h_0()
             .overflow_hidden()
             .bg(default_bg)
+            .border_1()
+            .border_color(if focused { rgb(0x5b8def) } else { default_bg })
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
+            .on_click(
+                cx.listener(move |view, _event, window, cx| view.focus_pane(pane_id, window, cx)),
+            )
             .child(terminal_canvas)
-            .when_some(self.terminal_error.clone(), |this, error| {
+            .when_some(
+                self.terminal_errors.get(&terminal_session_id).cloned(),
+                |this, error| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .bottom(px(8.))
+                            .left(px(12.))
+                            .text_color(rgb(0xff6b6b))
+                            .child(error),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for MultiplexerView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.resize_visible_terminals(window.viewport_size());
+        div()
+            .id("multiplexer")
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
+            .flex()
+            .flex_row()
+            .size_full()
+            .overflow_hidden()
+            .bg(rgb(0x0b0e13))
+            .child(self.render_sidebar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_tab_bar(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(self.render_selected_layout(cx)),
+                    ),
+            )
+            .when_some(self.global_error.clone(), |this, error| {
                 this.child(
                     div()
                         .absolute()
-                        .bottom(px(8.))
-                        .left(px(12.))
-                        .text_color(rgb(0xff6b6b))
+                        .right(px(12.))
+                        .bottom(px(10.))
+                        .rounded_md()
+                        .bg(rgb(0x55262a))
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(0xffb4b4))
                         .child(error),
                 )
             })
+    }
+}
+
+fn pane_extents(
+    layout: &PaneLayout,
+    width: f32,
+    height: f32,
+    output: &mut Vec<(TerminalSessionId, f32, f32)>,
+) {
+    match layout {
+        PaneLayout::Pane(pane) => output.push((pane.terminal_session_id, width, height)),
+        PaneLayout::Split(split) => {
+            let ratio = f32::from(split.ratio.parts_per_thousand()) / 1000.0;
+            match split.axis {
+                SplitAxis::Horizontal => {
+                    let available = (width - SPLIT_GAP_PX).max(2.0);
+                    pane_extents(&split.first, available * ratio, height, output);
+                    pane_extents(&split.second, available * (1.0 - ratio), height, output);
+                }
+                SplitAxis::Vertical => {
+                    let available = (height - SPLIT_GAP_PX).max(2.0);
+                    pane_extents(&split.first, width, available * ratio, output);
+                    pane_extents(&split.second, width, available * (1.0 - ratio), output);
+                }
+            }
+        }
+    }
+}
+
+fn first_pane_id(layout: &PaneLayout) -> Option<PaneId> {
+    match layout {
+        PaneLayout::Pane(pane) => Some(pane.id),
+        PaneLayout::Split(split) => {
+            first_pane_id(&split.first).or_else(|| first_pane_id(&split.second))
+        }
+    }
+}
+
+fn layout_contains_pane(layout: &PaneLayout, pane_id: PaneId) -> bool {
+    terminal_for_pane(layout, pane_id).is_some()
+}
+
+fn terminal_for_pane(layout: &PaneLayout, pane_id: PaneId) -> Option<TerminalSessionId> {
+    match layout {
+        PaneLayout::Pane(pane) => (pane.id == pane_id).then_some(pane.terminal_session_id),
+        PaneLayout::Split(split) => terminal_for_pane(&split.first, pane_id)
+            .or_else(|| terminal_for_pane(&split.second, pane_id)),
+    }
+}
+
+fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
+    if key.modifiers.control && key.key.len() == 1 {
+        let byte = key.key.as_bytes()[0].to_ascii_uppercase();
+        (b'@'..=b'_').contains(&byte).then(|| vec![byte - b'@'])
+    } else if key.modifiers.platform || key.modifiers.alt {
+        None
+    } else {
+        match key.key.as_str() {
+            "enter" => Some(vec![b'\r']),
+            "space" => Some(vec![b' ']),
+            "backspace" => Some(vec![0x7f]),
+            "tab" => Some(vec![b'\t']),
+            "escape" => Some(vec![0x1b]),
+            "up" => Some(b"\x1b[A".to_vec()),
+            "down" => Some(b"\x1b[B".to_vec()),
+            "right" => Some(b"\x1b[C".to_vec()),
+            "left" => Some(b"\x1b[D".to_vec()),
+            _ => key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
+        }
+    }
+}
+
+fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
+    match lifecycle {
+        TerminalLifecycle::Running => None,
+        TerminalLifecycle::Exited => Some("Terminal process exited".into()),
+        TerminalLifecycle::Failed(error) => Some(format!("Terminal process failed: {error}")),
     }
 }
 
@@ -424,8 +808,6 @@ fn paint_fixed_cell_line(
     cells: CellMetrics,
     window: &mut Window,
 ) -> gpui::Result<()> {
-    // Shape the row once, but anchor each cluster to Ghostty's cell grid. Keeping the
-    // cluster's internal offsets preserves combining marks and wide/fallback glyphs.
     let mut natural_cell_x = vec![None; row.glyph_cells.len()];
     for run in &line.runs {
         for glyph in &run.glyphs {
@@ -475,7 +857,8 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_input_bytes;
+    use super::{UiSelection, pane_extents, terminal_input_bytes};
+    use crate::{CoreCommand, CoreModel, PaneLayout, SplitAxis, SplitPlacement, SplitRatio};
     use gpui::Keystroke;
 
     #[test]
@@ -487,5 +870,77 @@ mod tests {
         };
 
         assert_eq!(terminal_input_bytes(&key), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn selection_falls_back_to_valid_space_tab_and_pane_ids() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let first = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "First".into(),
+                    directory: directory.clone(),
+                },
+            )
+            .expect("create first Space");
+        let second = model
+            .apply(
+                first.revision,
+                CoreCommand::CreateSpace {
+                    name: "Second".into(),
+                    directory,
+                },
+            )
+            .expect("create second Space");
+        let selected = UiSelection::initial(&second.snapshot);
+
+        assert_eq!(selected.space_id, Some(second.snapshot.spaces[0].id));
+        assert_eq!(selected.tab_id, Some(second.snapshot.spaces[0].tabs[0].id));
+        assert!(selected.pane_id.is_some());
+    }
+
+    #[test]
+    fn recursive_split_extents_follow_the_authoritative_ratios() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let initial = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "Space".into(),
+                    directory,
+                },
+            )
+            .expect("create Space");
+        let first_pane = match &initial.snapshot.spaces[0].tabs[0].layout {
+            PaneLayout::Pane(pane) => pane.id,
+            PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+        };
+        let split = model
+            .apply(
+                initial.revision,
+                CoreCommand::SplitPane {
+                    pane_id: first_pane,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::new(600).expect("valid ratio"),
+                },
+            )
+            .expect("split Pane");
+        let mut extents = Vec::new();
+        pane_extents(
+            &split.snapshot.spaces[0].tabs[0].layout,
+            1000.0,
+            500.0,
+            &mut extents,
+        );
+
+        assert_eq!(extents.len(), 2);
+        assert!((extents[0].1 - 599.4).abs() < 0.1);
+        assert!((extents[1].1 - 399.6).abs() < 0.1);
+        assert_eq!(extents[0].2, 500.0);
+        assert_eq!(extents[1].2, 500.0);
     }
 }
