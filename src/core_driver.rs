@@ -3,7 +3,7 @@ use crate::{
     TerminalChange, TerminalSessionId, TerminalSize, TerminalSnapshot,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -16,6 +16,7 @@ pub(crate) struct CoreDriver {
     commands: flume::Sender<Command>,
     updates: DriverUpdates,
     counters: Arc<DriverCounters>,
+    next_command_id: AtomicU64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,7 +28,14 @@ pub(crate) struct CoreProjection {
 pub(crate) enum DriverUpdate {
     Projection(CoreProjection),
     Hierarchy(CoreSnapshot),
-    CommandAccepted(CoreCommandOutcome),
+    CommandAccepted {
+        command_id: u64,
+        outcome: CoreCommandOutcome,
+    },
+    CommandRejected {
+        command_id: u64,
+        error: String,
+    },
     Terminal {
         terminal_session_id: TerminalSessionId,
         snapshot: TerminalSnapshot,
@@ -60,7 +68,7 @@ pub(crate) struct DriverUpdates {
 struct DriverUpdateState {
     projection: Option<CoreProjection>,
     hierarchy: Option<CoreSnapshot>,
-    command_outcome: Option<CoreCommandOutcome>,
+    command_results: VecDeque<DriverCommandResult>,
     terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
     error: Option<String>,
     stopped: bool,
@@ -69,6 +77,17 @@ struct DriverUpdateState {
 struct DriverUpdatePublisher {
     state: Arc<Mutex<DriverUpdateState>>,
     wake: flume::Sender<()>,
+}
+
+enum DriverCommandResult {
+    Accepted {
+        command_id: u64,
+        outcome: CoreCommandOutcome,
+    },
+    Rejected {
+        command_id: u64,
+        error: String,
+    },
 }
 
 impl DriverUpdates {
@@ -111,8 +130,19 @@ impl DriverUpdates {
             Some(DriverUpdate::Projection(projection))
         } else if let Some(hierarchy) = state.hierarchy.take() {
             Some(DriverUpdate::Hierarchy(hierarchy))
-        } else if let Some(outcome) = state.command_outcome.take() {
-            Some(DriverUpdate::CommandAccepted(outcome))
+        } else if let Some(result) = state.command_results.pop_front() {
+            Some(match result {
+                DriverCommandResult::Accepted {
+                    command_id,
+                    outcome,
+                } => DriverUpdate::CommandAccepted {
+                    command_id,
+                    outcome,
+                },
+                DriverCommandResult::Rejected { command_id, error } => {
+                    DriverUpdate::CommandRejected { command_id, error }
+                }
+            })
         } else if let Some(error) = state.error.take() {
             Some(DriverUpdate::Error(error))
         } else {
@@ -144,7 +174,7 @@ impl DriverUpdateState {
     fn has_pending(&self) -> bool {
         self.projection.is_some()
             || self.hierarchy.is_some()
-            || self.command_outcome.is_some()
+            || !self.command_results.is_empty()
             || !self.terminals.is_empty()
             || self.error.is_some()
     }
@@ -163,7 +193,18 @@ impl DriverUpdatePublisher {
                 state.projection = Some(projection);
             }
             DriverUpdate::Hierarchy(hierarchy) => state.hierarchy = Some(hierarchy),
-            DriverUpdate::CommandAccepted(outcome) => state.command_outcome = Some(outcome),
+            DriverUpdate::CommandAccepted {
+                command_id,
+                outcome,
+            } => state
+                .command_results
+                .push_back(DriverCommandResult::Accepted {
+                    command_id,
+                    outcome,
+                }),
+            DriverUpdate::CommandRejected { command_id, error } => state
+                .command_results
+                .push_back(DriverCommandResult::Rejected { command_id, error }),
             DriverUpdate::Terminal {
                 terminal_session_id,
                 snapshot,
@@ -188,7 +229,10 @@ impl Drop for DriverUpdatePublisher {
 }
 
 enum Command {
-    Apply(CoreCommand),
+    Apply {
+        command_id: u64,
+        command: CoreCommand,
+    },
     Input {
         terminal_session_id: TerminalSessionId,
         bytes: Vec<u8>,
@@ -246,6 +290,7 @@ impl CoreDriver {
                 commands: commands_tx,
                 updates,
                 counters,
+                next_command_id: AtomicU64::new(1),
             },
             projection,
         ))
@@ -262,8 +307,13 @@ impl CoreDriver {
         })
     }
 
-    pub(crate) fn apply_core_command(&self, command: CoreCommand) -> Result<(), String> {
-        self.send(Command::Apply(command))
+    pub(crate) fn apply_core_command(&self, command: CoreCommand) -> Result<u64, String> {
+        let command_id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        self.send(Command::Apply {
+            command_id,
+            command,
+        })?;
+        Ok(command_id)
     }
 
     pub(crate) fn resize_terminal(
@@ -329,20 +379,33 @@ fn run_driver(
             .wait();
         let result = match event {
             DriverEvent::Command(Err(_)) => break,
-            DriverEvent::Command(Ok(Command::Apply(command))) => core
-                .apply_core_command(command)
-                .map_err(|error| error.to_string())
-                .and_then(|outcome| {
-                    let mut pending = synchronize_hierarchy(
-                        &mut core,
-                        outcome.snapshot.clone(),
-                        &mut hierarchy_revision,
-                        &mut revisions,
-                        &counters,
-                    )?;
-                    pending.push(DriverUpdate::CommandAccepted(outcome));
-                    Ok(pending)
+            DriverEvent::Command(Ok(Command::Apply {
+                command_id,
+                command,
+            })) => match core.apply_core_command(command) {
+                Ok(outcome) => synchronize_hierarchy(
+                    &mut core,
+                    outcome.snapshot.clone(),
+                    &mut hierarchy_revision,
+                    &mut revisions,
+                    &counters,
+                )
+                .map(|mut pending| {
+                    pending.push(DriverUpdate::CommandAccepted {
+                        command_id,
+                        outcome,
+                    });
+                    pending
                 }),
+                Err(error) => {
+                    let error = error.to_string();
+                    if is_connection_failure(&error) {
+                        Err(error)
+                    } else {
+                        Ok(vec![DriverUpdate::CommandRejected { command_id, error }])
+                    }
+                }
+            },
             DriverEvent::Command(Ok(Command::Input {
                 terminal_session_id,
                 bytes,
@@ -545,7 +608,7 @@ mod tests {
         is_connection_failure,
     };
     use crate::{
-        CoreClient, CoreCommand, CoreEndpoint, CreatedResource, TerminalLifecycle,
+        CoreClient, CoreCommand, CoreEndpoint, CreatedResource, SpaceId, TerminalLifecycle,
         TerminalSessionId, TerminalSnapshot, run_resident_core,
     };
     use std::{
@@ -707,7 +770,8 @@ mod tests {
                 }) => saw_terminal |= projected == terminal_session_id,
                 Some(DriverUpdate::Error(error)) => panic!("UI Core driver failed: {error}"),
                 Some(DriverUpdate::Projection(_))
-                | Some(DriverUpdate::CommandAccepted(_))
+                | Some(DriverUpdate::CommandAccepted { .. })
+                | Some(DriverUpdate::CommandRejected { .. })
                 | None => {}
             }
         }
@@ -727,7 +791,7 @@ mod tests {
         let updates = driver.updates();
         let space_id = initial.hierarchy.spaces[0].id;
 
-        driver
+        let queued_command_id = driver
             .apply_core_command(CoreCommand::CreateTab {
                 space_id,
                 name: "Created Tab".into(),
@@ -741,16 +805,52 @@ mod tests {
                 Some(DriverUpdate::Hierarchy(snapshot)) => {
                     hierarchy_revision = Some(snapshot.revision);
                 }
-                Some(DriverUpdate::CommandAccepted(outcome)) => {
+                Some(DriverUpdate::CommandAccepted {
+                    command_id,
+                    outcome,
+                }) => {
+                    assert_eq!(command_id, queued_command_id);
                     assert_eq!(hierarchy_revision, Some(outcome.revision));
                     assert!(matches!(outcome.created, CreatedResource::Tab { .. }));
                     break;
+                }
+                Some(DriverUpdate::CommandRejected { error, .. }) => {
+                    panic!("UI Core command was rejected: {error}")
                 }
                 Some(DriverUpdate::Error(error)) => panic!("UI Core driver failed: {error}"),
                 Some(DriverUpdate::Projection(_)) | Some(DriverUpdate::Terminal { .. })
                     if Instant::now() < deadline => {}
                 _ => panic!("UI Core driver did not publish the command outcome"),
             }
+        }
+    }
+
+    #[test]
+    fn rejected_commands_keep_their_driver_command_identity() {
+        let core = TestCore::start("command-rejection");
+        let client =
+            CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach UI Client");
+        let (driver, _) = CoreDriver::start(client).expect("start UI Core driver");
+        let updates = driver.updates();
+        let command_id = driver
+            .apply_core_command(CoreCommand::CreateTab {
+                space_id: SpaceId::from_u64(u64::MAX),
+                name: "Nowhere".into(),
+            })
+            .expect("queue invalid Core command");
+
+        match updates.recv_timeout(Duration::from_secs(2)) {
+            Some(DriverUpdate::CommandRejected {
+                command_id: rejected_id,
+                error,
+            }) => {
+                assert_eq!(rejected_id, command_id);
+                assert!(error.contains("does not exist"));
+            }
+            Some(DriverUpdate::Error(error)) => {
+                panic!("semantic rejection was reported as a connection failure: {error}")
+            }
+            _ => panic!("UI Core driver did not publish the command rejection"),
         }
     }
 
