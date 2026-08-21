@@ -73,9 +73,20 @@ pub fn cell_offset(cols: u16, x: u16, y: u16) -> Option<usize> {
     (x < cols).then(|| usize::from(y) * usize::from(cols) + usize::from(x))
 }
 
+pub(crate) fn fixed_cell_glyph_x(
+    cell_x: u16,
+    cell_width_px: u16,
+    natural_glyph_x: f32,
+    natural_cell_x: f32,
+) -> f32 {
+    f32::from(cell_x) * f32::from(cell_width_px) + natural_glyph_x - natural_cell_x
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CellMetrics, GridDimensions, cell_offset, measured_cell_height};
+    use super::{
+        CellMetrics, GridDimensions, cell_offset, fixed_cell_glyph_x, measured_cell_height,
+    };
 
     #[test]
     fn grid_dimensions_fit_whole_cells_inside_the_viewport() {
@@ -112,5 +123,22 @@ mod tests {
     fn cell_height_contains_the_selected_fonts_vertical_metrics() {
         assert_eq!(measured_cell_height(14.0, 16.25, 5.25), 22);
         assert_eq!(measured_cell_height(14.0, 9.0, 3.0), 14);
+    }
+
+    #[test]
+    fn repeated_glyphs_stay_anchored_to_the_cursor_grid() {
+        let natural_advance = 8.25;
+        let cell_width = 9;
+
+        for cell_x in 0..64 {
+            let natural_x = f32::from(cell_x) * natural_advance;
+            let painted_x = fixed_cell_glyph_x(cell_x, cell_width, natural_x, natural_x);
+            assert_eq!(painted_x, f32::from(cell_x) * f32::from(cell_width));
+        }
+    }
+
+    #[test]
+    fn glyph_offsets_inside_a_combining_cluster_are_preserved() {
+        assert_eq!(fixed_cell_glyph_x(7, 9, 11.5, 10.75), 63.75);
     }
 }

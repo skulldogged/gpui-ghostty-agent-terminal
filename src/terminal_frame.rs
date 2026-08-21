@@ -1,4 +1,5 @@
 use crate::{TerminalSnapshot, terminal_grid::cell_offset};
+use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalFrame {
@@ -11,6 +12,31 @@ pub(crate) struct TerminalFrame {
 pub(crate) struct FrameRow {
     pub text: String,
     pub runs: Vec<ForegroundRun>,
+    pub glyph_cells: Vec<GlyphCell>,
+}
+
+impl FrameRow {
+    pub(crate) fn glyph_cell_index(&self, byte_index: usize) -> Option<usize> {
+        self.glyph_cells
+            .binary_search_by(|cell| {
+                if cell.byte_range.end <= byte_index {
+                    std::cmp::Ordering::Less
+                } else if cell.byte_range.start > byte_index {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GlyphCell {
+    // Maps every shaped glyph in this UTF-8 range back to its Ghostty cell anchor.
+    pub x: u16,
+    pub byte_range: Range<usize>,
+    pub color: [u8; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +68,7 @@ impl TerminalFrame {
         for y in 0..snapshot.rows {
             let mut text = String::new();
             let mut runs = Vec::<ForegroundRun>::new();
+            let mut glyph_cells = Vec::with_capacity(usize::from(snapshot.cols));
             for x in 0..snapshot.cols {
                 let cell = cells[offset(snapshot.cols, snapshot.rows, x, y)
                     .expect("in-bounds terminal coordinate")];
@@ -74,26 +101,30 @@ impl TerminalFrame {
                     },
                 );
 
-                let start = text.len();
                 match cell.map(|cell| cell.text.as_str()) {
-                    Some(value) if !value.is_empty() => text.push_str(value),
+                    Some(value) if !value.is_empty() => {
+                        push_text_cell(&mut text, &mut glyph_cells, x, value, foreground);
+                        push_foreground(&mut runs, value.len(), foreground);
+                    }
                     _ => {
-                        for _ in 0..width {
-                            text.push(' ');
+                        for cell_offset in 0..u16::from(width) {
+                            push_text_cell(
+                                &mut text,
+                                &mut glyph_cells,
+                                x.saturating_add(cell_offset),
+                                " ",
+                                foreground,
+                            );
+                            push_foreground(&mut runs, 1, foreground);
                         }
                     }
                 }
-                let len = text.len() - start;
-                if let Some(run) = runs.last_mut().filter(|run| run.color == foreground) {
-                    run.len += len;
-                } else {
-                    runs.push(ForegroundRun {
-                        len,
-                        color: foreground,
-                    });
-                }
             }
-            rows.push(FrameRow { text, runs });
+            rows.push(FrameRow {
+                text,
+                runs,
+                glyph_cells,
+            });
         }
 
         Self {
@@ -101,6 +132,30 @@ impl TerminalFrame {
             backgrounds,
             cursor_overlay,
         }
+    }
+}
+
+fn push_text_cell(
+    text: &mut String,
+    glyph_cells: &mut Vec<GlyphCell>,
+    x: u16,
+    value: &str,
+    color: [u8; 3],
+) {
+    let start = text.len();
+    text.push_str(value);
+    glyph_cells.push(GlyphCell {
+        x,
+        byte_range: start..text.len(),
+        color,
+    });
+}
+
+fn push_foreground(runs: &mut Vec<ForegroundRun>, len: usize, color: [u8; 3]) {
+    if let Some(run) = runs.last_mut().filter(|run| run.color == color) {
+        run.len += len;
+    } else {
+        runs.push(ForegroundRun { len, color });
     }
 }
 
@@ -122,7 +177,7 @@ fn push_background(backgrounds: &mut Vec<BackgroundRun>, next: BackgroundRun) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundRun, TerminalFrame};
+    use super::{BackgroundRun, GlyphCell, TerminalFrame};
     use crate::{TerminalCell, TerminalLifecycle, TerminalSnapshot};
 
     #[test]
@@ -139,6 +194,26 @@ mod tests {
         let frame = TerminalFrame::from_snapshot(&snapshot);
 
         assert_eq!(frame.rows[0].text, "界x ");
+        assert_eq!(
+            frame.rows[0].glyph_cells,
+            vec![
+                GlyphCell {
+                    x: 0,
+                    byte_range: 0..3,
+                    color: [0xaa, 0xbb, 0xcc],
+                },
+                GlyphCell {
+                    x: 2,
+                    byte_range: 3..4,
+                    color: [0xaa, 0xbb, 0xcc],
+                },
+                GlyphCell {
+                    x: 3,
+                    byte_range: 4..5,
+                    color: [0xdd; 3],
+                },
+            ]
+        );
         assert_eq!(
             frame.rows[0].runs.iter().map(|run| run.len).sum::<usize>(),
             5
@@ -168,6 +243,22 @@ mod tests {
                 color: [0xaa, 0xbb, 0xcc],
             })
         );
+    }
+
+    #[test]
+    fn every_glyph_in_a_combining_cluster_maps_to_one_terminal_cell() {
+        let frame = TerminalFrame::from_snapshot(&snapshot(
+            None,
+            vec![
+                cell(0, 0, 1, "e\u{301}", [0xaa, 0xbb, 0xcc]),
+                cell(1, 0, 1, "x", [0xaa, 0xbb, 0xcc]),
+            ],
+        ));
+
+        assert_eq!(frame.rows[0].glyph_cell_index(0), Some(0));
+        assert_eq!(frame.rows[0].glyph_cell_index(1), Some(0));
+        assert_eq!(frame.rows[0].glyph_cell_index(2), Some(0));
+        assert_eq!(frame.rows[0].glyph_cell_index(3), Some(1));
     }
 
     fn snapshot(cursor: Option<(u16, u16)>, cells: Vec<TerminalCell>) -> TerminalSnapshot {
