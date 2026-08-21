@@ -9,22 +9,32 @@ default = ["gui"]
 gui = [
     "dep:flume",
     "dep:gpui",
+    "dep:gpui_platform",
     "dep:interprocess",
+    "dep:ksni",
     "dep:libc",
     "dep:portable-pty",
     "dep:ring",
+    "dep:tray-icon",
     "dep:windows-sys",
 ]
 
 [dependencies]
 flume = { version = "0.12", optional = true }
-gpui = { version = "0.2", optional = true }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true, features = ["wayland", "x11"] }
 interprocess = { version = "2.4.2", optional = true }
 ring = { version = "0.17", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 portable-pty = { version = "0.9", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "=0.3.6", default-features = false, features = ["async-io", "blocking"], optional = true }
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tray-icon = { version = "=0.24.2", default-features = false, features = ["common-controls-v6"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = [

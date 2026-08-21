@@ -16,20 +16,24 @@ mod windows_pty;
 #[cfg(feature = "gui")]
 mod core_driver;
 #[cfg(feature = "gui")]
+mod desktop_presence;
+#[cfg(feature = "gui")]
+mod desktop_shell;
+#[cfg(feature = "gui")]
 mod gui;
 
 #[cfg(feature = "gui")]
 pub use resident_core::{
     ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, SemanticEvent,
     SemanticEventKind, TerminalCell, TerminalChange, TerminalLifecycle, TerminalSnapshot,
-    UiClientId, run_resident_core,
+    UiClientId, run_resident_core, stop_resident_core_after_parent,
 };
 #[cfg(feature = "gui")]
 pub use terminal_session::TerminalSize;
 
 #[cfg(feature = "gui")]
 pub fn run_gui() {
-    gui::run();
+    desktop_shell::run();
 }
 
 #[cfg(not(feature = "gui"))]

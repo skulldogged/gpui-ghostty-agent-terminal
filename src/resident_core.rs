@@ -15,7 +15,6 @@ use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
 };
-#[cfg(any(unix, test))]
 use std::io::Read;
 use std::{
     collections::HashSet,
@@ -1836,6 +1835,22 @@ pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub fn stop_resident_core_after_parent(endpoint: CoreEndpoint) -> Result<(), String> {
+    let mut parent_lifetime = std::io::stdin().lock();
+    let mut buffer = [0_u8; 256];
+    loop {
+        match parent_lifetime.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("wait for Desktop Shell exit: {error}")),
+        }
+    }
+
+    let mut core = CoreClient::connect(&endpoint, Duration::from_secs(10))?;
+    core.stop_resident_core()
 }
 
 #[cfg(unix)]

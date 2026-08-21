@@ -3,7 +3,7 @@ use agent_terminal::{
     TerminalLifecycle, TerminalSize,
 };
 use std::{
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -44,6 +44,33 @@ fn terminal_session_survives_ui_client_disconnect_and_reconnect() {
     wait_for_text(&mut second, "AFTER_UI_REATTACH");
     second.stop_resident_core().expect("stop Resident Core");
 
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn full_exit_stopper_waits_for_the_desktop_shell_before_stopping_the_core() {
+    let endpoint = isolated_endpoint("full-exit-stopper");
+    let mut core = spawn_core(&endpoint);
+    let client = CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
+    drop(client);
+
+    let (mut stopper, parent_lifetime) = spawn_full_exit_stopper(&endpoint);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        stopper
+            .0
+            .try_wait()
+            .expect("inspect full-exit stopper")
+            .is_none(),
+        "full-exit stopper did not wait for the Desktop Shell"
+    );
+    assert!(
+        core.0.try_wait().expect("inspect Resident Core").is_none(),
+        "full-exit stopper ended the Resident Core before the Desktop Shell exited"
+    );
+
+    drop(parent_lifetime);
+    wait_for_process_exit(&mut stopper, "full-exit stopper");
     wait_for_core_exit(&mut core);
 }
 
@@ -437,15 +464,37 @@ fn spawn_core(endpoint: &CoreEndpoint) -> ChildGuard {
     )
 }
 
+fn spawn_full_exit_stopper(endpoint: &CoreEndpoint) -> (ChildGuard, ChildStdin) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-terminal"))
+        .arg("--stop-resident-core-after-parent")
+        .arg(endpoint.argument())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn full-exit stopper");
+    let parent_lifetime = child.stdin.take().expect("open parent-lifetime pipe");
+    (ChildGuard(child), parent_lifetime)
+}
+
 fn wait_for_core_exit(core: &mut ChildGuard) {
+    wait_for_process_exit(core, "Resident Core");
+}
+
+fn wait_for_process_exit(process: &mut ChildGuard, process_name: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if core.0.try_wait().expect("wait for Resident Core").is_some() {
+        if process
+            .0
+            .try_wait()
+            .unwrap_or_else(|error| panic!("wait for {process_name}: {error}"))
+            .is_some()
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("Resident Core did not stop after an explicit stop command");
+    panic!("{process_name} did not exit before timeout");
 }
 
 fn wait_for_snapshot_after(

@@ -5,9 +5,9 @@ use crate::{
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
 };
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Pixels,
-    Point, Render, ShapedLine, SharedString, Task, TextRun, Window, WindowBounds, WindowOptions,
-    canvas, div, fill, font, point, prelude::*, px, rgb, size,
+    AnyWindowHandle, App, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke,
+    Pixels, Point, Render, ShapedLine, SharedString, Task, TextRun, Window, WindowBounds,
+    WindowOptions, canvas, div, fill, font, point, prelude::*, px, rgb, size,
 };
 #[cfg(windows)]
 use std::time::Duration;
@@ -15,47 +15,45 @@ use std::time::Duration;
 const TERMINAL_PADDING_PX: f32 = 12.0;
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
-pub fn run() {
-    Application::new().run(|cx: &mut App| {
-        let terminal_font =
-            TerminalFont::resolve(cx).expect("resolve an installed fixed-pitch terminal font");
-        let mut core = CoreClient::connect_or_spawn().expect("attach to Resident Core");
-        let snapshot = core.snapshot().expect("snapshot Terminal Session");
-        let driver = CoreDriver::start(core, snapshot.revision).expect("start UI Core driver");
-        let terminal_error = lifecycle_message(&snapshot.lifecycle);
-        let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    let focus = cx.focus_handle();
-                    focus.focus(window);
-                    let view = cx.new(|_| TerminalView {
-                        driver,
-                        snapshot,
-                        focus,
-                        refresh_task: Task::ready(()),
-                        terminal_error,
-                        terminal_font,
-                        requested_size: None,
-                    });
-                    view.update(cx, |view, cx| {
-                        view.start_refresh_task(cx);
-                        #[cfg(windows)]
-                        view.start_windows_probe(cx);
-                    });
-                    view
-                },
-            )
-            .expect("open GPUI window");
+pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, String> {
+    let terminal_font = TerminalFont::resolve(cx)?;
+    let mut core = CoreClient::connect_or_spawn()?;
+    let snapshot = core.snapshot()?;
+    let driver = CoreDriver::start(core, snapshot.revision)?;
+    let terminal_error = lifecycle_message(&snapshot.lifecycle);
+    let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let focus = cx.focus_handle();
+                focus.focus(window, cx);
+                let view = cx.new(|_| TerminalView {
+                    driver,
+                    snapshot,
+                    focus,
+                    refresh_task: Task::ready(()),
+                    terminal_error,
+                    terminal_font,
+                    requested_size: None,
+                });
+                view.update(cx, |view, cx| {
+                    view.start_refresh_task(cx);
+                    #[cfg(windows)]
+                    view.start_windows_probe(cx);
+                });
+                view
+            },
+        )
+        .map_err(|error| format!("open GPUI window: {error}"))?;
 
-        window
-            .update(cx, |_view, _window, cx| cx.activate(true))
-            .expect("activate GPUI window");
-    });
+    window
+        .update(cx, |_view, _window, cx| cx.activate(true))
+        .map_err(|error| format!("activate GPUI window: {error}"))?;
+    Ok(window.into())
 }
 
 struct TerminalView {
@@ -178,8 +176,7 @@ impl TerminalView {
                     if let Err(error) = view.driver.input(b"echo WINDOWS_CONPTY_LIVE\r".to_vec()) {
                         view.terminal_error = Some(error);
                     }
-                })
-                .ok();
+                });
             }
         })
         .detach();
@@ -192,21 +189,16 @@ impl TerminalView {
                 let Some(this) = this.upgrade() else {
                     break;
                 };
-                if this
-                    .update(cx, move |view, cx| {
-                        match update {
-                            DriverUpdate::Snapshot(snapshot) => {
-                                view.terminal_error = lifecycle_message(&snapshot.lifecycle);
-                                view.snapshot = snapshot;
-                            }
-                            DriverUpdate::Error(error) => view.terminal_error = Some(error),
+                this.update(cx, move |view, cx| {
+                    match update {
+                        DriverUpdate::Snapshot(snapshot) => {
+                            view.terminal_error = lifecycle_message(&snapshot.lifecycle);
+                            view.snapshot = snapshot;
                         }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                        DriverUpdate::Error(error) => view.terminal_error = Some(error),
+                    }
+                    cx.notify();
+                });
             }
         });
     }
