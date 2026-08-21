@@ -1,7 +1,4 @@
-use crate::{
-    ghostty,
-    terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
-};
+use crate::{ghostty, terminal_session::TerminalSize};
 use interprocess::TryClone;
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
@@ -28,7 +25,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod runtime;
 mod wire;
+
+use runtime::{CoreRuntime, RuntimeEvent};
 
 // Version 6 adds sequenced reliable semantic events with an attachment
 // baseline and fail-closed overflow recovery.
@@ -1401,78 +1401,79 @@ impl ResidentCore {
         thread::Builder::new()
             .name("resident-core-terminal".into())
             .spawn(move || {
-                let spawned = TerminalSession::spawn(TerminalSize::default());
-                let (mut session, events) = match spawned {
-                    Ok(spawned) => {
+                let started = std::env::current_dir()
+                    .map_err(|error| format!("resolve initial Space directory: {error}"))
+                    .and_then(|directory| CoreRuntime::start(&directory));
+                let mut runtime = match started {
+                    Ok(runtime) => {
                         let _ = ready_tx.send(Ok(()));
-                        spawned
+                        runtime
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                         return;
                     }
                 };
-                let mut revision = 0_u64;
-                let mut lifecycle = TerminalLifecycle::Running;
-                let mut last_snapshot_revision = None;
+                let default_terminal = runtime.default_terminal();
                 let mut event_sequence = 0_u64;
 
                 loop {
-                    let revision_before_refresh = revision;
-                    let lifecycle_before_refresh = lifecycle.clone();
-                    refresh_terminal_state(&mut session, &events, &mut revision, &mut lifecycle);
-                    if lifecycle != lifecycle_before_refresh {
-                        publish_semantic_event(
-                            &worker_semantic,
-                            SemanticEventKind::TerminalLifecycleChanged {
-                                lifecycle: lifecycle.clone(),
-                                terminal_revision: revision,
-                            },
-                        );
-                    }
-                    if revision != revision_before_refresh {
-                        publish_terminal_change(&worker_subscribers, &mut event_sequence, revision);
+                    for event in runtime.refresh() {
+                        match event {
+                            RuntimeEvent::TerminalLifecycleChanged {
+                                terminal_session_id,
+                                lifecycle,
+                                terminal_revision,
+                            } if terminal_session_id == default_terminal => {
+                                publish_semantic_event(
+                                    &worker_semantic,
+                                    SemanticEventKind::TerminalLifecycleChanged {
+                                        lifecycle,
+                                        terminal_revision,
+                                    },
+                                );
+                            }
+                            RuntimeEvent::TerminalChanged {
+                                terminal_session_id,
+                                terminal_revision,
+                            } if terminal_session_id == default_terminal => {
+                                publish_terminal_change(
+                                    &worker_subscribers,
+                                    &mut event_sequence,
+                                    terminal_revision,
+                                );
+                            }
+                            RuntimeEvent::TerminalLifecycleChanged { .. }
+                            | RuntimeEvent::TerminalChanged { .. } => {}
+                        }
                     }
                     match commands_rx.recv_timeout(SESSION_TICK) {
                         Ok(command) => {
                             let stop = matches!(command.request, WorkerRequest::Stop);
-                            let revision_before_command = revision;
+                            let mut changed_revision = None;
                             let result = match command.request {
-                                WorkerRequest::Input(bytes) => {
-                                    session.input(&bytes).map(|()| WorkerResponse::Ack)
-                                }
-                                WorkerRequest::Resize(size) => match size.validate() {
-                                    Err(error) => Err(error),
-                                    Ok(size) if size == session.size() => Ok(WorkerResponse::Ack),
-                                    Ok(size) => {
-                                        let result = session.resize(size);
-                                        // Resize drains bytes accepted at the old geometry before
-                                        // touching the transport. Advance even when the transport
-                                        // resize fails so those consumed bytes remain observable.
-                                        revision = revision.saturating_add(1);
-                                        result.map(|()| WorkerResponse::Ack)
+                                WorkerRequest::Input(bytes) => runtime
+                                    .input(default_terminal, &bytes)
+                                    .map(|()| WorkerResponse::Ack),
+                                WorkerRequest::Resize(size) => {
+                                    match runtime.resize(default_terminal, size) {
+                                        Ok(changed) => {
+                                            if changed {
+                                                changed_revision = runtime
+                                                    .terminal_revision(default_terminal)
+                                                    .ok();
+                                            }
+                                            Ok(WorkerResponse::Ack)
+                                        }
+                                        Err(error) => Err(error),
                                     }
-                                },
-                                WorkerRequest::Snapshot { since } if since == Some(revision) => {
-                                    Ok(WorkerResponse::Snapshot(None))
                                 }
-                                WorkerRequest::Snapshot { since } => {
-                                    let force_full =
-                                        since.is_none() || since != last_snapshot_revision;
-                                    session.render_update(force_full).map(|snapshot| {
-                                        let update = TerminalUpdate::from_terminal(
-                                            snapshot,
-                                            last_snapshot_revision,
-                                            revision,
-                                            lifecycle.clone(),
-                                        );
-                                        last_snapshot_revision = Some(revision);
-                                        WorkerResponse::Snapshot(Some(update))
-                                    })
-                                }
+                                WorkerRequest::Snapshot { since } => runtime
+                                    .snapshot(default_terminal, since)
+                                    .map(WorkerResponse::Snapshot),
                                 WorkerRequest::Stop => Ok(WorkerResponse::Ack),
                             };
-                            if revision != revision_before_command {
+                            if let Some(revision) = changed_revision {
                                 publish_terminal_change(
                                     &worker_subscribers,
                                     &mut event_sequence,
@@ -1754,38 +1755,6 @@ fn publish_terminal_change(
                 Err(flume::TrySendError::Disconnected(_)) => false,
             },
         );
-}
-
-fn refresh_terminal_state(
-    session: &mut TerminalSession,
-    events: &TerminalEvents,
-    revision: &mut u64,
-    lifecycle: &mut TerminalLifecycle,
-) {
-    match session.drain_pending_output() {
-        Ok(true) => *revision = revision.saturating_add(1),
-        Ok(false) => {}
-        Err(error) => {
-            *lifecycle = TerminalLifecycle::Failed(error);
-            *revision = revision.saturating_add(1);
-        }
-    }
-    while let Some(event) = events.try_recv() {
-        match event {
-            TerminalEvent::Changed => {}
-            TerminalEvent::Exited => {
-                *lifecycle = match session.reap_process() {
-                    Ok(()) => TerminalLifecycle::Exited,
-                    Err(error) => TerminalLifecycle::Failed(error),
-                };
-                *revision = revision.saturating_add(1);
-            }
-            TerminalEvent::Failed(error) => {
-                *lifecycle = TerminalLifecycle::Failed(error);
-                *revision = revision.saturating_add(1);
-            }
-        }
-    }
 }
 
 pub fn run_resident_core(endpoint: CoreEndpoint) -> Result<(), String> {

@@ -74,6 +74,7 @@ mod unix {
     impl PtySession {
         pub fn spawn(
             size: PtySize,
+            working_directory: &std::path::Path,
             events: flume::Sender<TerminalEvent>,
         ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
             let pair = native_pty_system()
@@ -81,6 +82,7 @@ mod unix {
                 .map_err(|error| format!("open PTY: {error}"))?;
 
             let mut command = CommandBuilder::new(shell());
+            command.cwd(working_directory);
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
 

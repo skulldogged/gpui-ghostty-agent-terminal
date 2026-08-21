@@ -75,6 +75,7 @@ unsafe impl Sync for SharedPseudoConsole {}
 impl PtySession {
     pub fn spawn(
         size: PtySize,
+        working_directory: &std::path::Path,
         events: flume::Sender<TerminalEvent>,
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         let input = Pipe::create()?;
@@ -94,7 +95,7 @@ impl PtySession {
         }
 
         let pseudoconsole = Arc::new(SharedPseudoConsole::new(pseudoconsole));
-        let process = spawn_shell(pseudoconsole.raw()?)?;
+        let process = spawn_shell(pseudoconsole.raw()?, working_directory)?;
 
         // ConPTY duplicated the host-facing ends. Keeping only the application
         // input/output ends avoids retaining an accidental EOF reference.
@@ -407,7 +408,10 @@ impl Drop for SharedPseudoConsole {
     }
 }
 
-fn spawn_shell(pseudoconsole: HPCON) -> Result<OwnedHandle, String> {
+fn spawn_shell(
+    pseudoconsole: HPCON,
+    working_directory: &std::path::Path,
+) -> Result<OwnedHandle, String> {
     let shell = shell();
     let mut arguments = Vec::new();
     if shell
@@ -421,6 +425,8 @@ fn spawn_shell(pseudoconsole: HPCON) -> Result<OwnedHandle, String> {
     }
     let mut command_line = command_line(shell.as_os_str(), &arguments)?;
     let application = nul_terminated(shell.as_os_str(), "shell executable")?;
+    let working_directory =
+        nul_terminated(working_directory.as_os_str(), "terminal working directory")?;
     let environment = environment_block()?;
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -477,7 +483,7 @@ fn spawn_shell(pseudoconsole: HPCON) -> Result<OwnedHandle, String> {
             0,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             environment.as_ptr().cast(),
-            null_mut(),
+            working_directory.as_ptr(),
             (&mut startup as *mut STARTUPINFOEXW).cast::<STARTUPINFOW>(),
             &mut process,
         ) != 0

@@ -522,7 +522,9 @@ fn wait_for_text(client: &mut CoreClient, marker: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let snapshot = client.snapshot().expect("snapshot Terminal Session");
-        if snapshot.text().contains(marker) {
+        let visual_rows = snapshot.text();
+        let unwrapped = visual_rows.lines().collect::<String>();
+        if unwrapped.contains(marker) {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
