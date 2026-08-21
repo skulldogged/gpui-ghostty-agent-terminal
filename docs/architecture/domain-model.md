@@ -6,6 +6,8 @@ This document resolves the structural decisions tracked in issue #9. `CONTEXT.md
 
 - Every Space, Tab, Pane, and Terminal Session has an opaque, immutable ID that is never reused.
 - The Resident Core is the sole owner of Spaces and live Terminal Sessions. A UI Client holds projections and references by ID.
+- One authoritative Core model owns the complete Space/Tab/Pane hierarchy. Callers submit typed semantic commands and observe revisioned immutable snapshots rather than receiving mutable entity references.
+- A separate terminal runtime registry owns live Terminal Session objects. The Core model stores their stable IDs and durable launch intent, never PTY/ConPTY handles or libghostty-vt state.
 - A Space owns an ordered list of Tabs and an initial directory. Git repository and worktree information are optional metadata, not identity.
 - A Tab owns one split tree. Every leaf names a Pane; a Pane references exactly one Terminal Session.
 - A Terminal Session appears in at most one Pane. Its identity and lifetime do not change when its Pane moves between Tabs or Spaces.
@@ -20,6 +22,7 @@ This document resolves the structural decisions tracked in issue #9. `CONTEXT.md
 - A live Terminal Session is `Running`, `Stopping`, `Exited`, or `Failed`. Structural cold restoration creates a new Terminal Session identity and must not claim live-process continuity.
 - Restore Disposition is durable intent independent of that live lifecycle. `Relaunch` creates a new Running Terminal Session during cold restore; `RemainEnded` creates a new ended representation without launching a process. Natural exit/failure changes the disposition to `RemainEnded`; Core shutdown, logout, or update cleanup does not change it merely because the Core stops the child.
 - Tabs and Panes have stable explicit ordering. Reordering does not change IDs. Focus, selected Tab, window geometry, sidebar state, and transient selection belong to each UI Client rather than the Resident Core.
+- A UI Client applies acknowledged hierarchy revisions in order. It may update ephemeral focus, animation, selection, and drag-preview state locally, but a structural change is authoritative only after the Resident Core accepts it.
 
 ## Persistence
 
