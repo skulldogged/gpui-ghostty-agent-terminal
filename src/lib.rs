@@ -16,6 +16,8 @@ mod windows_pty;
 #[cfg(feature = "gui")]
 mod core_driver;
 #[cfg(feature = "gui")]
+mod desktop_shell;
+#[cfg(feature = "gui")]
 mod gui;
 
 #[cfg(feature = "gui")]
@@ -29,7 +31,7 @@ pub use terminal_session::TerminalSize;
 
 #[cfg(feature = "gui")]
 pub fn run_gui() {
-    gui::run();
+    desktop_shell::run();
 }
 
 #[cfg(not(feature = "gui"))]
