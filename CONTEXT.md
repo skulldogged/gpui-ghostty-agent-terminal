@@ -20,6 +20,10 @@ _Avoid_: Panel, Agent Pane
 A live shell or CLI execution stream with an immutable identity independent of Pane placement. It appears in at most one Pane and has at most one controlling UI Client at a time.
 _Avoid_: Agent Session
 
+**Restore Disposition**:
+The persistent instruction attached to a Pane's launch intent that determines whether cold restore creates a new Running Terminal Session or returns the Pane as ended. It is independent of a live Terminal Session's lifecycle and never preserves process identity.
+_Avoid_: Last Running State, Restored Process
+
 **Resident Core**:
 The long-lived local process that owns Spaces, Terminal Sessions, and agent-integration state independently of any native application window.
 _Avoid_: Hidden Window, GUI Process
