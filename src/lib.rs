@@ -1,3 +1,4 @@
+mod core_model;
 mod ghostty;
 
 #[cfg(feature = "gui")]
@@ -22,6 +23,12 @@ mod desktop_shell;
 #[cfg(feature = "gui")]
 mod gui;
 
+pub use core_model::{
+    CoreCommand, CoreCommit, CoreEffect, CoreModel, CoreModelError, CoreSnapshot, CreatedResource,
+    PaneId, PaneLayout, PaneSnapshot, ResourceKind, RestoreDisposition, SpaceId, SpaceSnapshot,
+    SplitAxis, SplitId, SplitPlacement, SplitRatio, SplitSnapshot, TabId, TabSnapshot,
+    TerminalLaunch, TerminalSessionId, TerminalSessionSnapshot,
+};
 #[cfg(feature = "gui")]
 pub use resident_core::{
     ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, SemanticEvent,
