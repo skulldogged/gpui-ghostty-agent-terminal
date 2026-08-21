@@ -1,13 +1,13 @@
 use crate::{
     CoreClient, TerminalLifecycle, TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
-    terminal_frame::TerminalFrame,
-    terminal_grid::{CellMetrics, GridDimensions, measured_cell_height},
+    terminal_frame::{FrameRow, TerminalFrame},
+    terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
 };
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Pixels,
-    Render, SharedString, Task, TextRun, Window, WindowBounds, WindowOptions, canvas, div, fill,
-    font, point, prelude::*, px, rgb, size,
+    Point, Render, ShapedLine, SharedString, Task, TextRun, Window, WindowBounds, WindowOptions,
+    canvas, div, fill, font, point, prelude::*, px, rgb, size,
 };
 #[cfg(windows)]
 use std::time::Duration;
@@ -307,7 +307,7 @@ impl Render for TerminalView {
                     })
                     .collect::<Vec<_>>()
             },
-            move |bounds, lines, window, cx| {
+            move |bounds, lines, window, _cx| {
                 for background in &frame.backgrounds {
                     window.paint_quad(fill(
                         Bounds::new(
@@ -329,14 +329,16 @@ impl Render for TerminalView {
                     ));
                 }
                 for (y, line) in lines.iter().enumerate() {
-                    let _ = line.paint(
+                    let _ = paint_fixed_cell_line(
+                        &frame.rows[y],
+                        line,
                         point(
                             bounds.left(),
                             bounds.top() + px(y as f32 * f32::from(paint_font.cells.height_px)),
                         ),
                         px(f32::from(paint_font.cells.height_px)),
+                        paint_font.cells,
                         window,
-                        cx,
                     );
                 }
                 if let Some(cursor) = frame.cursor_overlay {
@@ -384,6 +386,59 @@ impl Render for TerminalView {
                 )
             })
     }
+}
+
+fn paint_fixed_cell_line(
+    row: &FrameRow,
+    line: &ShapedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    cells: CellMetrics,
+    window: &mut Window,
+) -> gpui::Result<()> {
+    // Shape the row once, but anchor each cluster to Ghostty's cell grid. Keeping the
+    // cluster's internal offsets preserves combining marks and wide/fallback glyphs.
+    let mut natural_cell_x = vec![None; row.glyph_cells.len()];
+    for run in &line.runs {
+        for glyph in &run.glyphs {
+            if let Some(cell_index) = row.glyph_cell_index(glyph.index) {
+                natural_cell_x[cell_index].get_or_insert(f32::from(glyph.position.x));
+            }
+        }
+    }
+
+    let padding_top = (line_height - line.ascent - line.descent) / 2.;
+    let baseline_y = origin.y + padding_top + line.ascent;
+    for run in &line.runs {
+        for glyph in &run.glyphs {
+            let Some(cell_index) = row.glyph_cell_index(glyph.index) else {
+                continue;
+            };
+            let glyph_cell = &row.glyph_cells[cell_index];
+            let Some(natural_cell_x) = natural_cell_x[cell_index] else {
+                continue;
+            };
+            let glyph_x = fixed_cell_glyph_x(
+                glyph_cell.x,
+                cells.width_px,
+                f32::from(glyph.position.x),
+                natural_cell_x,
+            );
+            let glyph_origin = point(origin.x + px(glyph_x), baseline_y);
+            if glyph.is_emoji {
+                window.paint_emoji(glyph_origin, run.font_id, glyph.id, line.font_size)?;
+            } else {
+                window.paint_glyph(
+                    glyph_origin,
+                    run.font_id,
+                    glyph.id,
+                    line.font_size,
+                    color(glyph_cell.color).into(),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
