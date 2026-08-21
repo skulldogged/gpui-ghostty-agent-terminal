@@ -2,6 +2,8 @@ mod core_model;
 mod ghostty;
 
 #[cfg(feature = "gui")]
+mod persistence;
+#[cfg(feature = "gui")]
 mod pty;
 #[cfg(feature = "gui")]
 mod resident_core;

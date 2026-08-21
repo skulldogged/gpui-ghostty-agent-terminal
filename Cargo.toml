@@ -7,6 +7,7 @@ publish = false
 [features]
 default = ["gui"]
 gui = [
+    "dep:directories",
     "dep:flume",
     "dep:gpui",
     "dep:gpui_platform",
@@ -20,6 +21,7 @@ gui = [
 ]
 
 [dependencies]
+directories = { version = "6", optional = true }
 flume = { version = "0.12", optional = true }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true, features = ["wayland", "x11"] }
