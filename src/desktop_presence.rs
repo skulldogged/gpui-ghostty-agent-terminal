@@ -127,7 +127,7 @@ mod platform {
                 .map_err(|error| format!("create desktop tray menu: {error}"))?;
 
             let menu_sender = sender.clone();
-            MenuEvent::set_event_handler(Some(move |event| match event.id.as_ref() {
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.as_ref() {
                 OPEN_ID => {
                     let _ = menu_sender.send(DesktopIntent::OpenOrFocus);
                 }
@@ -141,7 +141,7 @@ mod platform {
             }));
 
             let click_sender = sender;
-            TrayIconEvent::set_event_handler(Some(move |event| {
+            TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
                 if let TrayIconEvent::Click {
                     id,
                     button: MouseButton::Left,
