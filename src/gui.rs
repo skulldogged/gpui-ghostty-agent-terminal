@@ -176,8 +176,7 @@ impl TerminalView {
                     if let Err(error) = view.driver.input(b"echo WINDOWS_CONPTY_LIVE\r".to_vec()) {
                         view.terminal_error = Some(error);
                     }
-                })
-                .ok();
+                });
             }
         })
         .detach();
