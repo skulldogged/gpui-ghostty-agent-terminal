@@ -25,7 +25,7 @@ interface.
 ## Pinned inputs
 
 - Ghostty `4c725242b7dbe8c77c6e227ef1f9540c5ef17921`
-- GPUI `0.2` (resolved exactly in `Cargo.lock` once generated)
+- GPUI `fa00dccc42311f8dc71c533105488b0dbd518138`
 - Zig `0.16.0`
 
 ## Commands
@@ -46,6 +46,15 @@ Menlo/SF Mono on macOS, Cascadia Mono/Consolas on Windows, and DejaVu Sans Mono
 or Liberation Mono on Linux. `AGENT_TERMINAL_FONT` can request another installed
 fixed-pitch family, and `AGENT_TERMINAL_FONT_SIZE` accepts sizes from 8 through
 48 pixels.
+
+Closing the last window keeps the Desktop Shell available from its native tray
+item on macOS and Windows, or from a StatusNotifierItem host on Linux. Linux
+desktops without a status-notifier host instead quit the Desktop Shell with the
+last window so it never becomes an invisible background process. The tray keeps
+session lifetime explicit: **Quit Desktop Shell (Keep Sessions)** leaves the
+Resident Core running, while **Stop Sessions and Quit** also stops the Resident
+Core. Use the latter before rebuilding on Windows so the running Core releases
+`agent-terminal.exe`.
 
 ## Verdict
 

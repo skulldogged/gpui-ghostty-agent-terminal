@@ -61,9 +61,17 @@ mod platform {
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
-                    label: "Quit Desktop Shell".into(),
+                    label: "Quit Desktop Shell (Keep Sessions)".into(),
                     activate: Box::new(|tray: &mut Self| {
                         tray.send(DesktopIntent::QuitDesktopShell);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Stop Sessions and Quit".into(),
+                    activate: Box::new(|tray: &mut Self| {
+                        tray.send(DesktopIntent::StopResidentCoreAndQuit);
                     }),
                     ..Default::default()
                 }
@@ -103,6 +111,7 @@ mod platform {
     const TRAY_ID: &str = "agent-terminal";
     const OPEN_ID: &str = "agent-terminal.open";
     const QUIT_ID: &str = "agent-terminal.quit";
+    const FULL_EXIT_ID: &str = "agent-terminal.full-exit";
 
     pub(super) struct DesktopPresence {
         _tray_icon: TrayIcon,
@@ -112,8 +121,9 @@ mod platform {
         pub(super) fn start(sender: Sender<DesktopIntent>) -> Result<Self, String> {
             let open = MenuItem::with_id(OPEN_ID, "Open Terminal", true, None);
             let separator = PredefinedMenuItem::separator();
-            let quit = MenuItem::with_id(QUIT_ID, "Quit Desktop Shell", true, None);
-            let menu = Menu::with_items(&[&open, &separator, &quit])
+            let quit = MenuItem::with_id(QUIT_ID, "Quit Desktop Shell (Keep Sessions)", true, None);
+            let full_exit = MenuItem::with_id(FULL_EXIT_ID, "Stop Sessions and Quit", true, None);
+            let menu = Menu::with_items(&[&open, &separator, &quit, &full_exit])
                 .map_err(|error| format!("create desktop tray menu: {error}"))?;
 
             let menu_sender = sender.clone();
@@ -123,6 +133,9 @@ mod platform {
                 }
                 QUIT_ID => {
                     let _ = menu_sender.send(DesktopIntent::QuitDesktopShell);
+                }
+                FULL_EXIT_ID => {
+                    let _ = menu_sender.send(DesktopIntent::StopResidentCoreAndQuit);
                 }
                 _ => {}
             }));
