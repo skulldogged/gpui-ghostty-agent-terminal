@@ -1,6 +1,6 @@
 use crate::{
     CoreClient, CoreCommand, CoreSnapshot, CreatedResource, PaneId, PaneLayout, SpaceId, SplitAxis,
-    SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId, TerminalSize,
+    SplitId, SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId, TerminalSize,
     TerminalSnapshot,
     core_driver::{CoreDriver, CoreProjection, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
@@ -55,6 +55,8 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
                     terminal_font,
                     requested_sizes: HashMap::new(),
                     pending_close: None,
+                    move_source: None,
+                    selections_after_commands: HashMap::new(),
                 });
                 view.update(cx, |view, cx| {
                     view.start_refresh_task(cx);
@@ -84,6 +86,8 @@ struct MultiplexerView {
     terminal_font: TerminalFont,
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
     pending_close: Option<PaneId>,
+    move_source: Option<PaneId>,
+    selections_after_commands: HashMap<u64, PaneId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,11 +275,33 @@ impl MultiplexerView {
                 }) {
                     self.pending_close = None;
                 }
+                if self.move_source.is_some_and(|pane_id| {
+                    !self
+                        .hierarchy
+                        .spaces
+                        .iter()
+                        .flat_map(|space| &space.tabs)
+                        .any(|tab| layout_contains_pane(&tab.layout, pane_id))
+                }) {
+                    self.move_source = None;
+                }
             }
-            DriverUpdate::CommandAccepted(outcome) => {
-                self.selection =
-                    selection_for_created(self.selection, &outcome.created, &self.hierarchy);
+            DriverUpdate::CommandAccepted {
+                command_id,
+                outcome,
+            } => {
+                self.selection = self
+                    .selections_after_commands
+                    .remove(&command_id)
+                    .map(|pane_id| selection_for_pane(pane_id, &self.hierarchy))
+                    .unwrap_or_else(|| {
+                        selection_for_created(self.selection, &outcome.created, &self.hierarchy)
+                    });
                 self.global_error = None;
+            }
+            DriverUpdate::CommandRejected { command_id, error } => {
+                self.selections_after_commands.remove(&command_id);
+                self.global_error = Some(error);
             }
             DriverUpdate::Terminal {
                 terminal_session_id,
@@ -287,7 +313,10 @@ impl MultiplexerView {
                 terminal_session_id,
                 snapshot,
             ),
-            DriverUpdate::Error(error) => self.global_error = Some(error),
+            DriverUpdate::Error(error) => {
+                self.selections_after_commands.clear();
+                self.global_error = Some(error);
+            }
         }
     }
 
@@ -304,6 +333,8 @@ impl MultiplexerView {
         self.requested_sizes.clear();
         self.selection = self.selection.normalized(&self.hierarchy);
         self.pending_close = None;
+        self.move_source = None;
+        self.selections_after_commands.clear();
     }
 
     fn retain_live_terminals(&mut self) {
@@ -376,29 +407,61 @@ impl MultiplexerView {
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(source_pane_id) = self.move_source
+            && source_pane_id != pane_id
+        {
+            self.move_source = None;
+            self.pending_close = None;
+            self.selection.pane_id = Some(pane_id);
+            if let Some(command_id) = self.submit_core_command(
+                CoreCommand::MovePane {
+                    pane_id: source_pane_id,
+                    target_pane_id: pane_id,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+                cx,
+            ) {
+                self.selections_after_commands
+                    .insert(command_id, source_pane_id);
+            }
+            self.focus.focus(window, cx);
+            return;
+        }
         self.selection.pane_id = Some(pane_id);
         self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
 
-    fn submit_core_command(&mut self, command: CoreCommand, cx: &mut Context<Self>) {
+    fn submit_core_command(&mut self, command: CoreCommand, cx: &mut Context<Self>) -> Option<u64> {
         match self.driver.apply_core_command(command) {
-            Ok(()) => self.global_error = None,
-            Err(error) => self.global_error = Some(error),
+            Ok(command_id) => {
+                self.global_error = None;
+                cx.notify();
+                Some(command_id)
+            }
+            Err(error) => {
+                self.global_error = Some(error);
+                cx.notify();
+                None
+            }
         }
-        cx.notify();
     }
 
     fn create_space(&mut self, cx: &mut Context<Self>) {
+        self.cancel_move();
         match std::env::current_dir() {
-            Ok(directory) => self.submit_core_command(
-                CoreCommand::CreateSpace {
-                    name: format!("Space {}", self.hierarchy.spaces.len() + 1),
-                    directory,
-                },
-                cx,
-            ),
+            Ok(directory) => {
+                self.submit_core_command(
+                    CoreCommand::CreateSpace {
+                        name: format!("Space {}", self.hierarchy.spaces.len() + 1),
+                        directory,
+                    },
+                    cx,
+                );
+            }
             Err(error) => {
                 self.global_error = Some(format!("locate current directory: {error}"));
                 cx.notify();
@@ -407,6 +470,7 @@ impl MultiplexerView {
     }
 
     fn create_tab(&mut self, cx: &mut Context<Self>) {
+        self.cancel_move();
         let Some(space) = self.selected_space() else {
             return;
         };
@@ -420,6 +484,7 @@ impl MultiplexerView {
     }
 
     fn split_focused_pane(&mut self, axis: SplitAxis, cx: &mut Context<Self>) {
+        self.cancel_move();
         let Some(pane_id) = self.selection.pane_id else {
             return;
         };
@@ -435,6 +500,7 @@ impl MultiplexerView {
     }
 
     fn request_close_focused_pane(&mut self, cx: &mut Context<Self>) {
+        self.cancel_move();
         let Some(pane_id) = self.selection.pane_id else {
             return;
         };
@@ -444,6 +510,42 @@ impl MultiplexerView {
         } else {
             self.pending_close = Some(pane_id);
             cx.notify();
+        }
+    }
+
+    fn toggle_move_focused_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.selection.pane_id else {
+            return;
+        };
+        self.pending_close = None;
+        self.move_source = (self.move_source != Some(pane_id)).then_some(pane_id);
+        cx.notify();
+    }
+
+    fn cancel_move(&mut self) {
+        self.move_source = None;
+    }
+
+    fn resize_focused_pane(&mut self, grow: bool, cx: &mut Context<Self>) {
+        self.cancel_move();
+        let Some(pane_id) = self.selection.pane_id else {
+            return;
+        };
+        let Some(parent) = self
+            .selected_tab()
+            .and_then(|tab| nearest_parent_split(&tab.layout, pane_id))
+        else {
+            return;
+        };
+        let ratio = adjusted_split_ratio(parent, grow);
+        if ratio != parent.ratio {
+            self.submit_core_command(
+                CoreCommand::ResizeSplit {
+                    split_id: parent.split_id,
+                    ratio,
+                },
+                cx,
+            );
         }
     }
 
@@ -615,6 +717,57 @@ impl MultiplexerView {
                             view.split_focused_pane(SplitAxis::Vertical, cx)
                         }))
                         .child("Split V"),
+                )
+                .child(
+                    div()
+                        .id("shrink-pane")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xb4bdca))
+                        .on_click(cx.listener(|view, _event, _window, cx| {
+                            view.resize_focused_pane(false, cx)
+                        }))
+                        .child("Shrink"),
+                )
+                .child(
+                    div()
+                        .id("grow-pane")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xb4bdca))
+                        .on_click(cx.listener(|view, _event, _window, cx| {
+                            view.resize_focused_pane(true, cx)
+                        }))
+                        .child("Grow"),
+                )
+                .child(
+                    div()
+                        .id("move-pane")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(12.))
+                        .when(self.move_source.is_some(), |this| this.bg(rgb(0x273247)))
+                        .text_color(if self.move_source.is_some() {
+                            rgb(0xdbe6f5)
+                        } else {
+                            rgb(0xb4bdca)
+                        })
+                        .on_click(cx.listener(|view, _event, _window, cx| {
+                            view.toggle_move_focused_pane(cx)
+                        }))
+                        .child(if self.move_source.is_some() {
+                            "Cancel move"
+                        } else {
+                            "Move"
+                        }),
                 )
                 .child(
                     div()
@@ -960,6 +1113,69 @@ fn selection_for_created(
     selected.normalized(hierarchy)
 }
 
+fn selection_for_pane(pane_id: PaneId, hierarchy: &CoreSnapshot) -> UiSelection {
+    let location = hierarchy.spaces.iter().find_map(|space| {
+        space
+            .tabs
+            .iter()
+            .find(|tab| layout_contains_pane(&tab.layout, pane_id))
+            .map(|tab| (space.id, tab.id))
+    });
+    UiSelection {
+        space_id: location.map(|(space_id, _)| space_id),
+        tab_id: location.map(|(_, tab_id)| tab_id),
+        pane_id: location.map(|_| pane_id),
+    }
+    .normalized(hierarchy)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParentSplit {
+    split_id: SplitId,
+    ratio: SplitRatio,
+    pane_in_first: bool,
+}
+
+fn nearest_parent_split(layout: &PaneLayout, pane_id: PaneId) -> Option<ParentSplit> {
+    let PaneLayout::Split(split) = layout else {
+        return None;
+    };
+    if layout_contains_pane(&split.first, pane_id) {
+        nearest_parent_split(&split.first, pane_id).or(Some(ParentSplit {
+            split_id: split.id,
+            ratio: split.ratio,
+            pane_in_first: true,
+        }))
+    } else if layout_contains_pane(&split.second, pane_id) {
+        nearest_parent_split(&split.second, pane_id).or(Some(ParentSplit {
+            split_id: split.id,
+            ratio: split.ratio,
+            pane_in_first: false,
+        }))
+    } else {
+        None
+    }
+}
+
+fn adjusted_split_ratio(parent: ParentSplit, grow: bool) -> SplitRatio {
+    const STEP: u16 = 50;
+    let increase_first = grow == parent.pane_in_first;
+    let parts = if increase_first {
+        parent
+            .ratio
+            .parts_per_thousand()
+            .saturating_add(STEP)
+            .min(SplitRatio::MAX_PARTS)
+    } else {
+        parent
+            .ratio
+            .parts_per_thousand()
+            .saturating_sub(STEP)
+            .max(SplitRatio::MIN_PARTS)
+    };
+    SplitRatio::new(parts).expect("clamped split ratio must be valid")
+}
+
 fn pane_extents(
     layout: &PaneLayout,
     width: f32,
@@ -1095,7 +1311,8 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
 #[cfg(test)]
 mod tests {
     use super::{
-        UiSelection, accept_terminal_snapshot, pane_extents, selection_for_created,
+        UiSelection, accept_terminal_snapshot, adjusted_split_ratio, first_pane_id,
+        nearest_parent_split, pane_extents, selection_for_created, selection_for_pane,
         terminal_input_bytes,
     };
     use crate::{
@@ -1270,5 +1487,122 @@ mod tests {
         assert_eq!(selection.space_id, Some(split.snapshot.spaces[0].id));
         assert_eq!(selection.tab_id, Some(split.snapshot.spaces[0].tabs[0].id));
         assert_eq!(selection.pane_id, Some(pane_id));
+    }
+
+    #[test]
+    fn resize_targets_the_nearest_split_and_grows_the_focused_side() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let initial = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "Space".into(),
+                    directory,
+                },
+            )
+            .expect("create Space");
+        let first_pane =
+            first_pane_id(&initial.snapshot.spaces[0].tabs[0].layout).expect("initial Pane");
+        let horizontal = model
+            .apply(
+                initial.revision,
+                CoreCommand::SplitPane {
+                    pane_id: first_pane,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("split horizontally");
+        let CreatedResource::Pane {
+            pane_id: second_pane,
+            ..
+        } = horizontal.created
+        else {
+            panic!("split must create a Pane");
+        };
+        let vertical = model
+            .apply(
+                horizontal.revision,
+                CoreCommand::SplitPane {
+                    pane_id: second_pane,
+                    axis: SplitAxis::Vertical,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("split vertically");
+        let CreatedResource::Pane {
+            pane_id: focused_pane,
+            split_id,
+            ..
+        } = vertical.created
+        else {
+            panic!("split must create a Pane");
+        };
+
+        let parent =
+            nearest_parent_split(&vertical.snapshot.spaces[0].tabs[0].layout, focused_pane)
+                .expect("nearest parent split");
+
+        assert_eq!(parent.split_id, split_id);
+        assert!(!parent.pane_in_first);
+        assert_eq!(adjusted_split_ratio(parent, true).parts_per_thousand(), 450);
+        assert_eq!(
+            adjusted_split_ratio(parent, false).parts_per_thousand(),
+            550
+        );
+    }
+
+    #[test]
+    fn moved_pane_selection_follows_it_across_spaces() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let first = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "First".into(),
+                    directory: directory.clone(),
+                },
+            )
+            .expect("create first Space");
+        let source_pane =
+            first_pane_id(&first.snapshot.spaces[0].tabs[0].layout).expect("source Pane");
+        let second = model
+            .apply(
+                first.revision,
+                CoreCommand::CreateSpace {
+                    name: "Second".into(),
+                    directory,
+                },
+            )
+            .expect("create second Space");
+        let CreatedResource::Space {
+            space_id: target_space,
+            pane_id: target_pane,
+            ..
+        } = second.created
+        else {
+            panic!("Space creation must identify its Pane");
+        };
+        let moved = model
+            .apply(
+                second.revision,
+                CoreCommand::MovePane {
+                    pane_id: source_pane,
+                    target_pane_id: target_pane,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("move Pane across Spaces");
+
+        let selection = selection_for_pane(source_pane, &moved.snapshot);
+
+        assert_eq!(selection.space_id, Some(target_space));
+        assert_eq!(selection.pane_id, Some(source_pane));
     }
 }
