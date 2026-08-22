@@ -5,20 +5,20 @@ use crate::{
     core_driver::{CoreDriver, CoreProjection, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
+    ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent,
-    Keystroke, Pixels, Point, Render, ShapedLine, SharedString, Task, TextRun, Window,
-    WindowBounds, WindowOptions, canvas, div, fill, font, point, prelude::*, px, rgb, size,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations, FocusHandle, IntoElement,
+    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, Render, ShapedLine,
+    SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill, font, point,
+    prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
-const SIDEBAR_WIDTH_PX: f32 = 188.0;
-const TAB_BAR_HEIGHT_PX: f32 = 38.0;
-const SPLIT_GAP_PX: f32 = 1.0;
+const SPLIT_DIVIDER_PX: f32 = 5.0;
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
 pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, String> {
@@ -35,37 +35,37 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
         .collect();
     let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
     let window = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let focus = cx.focus_handle();
-                focus.focus(window, cx);
-                let view = cx.new(|_| MultiplexerView {
-                    driver,
-                    hierarchy: projection.hierarchy,
-                    terminals: projection.terminals,
-                    selection,
-                    focus,
-                    refresh_task: Task::ready(()),
-                    terminal_errors,
-                    global_error: None,
-                    terminal_font,
-                    requested_sizes: HashMap::new(),
-                    pending_close: None,
-                    move_source: None,
-                    selections_after_commands: HashMap::new(),
-                });
-                view.update(cx, |view, cx| {
-                    view.start_refresh_task(cx);
-                    #[cfg(windows)]
-                    view.start_windows_probe(cx);
-                });
-                view
-            },
-        )
+        .open_window(WorkspaceShell::window_options(bounds), move |window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            let view = cx.new(|_| MultiplexerView {
+                driver,
+                hierarchy: projection.hierarchy,
+                terminals: projection.terminals,
+                selection,
+                focus,
+                refresh_task: Task::ready(()),
+                terminal_errors,
+                global_error: None,
+                terminal_font,
+                requested_sizes: HashMap::new(),
+                move_source: None,
+                selections_after_commands: HashMap::new(),
+                sidebar_width: WorkspaceShell::SIDEBAR_WIDTH,
+                sidebar_dragging: false,
+                split_geometries: HashMap::new(),
+                split_dragging: None,
+                preview_split_ratios: HashMap::new(),
+                pending_split_resizes: HashMap::new(),
+                titlebar_drag_armed: false,
+            });
+            view.update(cx, |view, cx| {
+                view.start_refresh_task(cx);
+                #[cfg(windows)]
+                view.start_windows_probe(cx);
+            });
+            view
+        })
         .map_err(|error| format!("open GPUI window: {error}"))?;
 
     window
@@ -85,9 +85,15 @@ struct MultiplexerView {
     global_error: Option<String>,
     terminal_font: TerminalFont,
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
-    pending_close: Option<PaneId>,
     move_source: Option<PaneId>,
     selections_after_commands: HashMap<u64, PaneId>,
+    sidebar_width: f32,
+    sidebar_dragging: bool,
+    split_geometries: HashMap<SplitId, SplitGeometry>,
+    split_dragging: Option<SplitId>,
+    preview_split_ratios: HashMap<SplitId, SplitRatio>,
+    pending_split_resizes: HashMap<u64, SplitId>,
+    titlebar_drag_armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,6 +101,13 @@ struct UiSelection {
     space_id: Option<SpaceId>,
     tab_id: Option<TabId>,
     pane_id: Option<PaneId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SplitGeometry {
+    axis: SplitAxis,
+    start: f32,
+    length: f32,
 }
 
 impl UiSelection {
@@ -265,16 +278,6 @@ impl MultiplexerView {
                 self.hierarchy = hierarchy;
                 self.retain_live_terminals();
                 self.selection = self.selection.normalized(&self.hierarchy);
-                if self.pending_close.is_some_and(|pane_id| {
-                    !self
-                        .hierarchy
-                        .spaces
-                        .iter()
-                        .flat_map(|space| &space.tabs)
-                        .any(|tab| layout_contains_pane(&tab.layout, pane_id))
-                }) {
-                    self.pending_close = None;
-                }
                 if self.move_source.is_some_and(|pane_id| {
                     !self
                         .hierarchy
@@ -290,6 +293,9 @@ impl MultiplexerView {
                 command_id,
                 outcome,
             } => {
+                if let Some(split_id) = self.pending_split_resizes.remove(&command_id) {
+                    self.preview_split_ratios.remove(&split_id);
+                }
                 self.selection = self
                     .selections_after_commands
                     .remove(&command_id)
@@ -301,6 +307,9 @@ impl MultiplexerView {
             }
             DriverUpdate::CommandRejected { command_id, error } => {
                 self.selections_after_commands.remove(&command_id);
+                if let Some(split_id) = self.pending_split_resizes.remove(&command_id) {
+                    self.preview_split_ratios.remove(&split_id);
+                }
                 self.global_error = Some(error);
             }
             DriverUpdate::Terminal {
@@ -315,6 +324,9 @@ impl MultiplexerView {
             ),
             DriverUpdate::Error(error) => {
                 self.selections_after_commands.clear();
+                self.pending_split_resizes.clear();
+                self.preview_split_ratios.clear();
+                self.split_dragging = None;
                 self.global_error = Some(error);
             }
         }
@@ -332,9 +344,12 @@ impl MultiplexerView {
             .collect();
         self.requested_sizes.clear();
         self.selection = self.selection.normalized(&self.hierarchy);
-        self.pending_close = None;
         self.move_source = None;
         self.selections_after_commands.clear();
+        self.split_geometries.clear();
+        self.split_dragging = None;
+        self.preview_split_ratios.clear();
+        self.pending_split_resizes.clear();
     }
 
     fn retain_live_terminals(&mut self) {
@@ -392,7 +407,6 @@ impl MultiplexerView {
         self.selection.tab_id = None;
         self.selection.pane_id = None;
         self.selection = self.selection.normalized(&self.hierarchy);
-        self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -401,7 +415,6 @@ impl MultiplexerView {
         self.selection.tab_id = Some(tab_id);
         self.selection.pane_id = None;
         self.selection = self.selection.normalized(&self.hierarchy);
-        self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -411,7 +424,6 @@ impl MultiplexerView {
             && source_pane_id != pane_id
         {
             self.move_source = None;
-            self.pending_close = None;
             self.selection.pane_id = Some(pane_id);
             if let Some(command_id) = self.submit_core_command(
                 CoreCommand::MovePane {
@@ -430,7 +442,6 @@ impl MultiplexerView {
             return;
         }
         self.selection.pane_id = Some(pane_id);
-        self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -499,25 +510,10 @@ impl MultiplexerView {
         );
     }
 
-    fn request_close_focused_pane(&mut self, cx: &mut Context<Self>) {
-        self.cancel_move();
-        let Some(pane_id) = self.selection.pane_id else {
-            return;
-        };
-        if self.pending_close == Some(pane_id) {
-            self.pending_close = None;
-            self.submit_core_command(CoreCommand::ClosePane { pane_id }, cx);
-        } else {
-            self.pending_close = Some(pane_id);
-            cx.notify();
-        }
-    }
-
     fn toggle_move_focused_pane(&mut self, cx: &mut Context<Self>) {
         let Some(pane_id) = self.selection.pane_id else {
             return;
         };
-        self.pending_close = None;
         self.move_source = (self.move_source != Some(pane_id)).then_some(pane_id);
         cx.notify();
     }
@@ -526,37 +522,27 @@ impl MultiplexerView {
         self.move_source = None;
     }
 
-    fn resize_focused_pane(&mut self, grow: bool, cx: &mut Context<Self>) {
-        self.cancel_move();
-        let Some(pane_id) = self.selection.pane_id else {
-            return;
-        };
-        let Some(parent) = self
-            .selected_tab()
-            .and_then(|tab| nearest_parent_split(&tab.layout, pane_id))
-        else {
-            return;
-        };
-        let ratio = adjusted_split_ratio(parent, grow);
-        if ratio != parent.ratio {
-            self.submit_core_command(
-                CoreCommand::ResizeSplit {
-                    split_id: parent.split_id,
-                    ratio,
-                },
-                cx,
-            );
-        }
-    }
-
     fn resize_visible_terminals(&mut self, viewport: gpui::Size<Pixels>) {
         let Some(layout) = self.selected_tab().map(|tab| tab.layout.clone()) else {
             return;
         };
-        let width = (f32::from(viewport.width) - SIDEBAR_WIDTH_PX).max(1.0);
-        let height = (f32::from(viewport.height) - TAB_BAR_HEIGHT_PX).max(1.0);
+        let width = (f32::from(viewport.width) - self.sidebar_width).max(1.0);
+        let height = (f32::from(viewport.height) - WorkspaceShell::TITLE_BAR_HEIGHT).max(1.0);
         let mut panes = Vec::new();
-        pane_extents(&layout, width, height, &mut panes);
+        let mut split_geometries = HashMap::new();
+        collect_layout_metrics(
+            &layout,
+            LayoutRect {
+                x: self.sidebar_width,
+                y: WorkspaceShell::TITLE_BAR_HEIGHT,
+                width,
+                height,
+            },
+            &self.preview_split_ratios,
+            &mut panes,
+            &mut split_geometries,
+        );
+        self.split_geometries = split_geometries;
         for (terminal_session_id, width, height) in panes {
             let dimensions =
                 GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
@@ -577,82 +563,420 @@ impl MultiplexerView {
         }
     }
 
+    fn update_split_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(split_id) = self.split_dragging else {
+            return;
+        };
+        let Some(geometry) = self.split_geometries.get(&split_id).copied() else {
+            self.split_dragging = None;
+            return;
+        };
+        let pointer = match geometry.axis {
+            SplitAxis::Horizontal => position.x.as_f32(),
+            SplitAxis::Vertical => position.y.as_f32(),
+        };
+        let ratio = split_ratio_at(geometry, pointer);
+        if self.preview_split_ratios.get(&split_id) != Some(&ratio) {
+            self.preview_split_ratios.insert(split_id, ratio);
+            cx.notify();
+        }
+    }
+
+    fn finish_split_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(split_id) = self.split_dragging.take() else {
+            return;
+        };
+        let Some(ratio) = self.preview_split_ratios.get(&split_id).copied() else {
+            return;
+        };
+        let authoritative_ratio = self
+            .selected_tab()
+            .and_then(|tab| find_split_ratio(&tab.layout, split_id));
+        if authoritative_ratio == Some(ratio) {
+            self.preview_split_ratios.remove(&split_id);
+            cx.notify();
+            return;
+        }
+        match self.submit_core_command(CoreCommand::ResizeSplit { split_id, ratio }, cx) {
+            Some(command_id) => {
+                self.pending_split_resizes.insert(command_id, split_id);
+            }
+            None => {
+                self.preview_split_ratios.remove(&split_id);
+            }
+        }
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut sidebar = div()
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_WIDTH_PX))
+            .relative()
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_none()
-            .bg(rgb(0x11151d))
+            .bg(WorkspaceShell::color(ShellColor::Sidebar))
             .border_r_1()
-            .border_color(rgb(0x2b3240))
-            .p_2()
-            .gap_1()
+            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .px_1()
+            .pt_2()
+            .gap(px(2.))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_2()
-                    .py_1()
-                    .text_size(px(12.))
-                    .text_color(rgb(0x8993a4))
+                    .h(px(28.))
+                    .px_3()
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(WorkspaceShell::color(ShellColor::FaintText))
                     .child("SPACES")
                     .child(
                         div()
-                            .id("create-space")
-                            .cursor_pointer()
-                            .rounded_md()
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(0x273247))
-                            .text_color(rgb(0xdbe6f5))
-                            .on_click(
-                                cx.listener(|view, _event, _window, cx| view.create_space(cx)),
-                            )
-                            .child("+"),
+                            .text_size(px(11.))
+                            .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                            .child(self.hierarchy.spaces.len().to_string()),
                     ),
             );
         for space in &self.hierarchy.spaces {
             let space_id = space.id;
             let selected = self.selection.space_id == Some(space_id);
+            let initial = space
+                .name
+                .chars()
+                .next()
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_else(|| "·".into());
+            let tab_count = space.tabs.len();
+            let tab_label = if tab_count == 1 { "tab" } else { "tabs" };
+            let metadata = format!(
+                "{tab_count} {tab_label}  ·  {}",
+                space.directory.to_string_lossy()
+            );
             sidebar = sidebar.child(
                 div()
                     .id(("space", space_id.as_u64()))
                     .cursor_pointer()
-                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(52.))
+                    .mx_1()
                     .px_2()
-                    .py_2()
-                    .text_size(px(13.))
-                    .text_color(if selected {
-                        rgb(0xf4f7fb)
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(if selected {
+                        WorkspaceShell::color(ShellColor::SelectedBorder)
                     } else {
-                        rgb(0xb4bdca)
+                        WorkspaceShell::color(ShellColor::Sidebar)
                     })
-                    .when(selected, |this| this.bg(rgb(0x273247)))
+                    .when(selected, |this| {
+                        this.bg(WorkspaceShell::color(ShellColor::Selected))
+                    })
+                    .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
                     .on_click(cx.listener(move |view, _event, window, cx| {
                         view.select_space(space_id, window, cx)
                     }))
-                    .child(space.name.clone()),
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(24.))
+                            .rounded_full()
+                            .bg(if selected {
+                                WorkspaceShell::color(ShellColor::AccentMuted)
+                            } else {
+                                WorkspaceShell::color(ShellColor::Hover)
+                            })
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if selected {
+                                WorkspaceShell::color(ShellColor::Accent)
+                            } else {
+                                WorkspaceShell::color(ShellColor::MutedText)
+                            })
+                            .child(initial),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(if selected {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(WorkspaceShell::color(ShellColor::Text))
+                                    .child(space.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                                    .child(metadata),
+                            ),
+                    ),
             );
         }
-        sidebar.into_any_element()
+        sidebar
+            .child(
+                div()
+                    .id("sidebar-resize")
+                    .absolute()
+                    .top_0()
+                    .right(px(-3.))
+                    .w(px(6.))
+                    .h_full()
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _event, _window, cx| {
+                            view.sidebar_dragging = true;
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
+            .into_any_element()
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut tabs = div()
+    fn chrome_tile(
+        &self,
+        id: &'static str,
+        icon: ShellIcon,
+        active: bool,
+        danger: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let color = if danger {
+            WorkspaceShell::color(ShellColor::Danger)
+        } else if active {
+            WorkspaceShell::color(ShellColor::Accent)
+        } else {
+            WorkspaceShell::color(ShellColor::MutedText)
+        };
+        div()
+            .id(id)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(WorkspaceShell::CHROME_TILE_SIZE))
+            .cursor_pointer()
+            .rounded_lg()
+            .when(active, |this| {
+                this.bg(WorkspaceShell::color(ShellColor::AccentMuted))
+            })
+            .hover(move |this| {
+                this.bg(WorkspaceShell::color(if danger {
+                    ShellColor::DangerHover
+                } else {
+                    ShellColor::Hover
+                }))
+            })
+            .child(WorkspaceShell::icon(icon, color))
+    }
+
+    fn render_titlebar_drag_region(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(id)
+            .flex_1()
+            .h_full()
+            .min_w(px(24.))
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, _cx| {
+                    view.titlebar_drag_armed = true;
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|view, _event, _window, _cx| {
+                view.titlebar_drag_armed = false;
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, _cx| {
+                    view.titlebar_drag_armed = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, _cx| {
+                    view.titlebar_drag_armed = false;
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, _event, window, _cx| {
+                if view.titlebar_drag_armed {
+                    view.titlebar_drag_armed = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_click(|event, window, _cx| {
+                if event.click_count() == 2 {
+                    if cfg!(target_os = "linux") {
+                        window.zoom_window();
+                    } else {
+                        window.titlebar_double_click();
+                    }
+                }
+            })
+            .into_any_element()
+    }
+
+    fn render_window_controls(&self, window: &Window) -> Option<AnyElement> {
+        if cfg!(target_os = "macos")
+            || (cfg!(target_os = "linux")
+                && !matches!(window.window_decorations(), Decorations::Client { .. }))
+        {
+            return None;
+        }
+
+        let supported = window.window_controls();
+        let windows_caption_font = windows_caption_font();
+        let caption_button =
+            |id: &'static str, glyph: &'static str, area: WindowControlArea, danger: bool| {
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(46.))
+                    .h_full()
+                    .text_size(px(if cfg!(windows) { 10. } else { 13. }))
+                    .text_color(WorkspaceShell::color(ShellColor::MutedText))
+                    .when(cfg!(windows), |this| this.font_family(windows_caption_font))
+                    .window_control_area(area)
+                    .hover(move |this| {
+                        this.bg(WorkspaceShell::color(if danger {
+                            ShellColor::DangerHover
+                        } else {
+                            ShellColor::Hover
+                        }))
+                        .text_color(WorkspaceShell::color(if danger {
+                            ShellColor::Danger
+                        } else {
+                            ShellColor::Text
+                        }))
+                    })
+                    .child(glyph)
+            };
+        let minimize_glyph = if cfg!(windows) { "\u{e921}" } else { "−" };
+        let maximize_glyph = if cfg!(windows) {
+            if window.is_maximized() {
+                "\u{e923}"
+            } else {
+                "\u{e922}"
+            }
+        } else if window.is_maximized() {
+            "▣"
+        } else {
+            "□"
+        };
+        let close_glyph = if cfg!(windows) { "\u{e8bb}" } else { "×" };
+
+        let mut controls = div()
             .flex()
             .flex_row()
-            .h(px(TAB_BAR_HEIGHT_PX))
-            .w_full()
-            .flex_none()
             .items_center()
-            .bg(rgb(0x151a23))
-            .border_b_1()
-            .border_color(rgb(0x2b3240))
+            .justify_end()
+            .w(px(WorkspaceShell::WINDOW_CONTROLS_WIDTH))
+            .h_full()
+            .flex_none();
+        if supported.minimize {
+            controls = controls.child(
+                caption_button(
+                    "window-minimize",
+                    minimize_glyph,
+                    WindowControlArea::Min,
+                    false,
+                )
+                .when(cfg!(target_os = "linux"), |this| {
+                    this.on_click(|_event, window, cx| {
+                        cx.stop_propagation();
+                        window.minimize_window();
+                    })
+                }),
+            );
+        }
+        if supported.maximize {
+            controls = controls.child(
+                caption_button(
+                    "window-maximize",
+                    maximize_glyph,
+                    WindowControlArea::Max,
+                    false,
+                )
+                .when(cfg!(target_os = "linux"), |this| {
+                    this.on_click(|_event, window, cx| {
+                        cx.stop_propagation();
+                        window.zoom_window();
+                    })
+                }),
+            );
+        }
+        Some(
+            controls
+                .child(
+                    caption_button("window-close", close_glyph, WindowControlArea::Close, true)
+                        .when(cfg!(target_os = "linux"), |this| {
+                            this.on_click(|_event, window, cx| {
+                                cx.stop_propagation();
+                                window.remove_window();
+                            })
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let sidebar_chrome = div()
+            .flex()
+            .items_center()
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .border_r_1()
+            .border_color(WorkspaceShell::color(ShellColor::Border))
             .px_2()
-            .gap_1();
+            .when(cfg!(target_os = "macos"), |this| this.pl(px(78.)))
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(WorkspaceShell::CHROME_TILE_SIZE))
+                        .child(WorkspaceShell::icon(
+                            ShellIcon::AppMark,
+                            WorkspaceShell::color(ShellColor::Accent),
+                        )),
+                )
+            })
+            .child(self.render_titlebar_drag_region("sidebar-titlebar-drag-region", cx))
+            .child(
+                self.chrome_tile("create-space", ShellIcon::Plus, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| view.create_space(cx))),
+            );
+
+        let mut tabs = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .h_full()
+            .flex_shrink(1.)
+            .min_w_0()
+            .overflow_hidden()
+            .pl_2();
         if let Some(space) = self.selected_space() {
             for tab in &space.tabs {
                 let tab_id = tab.id;
@@ -661,138 +985,97 @@ impl MultiplexerView {
                     div()
                         .id(("tab", tab_id.as_u64()))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(WorkspaceShell::TAB_HEIGHT))
+                        .max_w(px(180.))
                         .px_3()
-                        .py_2()
-                        .rounded_t_md()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(if selected {
+                            WorkspaceShell::color(ShellColor::SelectedBorder)
+                        } else {
+                            WorkspaceShell::color(ShellColor::Chrome)
+                        })
                         .text_size(px(13.))
                         .text_color(if selected {
-                            rgb(0xf4f7fb)
+                            WorkspaceShell::color(ShellColor::Text)
                         } else {
-                            rgb(0x929cac)
+                            WorkspaceShell::color(ShellColor::MutedText)
                         })
-                        .when(selected, |this| this.bg(rgb(0x0b0e13)))
+                        .when(selected, |this| {
+                            this.bg(WorkspaceShell::color(ShellColor::Selected))
+                        })
+                        .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
                         .on_click(cx.listener(move |view, _event, window, cx| {
                             view.select_tab(tab_id, window, cx)
                         }))
-                        .child(tab.name.clone()),
+                        .child(
+                            WorkspaceShell::icon(
+                                ShellIcon::AppMark,
+                                WorkspaceShell::color(if selected {
+                                    ShellColor::Accent
+                                } else {
+                                    ShellColor::FaintText
+                                }),
+                            )
+                            .size(px(11.)),
+                        )
+                        .child(div().truncate().child(tab.name.clone())),
                 );
             }
-            tabs = tabs
-                .child(
-                    div()
-                        .id("create-tab")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx)))
-                        .child("+"),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .id("split-horizontal")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.split_focused_pane(SplitAxis::Horizontal, cx)
-                        }))
-                        .child("Split H"),
-                )
-                .child(
-                    div()
-                        .id("split-vertical")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.split_focused_pane(SplitAxis::Vertical, cx)
-                        }))
-                        .child("Split V"),
-                )
-                .child(
-                    div()
-                        .id("shrink-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.resize_focused_pane(false, cx)
-                        }))
-                        .child("Shrink"),
-                )
-                .child(
-                    div()
-                        .id("grow-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.resize_focused_pane(true, cx)
-                        }))
-                        .child("Grow"),
-                )
-                .child(
-                    div()
-                        .id("move-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .when(self.move_source.is_some(), |this| this.bg(rgb(0x273247)))
-                        .text_color(if self.move_source.is_some() {
-                            rgb(0xdbe6f5)
-                        } else {
-                            rgb(0xb4bdca)
-                        })
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.toggle_move_focused_pane(cx)
-                        }))
-                        .child(if self.move_source.is_some() {
-                            "Cancel move"
-                        } else {
-                            "Move"
-                        }),
-                )
-                .child(
-                    div()
-                        .id("close-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(if self.pending_close == self.selection.pane_id {
-                            rgb(0xffb4b4)
-                        } else {
-                            rgb(0xb4bdca)
-                        })
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.request_close_focused_pane(cx)
-                        }))
-                        .child(if self.pending_close == self.selection.pane_id {
-                            "Confirm close"
-                        } else {
-                            "Close"
-                        }),
-                );
+            tabs = tabs.child(
+                self.chrome_tile("create-tab", ShellIcon::Plus, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx))),
+            );
         }
-        tabs.into_any_element()
+
+        let pane_controls = div()
+            .flex()
+            .items_center()
+            .h_full()
+            .flex_none()
+            .child(
+                self.chrome_tile("split-horizontal", ShellIcon::SplitHorizontal, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| {
+                        view.split_focused_pane(SplitAxis::Horizontal, cx)
+                    })),
+            )
+            .child(
+                self.chrome_tile("split-vertical", ShellIcon::SplitVertical, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| {
+                        view.split_focused_pane(SplitAxis::Vertical, cx)
+                    })),
+            )
+            .child(
+                self.chrome_tile(
+                    "move-pane",
+                    ShellIcon::Move,
+                    self.move_source.is_some(),
+                    false,
+                )
+                .on_click(
+                    cx.listener(|view, _event, _window, cx| view.toggle_move_focused_pane(cx)),
+                ),
+            );
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(WorkspaceShell::TITLE_BAR_HEIGHT))
+            .w_full()
+            .flex_none()
+            .bg(WorkspaceShell::color(ShellColor::Chrome))
+            .border_b_1()
+            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .child(sidebar_chrome)
+            .child(tabs)
+            .child(self.render_titlebar_drag_region("main-titlebar-drag-region", cx))
+            .child(pane_controls)
+            .children(self.render_window_controls(window))
+            .into_any_element()
     }
 
     fn render_selected_layout(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -803,11 +1086,56 @@ impl MultiplexerView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(0x0b0e13))
-                .text_color(rgb(0x8993a4))
+                .bg(WorkspaceShell::color(ShellColor::Window))
+                .text_color(WorkspaceShell::color(ShellColor::MutedText))
                 .child("No Spaces yet")
                 .into_any_element(),
         }
+    }
+
+    fn render_split_divider(
+        &self,
+        split_id: SplitId,
+        axis: SplitAxis,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.split_dragging == Some(split_id);
+        div()
+            .id(("split-divider", split_id.as_u64()))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(axis == SplitAxis::Horizontal, |this| {
+                this.w(px(SPLIT_DIVIDER_PX)).h_full().cursor_col_resize()
+            })
+            .when(axis == SplitAxis::Vertical, |this| {
+                this.h(px(SPLIT_DIVIDER_PX)).w_full().cursor_row_resize()
+            })
+            .when(active, |this| {
+                this.bg(WorkspaceShell::color(ShellColor::AccentMuted))
+            })
+            .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _event, _window, cx| {
+                    view.split_dragging = Some(split_id);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .when(axis == SplitAxis::Horizontal, |this| {
+                        this.w(px(1.)).h_full()
+                    })
+                    .when(axis == SplitAxis::Vertical, |this| this.h(px(1.)).w_full())
+                    .bg(WorkspaceShell::color(if active {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::Border
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_pane_layout(&self, layout: &PaneLayout, cx: &mut Context<Self>) -> AnyElement {
@@ -816,7 +1144,12 @@ impl MultiplexerView {
             PaneLayout::Split(split) => {
                 let first = self.render_pane_layout(&split.first, cx);
                 let second = self.render_pane_layout(&split.second, cx);
-                let first_grow = f32::from(split.ratio.parts_per_thousand());
+                let ratio = self
+                    .preview_split_ratios
+                    .get(&split.id)
+                    .copied()
+                    .unwrap_or(split.ratio);
+                let first_grow = f32::from(ratio.parts_per_thousand());
                 let second_grow = 1000.0 - first_grow;
                 let first = match split.axis {
                     SplitAxis::Horizontal => div()
@@ -837,9 +1170,8 @@ impl MultiplexerView {
                     .when(split.axis == SplitAxis::Horizontal, |this| this.flex_row())
                     .when(split.axis == SplitAxis::Vertical, |this| this.flex_col())
                     .size_full()
-                    .gap(px(SPLIT_GAP_PX))
-                    .bg(rgb(0x343c4a))
                     .child(first)
+                    .child(self.render_split_divider(split.id, split.axis, cx))
                     .child(
                         div()
                             .flex_basis(px(0.))
@@ -965,13 +1297,18 @@ impl MultiplexerView {
 
         div()
             .id(("pane", pane_id.as_u64()))
+            .relative()
             .size_full()
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
             .bg(default_bg)
             .border_1()
-            .border_color(if focused { rgb(0x5b8def) } else { default_bg })
+            .border_color(if focused {
+                WorkspaceShell::color(ShellColor::Accent)
+            } else {
+                default_bg
+            })
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
@@ -987,7 +1324,7 @@ impl MultiplexerView {
                             .absolute()
                             .bottom(px(8.))
                             .left(px(12.))
-                            .text_color(rgb(0xff6b6b))
+                            .text_color(WorkspaceShell::color(ShellColor::Danger))
                             .child(error),
                     )
                 },
@@ -1025,24 +1362,60 @@ impl Render for MultiplexerView {
             .id("multiplexer")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
+                if view.sidebar_dragging {
+                    let viewport = window.viewport_size().width.as_f32();
+                    let max_width = (viewport - 500.)
+                        .max(WorkspaceShell::SIDEBAR_MIN_WIDTH)
+                        .min(viewport * 0.5);
+                    view.sidebar_width = event
+                        .position
+                        .x
+                        .as_f32()
+                        .clamp(WorkspaceShell::SIDEBAR_MIN_WIDTH, max_width);
+                    cx.notify();
+                }
+                view.update_split_drag(event.position, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, cx| {
+                    if view.sidebar_dragging {
+                        view.sidebar_dragging = false;
+                        cx.notify();
+                    }
+                    view.finish_split_drag(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, cx| {
+                    if view.sidebar_dragging {
+                        view.sidebar_dragging = false;
+                        cx.notify();
+                    }
+                    view.finish_split_drag(cx);
+                }),
+            )
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x0b0e13))
-            .child(self.render_sidebar(cx))
+            .bg(WorkspaceShell::color(ShellColor::Window))
+            .child(self.render_title_bar(window, cx))
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.render_tab_bar(cx))
+                    .min_h_0()
+                    .w_full()
+                    .child(self.render_sidebar(cx))
                     .child(
                         div()
                             .flex_1()
                             .min_h_0()
+                            .min_w_0()
                             .w_full()
                             .child(self.render_selected_layout(cx)),
                     ),
@@ -1053,11 +1426,11 @@ impl Render for MultiplexerView {
                         .absolute()
                         .right(px(12.))
                         .bottom(px(10.))
-                        .rounded_md()
-                        .bg(rgb(0x55262a))
-                        .px_2()
-                        .py_1()
-                        .text_color(rgb(0xffb4b4))
+                        .rounded_lg()
+                        .bg(WorkspaceShell::color(ShellColor::DangerHover))
+                        .px_3()
+                        .py_2()
+                        .text_color(WorkspaceShell::color(ShellColor::Danger))
                         .child(error),
                 )
             })
@@ -1129,76 +1502,135 @@ fn selection_for_pane(pane_id: PaneId, hierarchy: &CoreSnapshot) -> UiSelection 
     .normalized(hierarchy)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ParentSplit {
-    split_id: SplitId,
-    ratio: SplitRatio,
-    pane_in_first: bool,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LayoutRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
 }
 
-fn nearest_parent_split(layout: &PaneLayout, pane_id: PaneId) -> Option<ParentSplit> {
-    let PaneLayout::Split(split) = layout else {
-        return None;
-    };
-    if layout_contains_pane(&split.first, pane_id) {
-        nearest_parent_split(&split.first, pane_id).or(Some(ParentSplit {
-            split_id: split.id,
-            ratio: split.ratio,
-            pane_in_first: true,
-        }))
-    } else if layout_contains_pane(&split.second, pane_id) {
-        nearest_parent_split(&split.second, pane_id).or(Some(ParentSplit {
-            split_id: split.id,
-            ratio: split.ratio,
-            pane_in_first: false,
-        }))
-    } else {
-        None
-    }
-}
-
-fn adjusted_split_ratio(parent: ParentSplit, grow: bool) -> SplitRatio {
-    const STEP: u16 = 50;
-    let increase_first = grow == parent.pane_in_first;
-    let parts = if increase_first {
-        parent
-            .ratio
-            .parts_per_thousand()
-            .saturating_add(STEP)
-            .min(SplitRatio::MAX_PARTS)
-    } else {
-        parent
-            .ratio
-            .parts_per_thousand()
-            .saturating_sub(STEP)
-            .max(SplitRatio::MIN_PARTS)
-    };
-    SplitRatio::new(parts).expect("clamped split ratio must be valid")
-}
-
+#[cfg(test)]
 fn pane_extents(
     layout: &PaneLayout,
     width: f32,
     height: f32,
     output: &mut Vec<(TerminalSessionId, f32, f32)>,
 ) {
+    collect_layout_metrics(
+        layout,
+        LayoutRect {
+            x: 0.,
+            y: 0.,
+            width,
+            height,
+        },
+        &HashMap::new(),
+        output,
+        &mut HashMap::new(),
+    );
+}
+
+fn collect_layout_metrics(
+    layout: &PaneLayout,
+    rect: LayoutRect,
+    preview_ratios: &HashMap<SplitId, SplitRatio>,
+    panes: &mut Vec<(TerminalSessionId, f32, f32)>,
+    splits: &mut HashMap<SplitId, SplitGeometry>,
+) {
     match layout {
-        PaneLayout::Pane(pane) => output.push((pane.terminal_session_id, width, height)),
+        PaneLayout::Pane(pane) => panes.push((pane.terminal_session_id, rect.width, rect.height)),
         PaneLayout::Split(split) => {
-            let ratio = f32::from(split.ratio.parts_per_thousand()) / 1000.0;
+            let ratio = preview_ratios
+                .get(&split.id)
+                .copied()
+                .unwrap_or(split.ratio);
+            let ratio = f32::from(ratio.parts_per_thousand()) / 1000.0;
             match split.axis {
                 SplitAxis::Horizontal => {
-                    let available = (width - SPLIT_GAP_PX).max(2.0);
-                    pane_extents(&split.first, available * ratio, height, output);
-                    pane_extents(&split.second, available * (1.0 - ratio), height, output);
+                    let available = (rect.width - SPLIT_DIVIDER_PX).max(2.0);
+                    let first_width = available * ratio;
+                    splits.insert(
+                        split.id,
+                        SplitGeometry {
+                            axis: split.axis,
+                            start: rect.x,
+                            length: available,
+                        },
+                    );
+                    collect_layout_metrics(
+                        &split.first,
+                        LayoutRect {
+                            width: first_width,
+                            ..rect
+                        },
+                        preview_ratios,
+                        panes,
+                        splits,
+                    );
+                    collect_layout_metrics(
+                        &split.second,
+                        LayoutRect {
+                            x: rect.x + first_width + SPLIT_DIVIDER_PX,
+                            width: available - first_width,
+                            ..rect
+                        },
+                        preview_ratios,
+                        panes,
+                        splits,
+                    );
                 }
                 SplitAxis::Vertical => {
-                    let available = (height - SPLIT_GAP_PX).max(2.0);
-                    pane_extents(&split.first, width, available * ratio, output);
-                    pane_extents(&split.second, width, available * (1.0 - ratio), output);
+                    let available = (rect.height - SPLIT_DIVIDER_PX).max(2.0);
+                    let first_height = available * ratio;
+                    splits.insert(
+                        split.id,
+                        SplitGeometry {
+                            axis: split.axis,
+                            start: rect.y,
+                            length: available,
+                        },
+                    );
+                    collect_layout_metrics(
+                        &split.first,
+                        LayoutRect {
+                            height: first_height,
+                            ..rect
+                        },
+                        preview_ratios,
+                        panes,
+                        splits,
+                    );
+                    collect_layout_metrics(
+                        &split.second,
+                        LayoutRect {
+                            y: rect.y + first_height + SPLIT_DIVIDER_PX,
+                            height: available - first_height,
+                            ..rect
+                        },
+                        preview_ratios,
+                        panes,
+                        splits,
+                    );
                 }
             }
         }
+    }
+}
+
+fn split_ratio_at(geometry: SplitGeometry, pointer: f32) -> SplitRatio {
+    let fraction = ((pointer - geometry.start) / geometry.length).clamp(0., 1.);
+    let parts = (fraction * 1000.).round() as u16;
+    SplitRatio::new(parts.clamp(SplitRatio::MIN_PARTS, SplitRatio::MAX_PARTS))
+        .expect("clamped pointer ratio must be valid")
+}
+
+fn find_split_ratio(layout: &PaneLayout, split_id: SplitId) -> Option<SplitRatio> {
+    match layout {
+        PaneLayout::Pane(_) => None,
+        PaneLayout::Split(split) if split.id == split_id => Some(split.ratio),
+        PaneLayout::Split(split) => find_split_ratio(&split.first, split_id)
+            .or_else(|| find_split_ratio(&split.second, split_id)),
     }
 }
 
@@ -1308,12 +1740,30 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
     rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
 }
 
+fn windows_caption_font_for_build(build: u32) -> &'static str {
+    if build >= 22_000 {
+        "Segoe Fluent Icons"
+    } else {
+        "Segoe MDL2 Assets"
+    }
+}
+
+#[cfg(windows)]
+fn windows_caption_font() -> &'static str {
+    windows_caption_font_for_build(windows_version::OsVersion::current().build)
+}
+
+#[cfg(not(windows))]
+fn windows_caption_font() -> &'static str {
+    windows_caption_font_for_build(22_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        UiSelection, accept_terminal_snapshot, adjusted_split_ratio, first_pane_id,
-        nearest_parent_split, pane_extents, selection_for_created, selection_for_pane,
-        terminal_input_bytes,
+        SplitGeometry, UiSelection, accept_terminal_snapshot, first_pane_id, pane_extents,
+        selection_for_created, selection_for_pane, split_ratio_at, terminal_input_bytes,
+        windows_caption_font_for_build,
     };
     use crate::{
         CoreCommand, CoreModel, CreatedResource, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
@@ -1331,6 +1781,12 @@ mod tests {
         };
 
         assert_eq!(terminal_input_bytes(&key), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn windows_caption_font_follows_the_windows_11_build_boundary() {
+        assert_eq!(windows_caption_font_for_build(21_999), "Segoe MDL2 Assets");
+        assert_eq!(windows_caption_font_for_build(22_000), "Segoe Fluent Icons");
     }
 
     #[test]
@@ -1399,8 +1855,8 @@ mod tests {
         );
 
         assert_eq!(extents.len(), 2);
-        assert!((extents[0].1 - 599.4).abs() < 0.1);
-        assert!((extents[1].1 - 399.6).abs() < 0.1);
+        assert!((extents[0].1 - 597.0).abs() < 0.1);
+        assert!((extents[1].1 - 398.0).abs() < 0.1);
         assert_eq!(extents[0].2, 500.0);
         assert_eq!(extents[1].2, 500.0);
     }
@@ -1490,69 +1946,16 @@ mod tests {
     }
 
     #[test]
-    fn resize_targets_the_nearest_split_and_grows_the_focused_side() {
-        let directory = std::env::current_dir().expect("current directory");
-        let mut model = CoreModel::new();
-        let initial = model
-            .apply(
-                0,
-                CoreCommand::CreateSpace {
-                    name: "Space".into(),
-                    directory,
-                },
-            )
-            .expect("create Space");
-        let first_pane =
-            first_pane_id(&initial.snapshot.spaces[0].tabs[0].layout).expect("initial Pane");
-        let horizontal = model
-            .apply(
-                initial.revision,
-                CoreCommand::SplitPane {
-                    pane_id: first_pane,
-                    axis: SplitAxis::Horizontal,
-                    placement: SplitPlacement::After,
-                    ratio: SplitRatio::EQUAL,
-                },
-            )
-            .expect("split horizontally");
-        let CreatedResource::Pane {
-            pane_id: second_pane,
-            ..
-        } = horizontal.created
-        else {
-            panic!("split must create a Pane");
-        };
-        let vertical = model
-            .apply(
-                horizontal.revision,
-                CoreCommand::SplitPane {
-                    pane_id: second_pane,
-                    axis: SplitAxis::Vertical,
-                    placement: SplitPlacement::After,
-                    ratio: SplitRatio::EQUAL,
-                },
-            )
-            .expect("split vertically");
-        let CreatedResource::Pane {
-            pane_id: focused_pane,
-            split_id,
-            ..
-        } = vertical.created
-        else {
-            panic!("split must create a Pane");
+    fn dragging_a_split_seam_maps_pointer_position_to_a_bounded_ratio() {
+        let geometry = SplitGeometry {
+            axis: SplitAxis::Horizontal,
+            start: 220.,
+            length: 800.,
         };
 
-        let parent =
-            nearest_parent_split(&vertical.snapshot.spaces[0].tabs[0].layout, focused_pane)
-                .expect("nearest parent split");
-
-        assert_eq!(parent.split_id, split_id);
-        assert!(!parent.pane_in_first);
-        assert_eq!(adjusted_split_ratio(parent, true).parts_per_thousand(), 450);
-        assert_eq!(
-            adjusted_split_ratio(parent, false).parts_per_thousand(),
-            550
-        );
+        assert_eq!(split_ratio_at(geometry, 780.).parts_per_thousand(), 700);
+        assert_eq!(split_ratio_at(geometry, 0.).parts_per_thousand(), 100);
+        assert_eq!(split_ratio_at(geometry, 2_000.).parts_per_thousand(), 900);
     }
 
     #[test]

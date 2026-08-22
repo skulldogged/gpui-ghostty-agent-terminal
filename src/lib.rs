@@ -13,6 +13,8 @@ mod terminal_frame;
 mod terminal_grid;
 #[cfg(feature = "gui")]
 mod terminal_session;
+#[cfg(feature = "gui")]
+mod ui_shell;
 #[cfg(all(feature = "gui", windows))]
 mod windows_pty;
 
