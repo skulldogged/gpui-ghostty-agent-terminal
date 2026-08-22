@@ -125,11 +125,21 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    #[cfg(test)]
     pub fn spawn(size: TerminalSize) -> Result<(Self, TerminalEvents), String> {
+        let working_directory = std::env::current_dir()
+            .map_err(|error| format!("resolve terminal working directory: {error}"))?;
+        Self::spawn_in(size, &working_directory)
+    }
+
+    pub(crate) fn spawn_in(
+        size: TerminalSize,
+        working_directory: &std::path::Path,
+    ) -> Result<(Self, TerminalEvents), String> {
         let size = size.validate()?;
         let terminal = ghostty::Terminal::new(size.cols, size.rows)?;
         let (events_tx, events_rx) = flume::bounded(1);
-        let (process, output) = PtySession::spawn(size.pty_size(), events_tx)?;
+        let (process, output) = PtySession::spawn(size.pty_size(), working_directory, events_tx)?;
         Ok((
             Self {
                 terminal,
