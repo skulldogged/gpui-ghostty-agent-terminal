@@ -1,6 +1,7 @@
 use agent_terminal::{
-    ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, SemanticEventKind,
-    TerminalLifecycle, TerminalSize,
+    ControlLeaseDenial, CoreClient, CoreCommand, CoreCommandError, CoreEndpoint, CoreModelError,
+    CreatedResource, PaneLayout, SemanticEventKind, TerminalLifecycle, TerminalSessionId,
+    TerminalSize,
 };
 use std::{
     process::{Child, ChildStdin, Command, Stdio},
@@ -44,6 +45,177 @@ fn terminal_session_survives_ui_client_disconnect_and_reconnect() {
     wait_for_text(&mut second, "AFTER_UI_REATTACH");
     second.stop_resident_core().expect("stop Resident Core");
 
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn hierarchy_commands_run_multiple_terminals_and_reconnect_by_stable_id() {
+    let endpoint = isolated_endpoint("multiplexer-hierarchy");
+    let mut core = spawn_core(&endpoint);
+    let mut controller = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("attach controlling UI Client");
+    let first_terminal = controller
+        .active_terminal_session_id()
+        .expect("initial Terminal Session");
+    let initial_revision = controller.core_snapshot().revision;
+
+    let created = controller
+        .apply_core_command(CoreCommand::CreateSpace {
+            name: "Second Space".into(),
+            directory: std::env::current_dir().expect("current directory"),
+        })
+        .expect("create a second Space through Resident Core IPC");
+    let CreatedResource::Space {
+        terminal_session_id: second_terminal,
+        ..
+    } = created.created
+    else {
+        panic!("Space creation must identify its Terminal Session");
+    };
+    assert!(created.revision > initial_revision);
+    assert_eq!(created.snapshot.spaces.len(), 2);
+    assert_eq!(created.snapshot.terminal_sessions.len(), 2);
+    assert_eq!(
+        controller
+            .control_lease_for(second_terminal)
+            .expect("new Terminal Session has a Control Lease")
+            .controller,
+        Some(controller.client_id())
+    );
+
+    controller
+        .input_to(first_terminal, b"echo FIRST_MULTIPLEXED_TERMINAL\r")
+        .expect("write first Terminal Session");
+    controller
+        .input_to(second_terminal, b"echo SECOND_MULTIPLEXED_TERMINAL\r")
+        .expect("write second Terminal Session");
+    wait_for_terminal_text(
+        &mut controller,
+        first_terminal,
+        "FIRST_MULTIPLEXED_TERMINAL",
+    );
+    wait_for_terminal_text(
+        &mut controller,
+        second_terminal,
+        "SECOND_MULTIPLEXED_TERMINAL",
+    );
+
+    let mut stale_observer = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("attach observer to complete hierarchy");
+    assert_eq!(stale_observer.core_snapshot(), &created.snapshot);
+    let second_lease = controller
+        .transfer_terminal_control(second_terminal, stale_observer.client_id())
+        .expect("transfer only the second Terminal Session lease");
+    assert_eq!(second_lease.controller, Some(stale_observer.client_id()));
+    assert_eq!(
+        controller
+            .control_lease_for(first_terminal)
+            .expect("first Terminal Session lease remains available")
+            .controller,
+        Some(controller.client_id())
+    );
+    stale_observer
+        .refresh_control_lease_for(second_terminal)
+        .expect("observer refreshes second Terminal Session lease");
+    stale_observer
+        .input_to(second_terminal, b"echo INDEPENDENT_SECOND_LEASE\r")
+        .expect("observer controls only the transferred Terminal Session");
+    assert!(matches!(
+        stale_observer.input_to(first_terminal, b"echo MUST_NOT_REACH_FIRST\r"),
+        Err(CoreCommandError::ControlLeaseDenied {
+            reason: ControlLeaseDenial::HeldByOther,
+            ..
+        })
+    ));
+    wait_for_terminal_text(
+        &mut stale_observer,
+        second_terminal,
+        "INDEPENDENT_SECOND_LEASE",
+    );
+    controller
+        .apply_core_command(CoreCommand::RenameSpace {
+            space_id: created.snapshot.spaces[1].id,
+            name: "Renamed Space".into(),
+        })
+        .expect("rename Space");
+    assert!(matches!(
+        stale_observer.apply_core_command(CoreCommand::RenameSpace {
+            space_id: created.snapshot.spaces[1].id,
+            name: "Stale Rename".into(),
+        }),
+        Err(CoreCommandError::Rejected(
+            CoreModelError::StaleRevision { .. }
+        ))
+    ));
+    stale_observer
+        .refresh_core_snapshot()
+        .expect("observer resnapshots after structured stale rejection");
+    drop(stale_observer);
+    drop(controller);
+
+    assert!(
+        core.0.try_wait().expect("inspect Resident Core").is_none(),
+        "Resident Core exited when every UI Client detached"
+    );
+    let mut reattached = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("reattach to multiplexed Resident Core");
+    assert_eq!(reattached.core_snapshot().spaces.len(), 2);
+    wait_for_terminal_text(
+        &mut reattached,
+        first_terminal,
+        "FIRST_MULTIPLEXED_TERMINAL",
+    );
+    wait_for_terminal_text(
+        &mut reattached,
+        second_terminal,
+        "SECOND_MULTIPLEXED_TERMINAL",
+    );
+    reattached.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn an_empty_hierarchy_can_reconnect_and_create_a_new_space() {
+    let endpoint = isolated_endpoint("empty-hierarchy");
+    let mut core = spawn_core(&endpoint);
+    let mut client =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
+    let pane_id = match &client.core_snapshot().spaces[0].tabs[0].layout {
+        PaneLayout::Pane(pane) => pane.id,
+        PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+    };
+    client
+        .apply_core_command(CoreCommand::ClosePane { pane_id })
+        .expect("close the final Pane");
+    assert!(client.core_snapshot().spaces.is_empty());
+    assert_eq!(client.active_terminal_session_id(), None);
+    drop(client);
+
+    let mut reattached = CoreClient::connect(&endpoint, Duration::from_secs(10))
+        .expect("reattach to an empty hierarchy");
+    assert!(reattached.core_snapshot().spaces.is_empty());
+    let created = reattached
+        .apply_core_command(CoreCommand::CreateSpace {
+            name: "Recreated".into(),
+            directory: std::env::current_dir().expect("current directory"),
+        })
+        .expect("create a Space from the empty state");
+    let CreatedResource::Space {
+        terminal_session_id,
+        ..
+    } = created.created
+    else {
+        panic!("Space creation must identify its Terminal Session");
+    };
+    assert_eq!(
+        reattached.active_terminal_session_id(),
+        Some(terminal_session_id)
+    );
+    reattached
+        .input(b"echo RECREATED_AFTER_EMPTY\r")
+        .expect("new Terminal Session is controllable");
+    wait_for_text(&mut reattached, "RECREATED_AFTER_EMPTY");
+    reattached.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
 }
 
@@ -106,6 +278,10 @@ fn terminal_changes_wake_the_ui_client_without_snapshot_polling() {
         .snapshot_since(initial.revision)
         .expect("fetch changed terminal snapshot")
         .expect("terminal changed after pushed invalidation");
+    assert_eq!(
+        Some(change.terminal_session_id),
+        client.active_terminal_session_id()
+    );
     assert!(snapshot.revision >= change.terminal_revision);
     wait_for_text(&mut client, "PUSHED_TERMINAL_CHANGE");
     client.stop_resident_core().expect("stop Resident Core");
@@ -121,10 +297,13 @@ fn observer_can_attach_and_receive_an_explicit_control_lease_transfer() {
     let mut observer =
         CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach observer UI Client");
 
-    let initial_lease = controller.control_lease().clone();
+    let initial_lease = controller
+        .control_lease()
+        .expect("active Control Lease")
+        .clone();
     let initial_generation = initial_lease.generation;
     assert_eq!(initial_lease.controller, Some(controller.client_id()));
-    assert_eq!(observer.control_lease(), &initial_lease);
+    assert_eq!(observer.control_lease(), Some(&initial_lease));
     observer
         .snapshot()
         .expect("observer reads terminal snapshot");
@@ -191,7 +370,7 @@ fn control_lease_changes_are_delivered_as_ordered_semantic_events() {
             lease: transferred.clone(),
         }
     );
-    assert_eq!(observer.control_lease(), &transferred);
+    assert_eq!(observer.control_lease(), Some(&transferred));
     let controller_first = controller
         .wait_for_semantic_event(Duration::from_secs(10))
         .expect("wait for controller's first semantic event")
@@ -230,7 +409,10 @@ fn observer_can_acquire_the_control_lease_after_controller_detaches() {
             .expect_err("held Control Lease must not be stolen"),
         CoreCommandError::ControlLeaseDenied {
             reason: ControlLeaseDenial::HeldByOther,
-            lease: controller.control_lease().clone(),
+            lease: controller
+                .control_lease()
+                .expect("active Control Lease")
+                .clone(),
         }
     );
     drop(controller);
@@ -243,7 +425,7 @@ fn observer_can_acquire_the_control_lease_after_controller_detaches() {
         SemanticEventKind::ControlLeaseChanged { lease } if lease.controller.is_none() => lease,
         event => panic!("expected vacant Control Lease event, got {event:?}"),
     };
-    assert_eq!(observer.control_lease(), &vacant);
+    assert_eq!(observer.control_lease(), Some(&vacant));
 
     assert_eq!(
         observer
@@ -375,6 +557,7 @@ fn snapshots_report_revisions_and_terminal_exit() {
         SemanticEventKind::TerminalLifecycleChanged {
             lifecycle: TerminalLifecycle::Exited,
             terminal_revision,
+            ..
         } => terminal_revision,
         event => panic!("expected Terminal Session exit event, got {event:?}"),
     };
@@ -519,9 +702,22 @@ fn wait_for_snapshot_after(
 }
 
 fn wait_for_text(client: &mut CoreClient, marker: &str) {
+    let terminal_session_id = client
+        .active_terminal_session_id()
+        .expect("active Terminal Session");
+    wait_for_terminal_text(client, terminal_session_id, marker);
+}
+
+fn wait_for_terminal_text(
+    client: &mut CoreClient,
+    terminal_session_id: TerminalSessionId,
+    marker: &str,
+) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let snapshot = client.snapshot().expect("snapshot Terminal Session");
+        let snapshot = client
+            .terminal_snapshot(terminal_session_id)
+            .expect("snapshot Terminal Session");
         let visual_rows = snapshot.text();
         let unwrapped = visual_rows.lines().collect::<String>();
         if unwrapped.contains(marker) {

@@ -31,9 +31,10 @@ pub use core_model::{
 };
 #[cfg(feature = "gui")]
 pub use resident_core::{
-    ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreEndpoint, SemanticEvent,
-    SemanticEventKind, TerminalCell, TerminalChange, TerminalLifecycle, TerminalSnapshot,
-    UiClientId, run_resident_core, stop_resident_core_after_parent,
+    ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreCommandOutcome,
+    CoreEndpoint, SemanticEvent, SemanticEventKind, TerminalCell, TerminalChange,
+    TerminalLifecycle, TerminalSnapshot, UiClientId, run_resident_core,
+    stop_resident_core_after_parent,
 };
 #[cfg(feature = "gui")]
 pub use terminal_session::TerminalSize;
