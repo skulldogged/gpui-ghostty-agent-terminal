@@ -1,5 +1,5 @@
 use crate::{
-    CoreClient, TerminalLifecycle, TerminalSize, TerminalSnapshot,
+    CoreClient, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
@@ -17,9 +17,18 @@ const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
 pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, String> {
     let terminal_font = TerminalFont::resolve(cx)?;
-    let mut core = CoreClient::connect_or_spawn()?;
-    let snapshot = core.snapshot()?;
-    let driver = CoreDriver::start(core, snapshot.revision)?;
+    let core = CoreClient::connect_or_spawn()?;
+    let (driver, mut projection) = CoreDriver::start(core)?;
+    let terminal_session_id = projection
+        .hierarchy
+        .terminal_sessions
+        .first()
+        .map(|session| session.id)
+        .ok_or_else(|| "the initial hierarchy has no Terminal Session".to_string())?;
+    let snapshot = projection
+        .terminals
+        .remove(&terminal_session_id)
+        .ok_or_else(|| "the initial Terminal Session has no rendered snapshot".to_string())?;
     let terminal_error = lifecycle_message(&snapshot.lifecycle);
     let bounds = Bounds::centered(None, size(px(900.), px(560.)), cx);
     let window = cx
@@ -33,6 +42,7 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
                 focus.focus(window, cx);
                 let view = cx.new(|_| TerminalView {
                     driver,
+                    terminal_session_id,
                     snapshot,
                     focus,
                     refresh_task: Task::ready(()),
@@ -58,6 +68,7 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
 
 struct TerminalView {
     driver: CoreDriver,
+    terminal_session_id: TerminalSessionId,
     snapshot: TerminalSnapshot,
     focus: FocusHandle,
     refresh_task: Task<()>,
@@ -173,7 +184,10 @@ impl TerminalView {
             timer.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |view, _cx| {
-                    if let Err(error) = view.driver.input(b"echo WINDOWS_CONPTY_LIVE\r".to_vec()) {
+                    if let Err(error) = view.driver.input_to(
+                        view.terminal_session_id,
+                        b"echo WINDOWS_CONPTY_LIVE\r".to_vec(),
+                    ) {
                         view.terminal_error = Some(error);
                     }
                 });
@@ -191,10 +205,29 @@ impl TerminalView {
                 };
                 this.update(cx, move |view, cx| {
                     match update {
-                        DriverUpdate::Snapshot(snapshot) => {
+                        DriverUpdate::Terminal {
+                            terminal_session_id,
+                            snapshot,
+                        } if terminal_session_id == view.terminal_session_id => {
                             view.terminal_error = lifecycle_message(&snapshot.lifecycle);
                             view.snapshot = snapshot;
                         }
+                        DriverUpdate::Projection(mut projection) => {
+                            if let Some(terminal_session_id) = projection
+                                .hierarchy
+                                .terminal_sessions
+                                .first()
+                                .map(|session| session.id)
+                                && let Some(snapshot) =
+                                    projection.terminals.remove(&terminal_session_id)
+                            {
+                                view.terminal_session_id = terminal_session_id;
+                                view.terminal_error = lifecycle_message(&snapshot.lifecycle);
+                                view.snapshot = snapshot;
+                                view.requested_size = None;
+                            }
+                        }
+                        DriverUpdate::Terminal { .. } | DriverUpdate::Hierarchy(_) => {}
                         DriverUpdate::Error(error) => view.terminal_error = Some(error),
                     }
                     cx.notify();
@@ -205,7 +238,7 @@ impl TerminalView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
-            if let Err(error) = self.driver.input(bytes) {
+            if let Err(error) = self.driver.input_to(self.terminal_session_id, bytes) {
                 self.terminal_error = Some(error);
                 cx.notify();
             }
@@ -260,7 +293,10 @@ impl Render for TerminalView {
             self.terminal_font.cells.height_px,
         );
         if self.requested_size != Some(desired_size) {
-            match self.driver.resize(desired_size) {
+            match self
+                .driver
+                .resize_terminal(self.terminal_session_id, desired_size)
+            {
                 Ok(()) => self.requested_size = Some(desired_size),
                 Err(error) => self.terminal_error = Some(error),
             }

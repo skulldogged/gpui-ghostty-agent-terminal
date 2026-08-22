@@ -1,9 +1,13 @@
 use crate::{
-    CoreClient, SemanticEvent, SemanticEventKind, TerminalChange, TerminalSize, TerminalSnapshot,
+    CoreClient, CoreSnapshot, SemanticEvent, SemanticEventKind, TerminalChange, TerminalSessionId,
+    TerminalSize, TerminalSnapshot,
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const COMMAND_CAPACITY: usize = 256;
@@ -14,8 +18,19 @@ pub(crate) struct CoreDriver {
     counters: Arc<DriverCounters>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoreProjection {
+    pub hierarchy: CoreSnapshot,
+    pub terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
+}
+
 pub(crate) enum DriverUpdate {
-    Snapshot(TerminalSnapshot),
+    Projection(CoreProjection),
+    Hierarchy(CoreSnapshot),
+    Terminal {
+        terminal_session_id: TerminalSessionId,
+        snapshot: TerminalSnapshot,
+    },
     Error(String),
 }
 
@@ -35,23 +50,146 @@ struct DriverCounters {
 
 #[derive(Clone)]
 pub(crate) struct DriverUpdates {
-    receiver: flume::Receiver<DriverUpdate>,
+    state: Arc<Mutex<DriverUpdateState>>,
+    wakes: flume::Receiver<()>,
+    wake: flume::Sender<()>,
+}
+
+#[derive(Default)]
+struct DriverUpdateState {
+    projection: Option<CoreProjection>,
+    hierarchy: Option<CoreSnapshot>,
+    terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
+    error: Option<String>,
+    stopped: bool,
+}
+
+struct DriverUpdatePublisher {
+    state: Arc<Mutex<DriverUpdateState>>,
+    wake: flume::Sender<()>,
 }
 
 impl DriverUpdates {
     pub(crate) async fn next(&self) -> Option<DriverUpdate> {
-        self.receiver.recv_async().await.ok()
+        loop {
+            if let Some(update) = self.take_pending() {
+                return Some(update);
+            }
+            if self.is_stopped() {
+                return None;
+            }
+            if self.wakes.recv_async().await.is_err() {
+                return None;
+            }
+        }
     }
 
     #[cfg(test)]
     fn recv_timeout(&self, timeout: std::time::Duration) -> Option<DriverUpdate> {
-        self.receiver.recv_timeout(timeout).ok()
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(update) = self.take_pending() {
+                return Some(update);
+            }
+            if self.is_stopped() {
+                return None;
+            }
+            self.wakes
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .ok()?;
+        }
+    }
+
+    fn take_pending(&self) -> Option<DriverUpdate> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("UI Core driver update mutex poisoned");
+        let update = if let Some(projection) = state.projection.take() {
+            Some(DriverUpdate::Projection(projection))
+        } else if let Some(hierarchy) = state.hierarchy.take() {
+            Some(DriverUpdate::Hierarchy(hierarchy))
+        } else if let Some(error) = state.error.take() {
+            Some(DriverUpdate::Error(error))
+        } else {
+            let terminal_session_id = state.terminals.keys().copied().min()?;
+            let snapshot = state
+                .terminals
+                .remove(&terminal_session_id)
+                .expect("selected pending Terminal Session exists");
+            Some(DriverUpdate::Terminal {
+                terminal_session_id,
+                snapshot,
+            })
+        };
+        if state.has_pending() {
+            let _ = self.wake.try_send(());
+        }
+        update
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.state
+            .lock()
+            .expect("UI Core driver update mutex poisoned")
+            .stopped
+    }
+}
+
+impl DriverUpdateState {
+    fn has_pending(&self) -> bool {
+        self.projection.is_some()
+            || self.hierarchy.is_some()
+            || !self.terminals.is_empty()
+            || self.error.is_some()
+    }
+}
+
+impl DriverUpdatePublisher {
+    fn publish(&self, update: DriverUpdate) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("UI Core driver update mutex poisoned");
+        match update {
+            DriverUpdate::Projection(projection) => {
+                state.hierarchy = None;
+                state.terminals.clear();
+                state.projection = Some(projection);
+            }
+            DriverUpdate::Hierarchy(hierarchy) => state.hierarchy = Some(hierarchy),
+            DriverUpdate::Terminal {
+                terminal_session_id,
+                snapshot,
+            } => {
+                state.terminals.insert(terminal_session_id, snapshot);
+            }
+            DriverUpdate::Error(error) => state.error = Some(error),
+        }
+        drop(state);
+        let _ = self.wake.try_send(());
+    }
+}
+
+impl Drop for DriverUpdatePublisher {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("UI Core driver update mutex poisoned")
+            .stopped = true;
+        let _ = self.wake.try_send(());
     }
 }
 
 enum Command {
-    Input(Vec<u8>),
-    Resize(TerminalSize),
+    Input {
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        terminal_session_id: TerminalSessionId,
+        size: TerminalSize,
+    },
 }
 
 enum DriverEvent {
@@ -61,13 +199,26 @@ enum DriverEvent {
 }
 
 impl CoreDriver {
-    pub(crate) fn start(core: CoreClient, revision: u64) -> Result<Self, String> {
-        if core.active_terminal_session_id().is_none() {
-            return Err("cannot start a terminal driver without an active Terminal Session".into());
-        }
+    pub(crate) fn start(mut core: CoreClient) -> Result<(Self, CoreProjection), String> {
+        let projection = load_projection(&mut core)?;
+        let revisions = projection
+            .terminals
+            .iter()
+            .map(|(&terminal_session_id, snapshot)| (terminal_session_id, snapshot.revision))
+            .collect();
+        let hierarchy_revision = projection.hierarchy.revision;
         let (commands_tx, commands_rx) = flume::bounded(COMMAND_CAPACITY);
-        let (updates_tx, updates_rx) = flume::bounded(1);
-        let stale_updates = updates_rx.clone();
+        let (wake_tx, wake_rx) = flume::bounded(1);
+        let state = Arc::new(Mutex::new(DriverUpdateState::default()));
+        let updates = DriverUpdates {
+            state: Arc::clone(&state),
+            wakes: wake_rx,
+            wake: wake_tx.clone(),
+        };
+        let publisher = DriverUpdatePublisher {
+            state,
+            wake: wake_tx,
+        };
         let counters = Arc::new(DriverCounters::default());
         let worker_counters = Arc::clone(&counters);
         std::thread::Builder::new()
@@ -75,29 +226,44 @@ impl CoreDriver {
             .spawn(move || {
                 run_driver(
                     core,
-                    revision,
+                    hierarchy_revision,
+                    revisions,
                     commands_rx,
-                    updates_tx,
-                    stale_updates,
+                    publisher,
                     worker_counters,
                 )
             })
             .map_err(|error| format!("spawn UI Core driver: {error}"))?;
-        Ok(Self {
-            commands: commands_tx,
-            updates: DriverUpdates {
-                receiver: updates_rx,
+        Ok((
+            Self {
+                commands: commands_tx,
+                updates,
+                counters,
             },
-            counters,
+            projection,
+        ))
+    }
+
+    pub(crate) fn input_to(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        self.send(Command::Input {
+            terminal_session_id,
+            bytes,
         })
     }
 
-    pub(crate) fn input(&self, bytes: Vec<u8>) -> Result<(), String> {
-        self.send(Command::Input(bytes))
-    }
-
-    pub(crate) fn resize(&self, size: TerminalSize) -> Result<(), String> {
-        self.send(Command::Resize(size))
+    pub(crate) fn resize_terminal(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        size: TerminalSize,
+    ) -> Result<(), String> {
+        self.send(Command::Resize {
+            terminal_session_id,
+            size,
+        })
     }
 
     pub(crate) fn updates(&self) -> DriverUpdates {
@@ -136,15 +302,12 @@ impl Drop for CoreDriver {
 
 fn run_driver(
     mut core: CoreClient,
-    mut revision: u64,
+    mut hierarchy_revision: u64,
+    mut revisions: HashMap<TerminalSessionId, u64>,
     commands: flume::Receiver<Command>,
-    updates: flume::Sender<DriverUpdate>,
-    stale_updates: flume::Receiver<DriverUpdate>,
+    updates: DriverUpdatePublisher,
     counters: Arc<DriverCounters>,
 ) {
-    let mut terminal_session_id = core
-        .active_terminal_session_id()
-        .expect("CoreDriver starts only with an active Terminal Session");
     let mut terminal_changes = core.terminal_changes();
     let mut semantic_events = core.semantic_events();
     loop {
@@ -153,129 +316,111 @@ fn run_driver(
             .recv(&terminal_changes, DriverEvent::TerminalChanged)
             .recv(&semantic_events, DriverEvent::Semantic)
             .wait();
-        let (result, reconnect) = match event {
+        let result = match event {
             DriverEvent::Command(Err(_)) => break,
-            DriverEvent::Command(Ok(Command::Input(bytes))) => {
-                let result = core
-                    .input(&bytes)
-                    .map(|()| None)
-                    .map_err(|error| error.to_string());
-                let reconnect = result
-                    .as_ref()
-                    .is_err_and(|error| is_connection_failure(error));
-                (result, reconnect)
-            }
-            DriverEvent::Command(Ok(Command::Resize(size))) => {
-                let result = core
-                    .resize(size)
-                    .map(|()| None)
-                    .map_err(|error| error.to_string());
-                let reconnect = result
-                    .as_ref()
-                    .is_err_and(|error| is_connection_failure(error));
-                (result, reconnect)
-            }
+            DriverEvent::Command(Ok(Command::Input {
+                terminal_session_id,
+                bytes,
+            })) => core
+                .input_to(terminal_session_id, &bytes)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::Resize {
+                terminal_session_id,
+                size,
+            })) => core
+                .resize_terminal(terminal_session_id, size)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
             DriverEvent::TerminalChanged(Ok(change)) => {
-                if change.terminal_session_id != terminal_session_id {
-                    continue;
-                }
                 counters.pushed_changes.fetch_add(1, Ordering::Relaxed);
-                if change.terminal_revision <= revision {
-                    continue;
-                }
-                counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
-                let result = core.snapshot_since(revision).map(|snapshot| {
-                    if let Some(snapshot) = &snapshot {
-                        revision = snapshot.revision;
-                    }
-                    snapshot.map(DriverUpdate::Snapshot)
-                });
-                let reconnect = result
-                    .as_ref()
-                    .is_err_and(|error| is_connection_failure(error));
-                (result, reconnect)
+                refresh_terminal(
+                    &mut core,
+                    change.terminal_session_id,
+                    change.terminal_revision,
+                    &mut revisions,
+                    &counters,
+                )
+                .map(|update| update.into_iter().collect())
             }
-            DriverEvent::TerminalChanged(Err(_)) => (
-                Err("Resident Core disconnected while waiting for a terminal change".into()),
-                true,
-            ),
+            DriverEvent::TerminalChanged(Err(_)) => {
+                Err("Resident Core disconnected while waiting for a terminal change".into())
+            }
             DriverEvent::Semantic(Ok(event)) => {
                 core.accept_semantic_event(&event);
-                let SemanticEventKind::TerminalLifecycleChanged {
-                    terminal_session_id: changed_terminal_session_id,
-                    terminal_revision,
-                    ..
-                } = event.kind
-                else {
-                    continue;
-                };
-                if changed_terminal_session_id != terminal_session_id {
-                    continue;
-                }
-                if terminal_revision <= revision {
-                    continue;
-                }
-                counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
-                let result = core.snapshot_since(revision).map(|snapshot| {
-                    if let Some(snapshot) = &snapshot {
-                        revision = snapshot.revision;
+                match event.kind {
+                    SemanticEventKind::TerminalLifecycleChanged {
+                        terminal_session_id,
+                        terminal_revision,
+                        ..
+                    } => refresh_terminal(
+                        &mut core,
+                        terminal_session_id,
+                        terminal_revision,
+                        &mut revisions,
+                        &counters,
+                    )
+                    .map(|update| update.into_iter().collect()),
+                    SemanticEventKind::HierarchyChanged { revision }
+                        if revision > hierarchy_revision =>
+                    {
+                        core.refresh_core_snapshot().and_then(|snapshot| {
+                            synchronize_hierarchy(
+                                &mut core,
+                                snapshot,
+                                &mut hierarchy_revision,
+                                &mut revisions,
+                                &counters,
+                            )
+                        })
                     }
-                    snapshot.map(DriverUpdate::Snapshot)
-                });
-                let reconnect = result
-                    .as_ref()
-                    .is_err_and(|error| is_connection_failure(error));
-                (result, reconnect)
+                    SemanticEventKind::ControlLeaseChanged { .. }
+                    | SemanticEventKind::HierarchyChanged { .. } => Ok(Vec::new()),
+                }
             }
-            DriverEvent::Semantic(Err(_)) => (
-                Err("Resident Core disconnected while waiting for a semantic event".into()),
-                true,
-            ),
+            DriverEvent::Semantic(Err(_)) => {
+                Err("Resident Core disconnected while waiting for a semantic event".into())
+            }
         };
+
         match result {
-            Ok(Some(update)) => {
-                counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
-                publish_latest(&updates, &stale_updates, update);
+            Ok(pending) => {
+                for update in pending {
+                    updates.publish(update);
+                }
             }
-            Ok(None) => {}
             Err(error) => {
-                publish_latest(&updates, &stale_updates, DriverUpdate::Error(error));
+                let reconnect = is_connection_failure(&error);
+                updates.publish(DriverUpdate::Error(error));
                 if !reconnect {
                     continue;
                 }
                 let recovered = CoreClient::connect_or_spawn().and_then(|mut replacement| {
-                    let snapshot = replacement.snapshot()?;
-                    Ok((replacement, snapshot))
+                    let projection = load_projection(&mut replacement)?;
+                    Ok((replacement, projection))
                 });
                 match recovered {
-                    Ok((replacement, snapshot)) => {
+                    Ok((replacement, projection)) => {
                         terminal_changes = replacement.terminal_changes();
                         semantic_events = replacement.semantic_events();
+                        hierarchy_revision = projection.hierarchy.revision;
+                        revisions = projection
+                            .terminals
+                            .iter()
+                            .map(|(&terminal_session_id, snapshot)| {
+                                (terminal_session_id, snapshot.revision)
+                            })
+                            .collect();
                         core = replacement;
-                        let Some(reconnected_terminal_session_id) =
-                            core.active_terminal_session_id()
-                        else {
-                            publish_latest(
-                                &updates,
-                                &stale_updates,
-                                DriverUpdate::Error(
-                                    "Resident Core reconnected without an active Terminal Session"
-                                        .into(),
-                                ),
-                            );
-                            break;
-                        };
-                        terminal_session_id = reconnected_terminal_session_id;
-                        revision = snapshot.revision;
-                        counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
-                        publish_latest(&updates, &stale_updates, DriverUpdate::Snapshot(snapshot));
+                        counters
+                            .snapshots_published
+                            .fetch_add(projection.terminals.len() as u64, Ordering::Relaxed);
+                        updates.publish(DriverUpdate::Projection(projection));
                     }
                     Err(error) => {
-                        publish_latest(
-                            &updates,
-                            &stale_updates,
-                            DriverUpdate::Error(format!("Resident Core reconnect failed: {error}")),
-                        );
+                        updates.publish(DriverUpdate::Error(format!(
+                            "Resident Core reconnect failed: {error}"
+                        )));
                         break;
                     }
                 }
@@ -284,28 +429,102 @@ fn run_driver(
     }
 }
 
+fn load_projection(core: &mut CoreClient) -> Result<CoreProjection, String> {
+    let hierarchy = core.core_snapshot().clone();
+    let terminal_ids = hierarchy
+        .terminal_sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    let mut terminals = HashMap::with_capacity(terminal_ids.len());
+    for terminal_session_id in terminal_ids {
+        terminals.insert(
+            terminal_session_id,
+            core.terminal_snapshot(terminal_session_id)?,
+        );
+    }
+    Ok(CoreProjection {
+        hierarchy,
+        terminals,
+    })
+}
+
+fn synchronize_hierarchy(
+    core: &mut CoreClient,
+    snapshot: CoreSnapshot,
+    hierarchy_revision: &mut u64,
+    revisions: &mut HashMap<TerminalSessionId, u64>,
+    counters: &DriverCounters,
+) -> Result<Vec<DriverUpdate>, String> {
+    *hierarchy_revision = snapshot.revision;
+    let terminal_ids = snapshot
+        .terminal_sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<HashSet<_>>();
+    revisions.retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+    let mut updates = vec![DriverUpdate::Hierarchy(snapshot)];
+    let mut new_terminals = terminal_ids
+        .into_iter()
+        .filter(|terminal_session_id| !revisions.contains_key(terminal_session_id))
+        .collect::<Vec<_>>();
+    new_terminals.sort_unstable();
+    for terminal_session_id in new_terminals {
+        counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
+        let terminal = core.terminal_snapshot(terminal_session_id)?;
+        revisions.insert(terminal_session_id, terminal.revision);
+        counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
+        updates.push(DriverUpdate::Terminal {
+            terminal_session_id,
+            snapshot: terminal,
+        });
+    }
+    Ok(updates)
+}
+
+fn refresh_terminal(
+    core: &mut CoreClient,
+    terminal_session_id: TerminalSessionId,
+    announced_revision: u64,
+    revisions: &mut HashMap<TerminalSessionId, u64>,
+    counters: &DriverCounters,
+) -> Result<Option<DriverUpdate>, String> {
+    let Some(&revision) = revisions.get(&terminal_session_id) else {
+        return Ok(None);
+    };
+    if announced_revision <= revision {
+        return Ok(None);
+    }
+    counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
+    let Some(snapshot) = core.terminal_snapshot_since(terminal_session_id, revision)? else {
+        return Ok(None);
+    };
+    revisions.insert(terminal_session_id, snapshot.revision);
+    counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
+    Ok(Some(DriverUpdate::Terminal {
+        terminal_session_id,
+        snapshot,
+    }))
+}
+
 fn is_connection_failure(error: &str) -> bool {
     error.starts_with("send Resident Core command:")
         || error.starts_with("receive Resident Core response:")
         || error.starts_with("Resident Core disconnected")
 }
 
-fn publish_latest<T>(updates: &flume::Sender<T>, stale_updates: &flume::Receiver<T>, update: T) {
-    match updates.try_send(update) {
-        Ok(()) => {}
-        Err(flume::TrySendError::Full(update)) => {
-            let _ = stale_updates.try_recv();
-            let _ = updates.try_send(update);
-        }
-        Err(flume::TrySendError::Disconnected(_)) => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CoreDriver, DriverUpdate, is_connection_failure, publish_latest};
-    use crate::{CoreClient, CoreEndpoint, run_resident_core};
+    use super::{
+        CoreDriver, DriverUpdate, DriverUpdatePublisher, DriverUpdateState, DriverUpdates,
+        is_connection_failure,
+    };
+    use crate::{
+        CoreClient, CoreCommand, CoreEndpoint, CreatedResource, TerminalLifecycle,
+        TerminalSessionId, TerminalSnapshot, run_resident_core,
+    };
     use std::{
+        sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -349,41 +568,32 @@ mod tests {
     #[test]
     fn terminal_output_reaches_the_view_without_snapshot_polling() {
         let core = TestCore::start("pushed-update");
-        let mut client =
+        let client =
             CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach UI Client");
-        let mut initial = client.snapshot().expect("take initial snapshot");
-        while client
-            .wait_for_terminal_change(Duration::from_millis(100))
-            .expect("wait for a quiet terminal baseline")
-            .is_some()
-        {
-            if let Some(snapshot) = client
-                .snapshot_since(initial.revision)
-                .expect("refresh terminal baseline")
-            {
-                initial = snapshot;
-            }
-        }
-        let driver = CoreDriver::start(client, initial.revision).expect("start UI Core driver");
+        let (driver, projection) = CoreDriver::start(client).expect("start UI Core driver");
+        let terminal_session_id = projection.hierarchy.terminal_sessions[0].id;
         let updates = driver.updates();
 
+        while updates.recv_timeout(Duration::from_millis(100)).is_some() {}
+        let idle = driver.stats();
         assert!(
             updates.recv_timeout(Duration::from_millis(100)).is_none(),
-            "an idle UI Core driver must not publish polling updates"
+            "a quiet UI Core driver must not publish polling updates"
         );
-        let idle = driver.stats();
-        assert_eq!(idle.snapshot_requests, 0);
-        assert_eq!(idle.snapshots_published, 0);
+        assert_eq!(driver.stats(), idle);
 
         driver
-            .input(b"echo DRIVER_PUSHED_UPDATE\r".to_vec())
+            .input_to(terminal_session_id, b"echo DRIVER_PUSHED_UPDATE\r".to_vec())
             .expect("send terminal input");
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match updates.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Some(DriverUpdate::Snapshot(snapshot))
-                    if snapshot.text().contains("DRIVER_PUSHED_UPDATE") =>
+                Some(DriverUpdate::Terminal {
+                    terminal_session_id: changed_terminal,
+                    snapshot,
+                }) if changed_terminal == terminal_session_id
+                    && snapshot.text().contains("DRIVER_PUSHED_UPDATE") =>
                 {
                     break;
                 }
@@ -399,14 +609,86 @@ mod tests {
     }
 
     #[test]
-    fn slow_views_receive_only_the_latest_coalescible_update() {
-        let (sender, receiver) = flume::bounded(1);
-        publish_latest(&sender, &receiver, 1);
-        publish_latest(&sender, &receiver, 2);
-        publish_latest(&sender, &receiver, 3);
+    fn slow_views_keep_the_latest_snapshot_for_each_terminal() {
+        let (wake_tx, wake_rx) = flume::bounded(1);
+        let state = Arc::new(Mutex::new(DriverUpdateState::default()));
+        let updates = DriverUpdates {
+            state: Arc::clone(&state),
+            wakes: wake_rx,
+            wake: wake_tx.clone(),
+        };
+        let publisher = DriverUpdatePublisher {
+            state,
+            wake: wake_tx,
+        };
+        let first = TerminalSessionId::from_u64(1);
+        let second = TerminalSessionId::from_u64(2);
+        publisher.publish(terminal_update(first, 1));
+        publisher.publish(terminal_update(second, 1));
+        publisher.publish(terminal_update(first, 3));
 
-        assert_eq!(receiver.recv().unwrap(), 3);
-        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(1)),
+            Some(DriverUpdate::Terminal {
+                terminal_session_id,
+                snapshot
+            }) if terminal_session_id == first && snapshot.revision == 3
+        ));
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(1)),
+            Some(DriverUpdate::Terminal {
+                terminal_session_id,
+                snapshot
+            }) if terminal_session_id == second && snapshot.revision == 1
+        ));
+        assert!(updates.recv_timeout(Duration::from_millis(10)).is_none());
+    }
+
+    #[test]
+    fn hierarchy_events_add_independent_terminal_projections() {
+        let core = TestCore::start("hierarchy-update");
+        let client =
+            CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach UI Client");
+        let (driver, initial) = CoreDriver::start(client).expect("start UI Core driver");
+        let updates = driver.updates();
+        let mut mutator =
+            CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach mutator");
+        let created = mutator
+            .apply_core_command(CoreCommand::CreateSpace {
+                name: "Driver Space".into(),
+                directory: std::env::current_dir().expect("current directory"),
+            })
+            .expect("create Space through another attached UI Client");
+        let CreatedResource::Space {
+            terminal_session_id,
+            ..
+        } = created.created
+        else {
+            panic!("Space creation must identify its Terminal Session");
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_hierarchy = false;
+        let mut saw_terminal = false;
+        while Instant::now() < deadline && !(saw_hierarchy && saw_terminal) {
+            match updates.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Some(DriverUpdate::Hierarchy(snapshot)) => {
+                    saw_hierarchy = snapshot.revision == created.revision
+                        && snapshot.spaces.len() == initial.hierarchy.spaces.len() + 1;
+                }
+                Some(DriverUpdate::Terminal {
+                    terminal_session_id: projected,
+                    ..
+                }) => saw_terminal |= projected == terminal_session_id,
+                Some(DriverUpdate::Error(error)) => panic!("UI Core driver failed: {error}"),
+                Some(DriverUpdate::Projection(_)) | None => {}
+            }
+        }
+        assert!(saw_hierarchy, "driver did not publish the new hierarchy");
+        assert!(
+            saw_terminal,
+            "driver did not project the new Terminal Session"
+        );
     }
 
     #[test]
@@ -415,5 +697,21 @@ mod tests {
         assert!(is_connection_failure(
             "receive Resident Core response: connection reset"
         ));
+    }
+
+    fn terminal_update(terminal_session_id: TerminalSessionId, revision: u64) -> DriverUpdate {
+        DriverUpdate::Terminal {
+            terminal_session_id,
+            snapshot: TerminalSnapshot {
+                revision,
+                lifecycle: TerminalLifecycle::Running,
+                cols: 1,
+                rows: 1,
+                cursor: None,
+                default_fg: [0xdd; 3],
+                default_bg: [0x11; 3],
+                cells: Vec::new(),
+            },
+        }
     }
 }
