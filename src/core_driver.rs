@@ -1,6 +1,6 @@
 use crate::{
-    CoreClient, CoreSnapshot, SemanticEvent, SemanticEventKind, TerminalChange, TerminalSessionId,
-    TerminalSize, TerminalSnapshot,
+    CoreClient, CoreCommand, CoreCommandOutcome, CoreSnapshot, SemanticEvent, SemanticEventKind,
+    TerminalChange, TerminalSessionId, TerminalSize, TerminalSnapshot,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -27,6 +27,7 @@ pub(crate) struct CoreProjection {
 pub(crate) enum DriverUpdate {
     Projection(CoreProjection),
     Hierarchy(CoreSnapshot),
+    CommandAccepted(CoreCommandOutcome),
     Terminal {
         terminal_session_id: TerminalSessionId,
         snapshot: TerminalSnapshot,
@@ -59,6 +60,7 @@ pub(crate) struct DriverUpdates {
 struct DriverUpdateState {
     projection: Option<CoreProjection>,
     hierarchy: Option<CoreSnapshot>,
+    command_outcome: Option<CoreCommandOutcome>,
     terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
     error: Option<String>,
     stopped: bool,
@@ -109,6 +111,8 @@ impl DriverUpdates {
             Some(DriverUpdate::Projection(projection))
         } else if let Some(hierarchy) = state.hierarchy.take() {
             Some(DriverUpdate::Hierarchy(hierarchy))
+        } else if let Some(outcome) = state.command_outcome.take() {
+            Some(DriverUpdate::CommandAccepted(outcome))
         } else if let Some(error) = state.error.take() {
             Some(DriverUpdate::Error(error))
         } else {
@@ -140,6 +144,7 @@ impl DriverUpdateState {
     fn has_pending(&self) -> bool {
         self.projection.is_some()
             || self.hierarchy.is_some()
+            || self.command_outcome.is_some()
             || !self.terminals.is_empty()
             || self.error.is_some()
     }
@@ -158,6 +163,7 @@ impl DriverUpdatePublisher {
                 state.projection = Some(projection);
             }
             DriverUpdate::Hierarchy(hierarchy) => state.hierarchy = Some(hierarchy),
+            DriverUpdate::CommandAccepted(outcome) => state.command_outcome = Some(outcome),
             DriverUpdate::Terminal {
                 terminal_session_id,
                 snapshot,
@@ -182,6 +188,7 @@ impl Drop for DriverUpdatePublisher {
 }
 
 enum Command {
+    Apply(CoreCommand),
     Input {
         terminal_session_id: TerminalSessionId,
         bytes: Vec<u8>,
@@ -255,6 +262,10 @@ impl CoreDriver {
         })
     }
 
+    pub(crate) fn apply_core_command(&self, command: CoreCommand) -> Result<(), String> {
+        self.send(Command::Apply(command))
+    }
+
     pub(crate) fn resize_terminal(
         &self,
         terminal_session_id: TerminalSessionId,
@@ -318,6 +329,20 @@ fn run_driver(
             .wait();
         let result = match event {
             DriverEvent::Command(Err(_)) => break,
+            DriverEvent::Command(Ok(Command::Apply(command))) => core
+                .apply_core_command(command)
+                .map_err(|error| error.to_string())
+                .and_then(|outcome| {
+                    let mut pending = synchronize_hierarchy(
+                        &mut core,
+                        outcome.snapshot.clone(),
+                        &mut hierarchy_revision,
+                        &mut revisions,
+                        &counters,
+                    )?;
+                    pending.push(DriverUpdate::CommandAccepted(outcome));
+                    Ok(pending)
+                }),
             DriverEvent::Command(Ok(Command::Input {
                 terminal_session_id,
                 bytes,
@@ -681,7 +706,9 @@ mod tests {
                     ..
                 }) => saw_terminal |= projected == terminal_session_id,
                 Some(DriverUpdate::Error(error)) => panic!("UI Core driver failed: {error}"),
-                Some(DriverUpdate::Projection(_)) | None => {}
+                Some(DriverUpdate::Projection(_))
+                | Some(DriverUpdate::CommandAccepted(_))
+                | None => {}
             }
         }
         assert!(saw_hierarchy, "driver did not publish the new hierarchy");
@@ -689,6 +716,42 @@ mod tests {
             saw_terminal,
             "driver did not project the new Terminal Session"
         );
+    }
+
+    #[test]
+    fn commands_publish_the_created_resource_after_the_authoritative_hierarchy() {
+        let core = TestCore::start("command-outcome");
+        let client =
+            CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach UI Client");
+        let (driver, initial) = CoreDriver::start(client).expect("start UI Core driver");
+        let updates = driver.updates();
+        let space_id = initial.hierarchy.spaces[0].id;
+
+        driver
+            .apply_core_command(CoreCommand::CreateTab {
+                space_id,
+                name: "Created Tab".into(),
+            })
+            .expect("queue Core command");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut hierarchy_revision = None;
+        loop {
+            match updates.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Some(DriverUpdate::Hierarchy(snapshot)) => {
+                    hierarchy_revision = Some(snapshot.revision);
+                }
+                Some(DriverUpdate::CommandAccepted(outcome)) => {
+                    assert_eq!(hierarchy_revision, Some(outcome.revision));
+                    assert!(matches!(outcome.created, CreatedResource::Tab { .. }));
+                    break;
+                }
+                Some(DriverUpdate::Error(error)) => panic!("UI Core driver failed: {error}"),
+                Some(DriverUpdate::Projection(_)) | Some(DriverUpdate::Terminal { .. })
+                    if Instant::now() < deadline => {}
+                _ => panic!("UI Core driver did not publish the command outcome"),
+            }
+        }
     }
 
     #[test]

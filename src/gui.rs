@@ -1,6 +1,7 @@
 use crate::{
-    CoreClient, CoreSnapshot, PaneId, PaneLayout, SpaceId, SplitAxis, TabId, TerminalLifecycle,
-    TerminalSessionId, TerminalSize, TerminalSnapshot,
+    CoreClient, CoreCommand, CoreSnapshot, CreatedResource, PaneId, PaneLayout, SpaceId, SplitAxis,
+    SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId, TerminalSize,
+    TerminalSnapshot,
     core_driver::{CoreDriver, CoreProjection, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
@@ -53,6 +54,7 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
                     global_error: None,
                     terminal_font,
                     requested_sizes: HashMap::new(),
+                    pending_close: None,
                 });
                 view.update(cx, |view, cx| {
                     view.start_refresh_task(cx);
@@ -81,6 +83,7 @@ struct MultiplexerView {
     global_error: Option<String>,
     terminal_font: TerminalFont,
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
+    pending_close: Option<PaneId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,6 +261,21 @@ impl MultiplexerView {
                 self.hierarchy = hierarchy;
                 self.retain_live_terminals();
                 self.selection = self.selection.normalized(&self.hierarchy);
+                if self.pending_close.is_some_and(|pane_id| {
+                    !self
+                        .hierarchy
+                        .spaces
+                        .iter()
+                        .flat_map(|space| &space.tabs)
+                        .any(|tab| layout_contains_pane(&tab.layout, pane_id))
+                }) {
+                    self.pending_close = None;
+                }
+            }
+            DriverUpdate::CommandAccepted(outcome) => {
+                self.selection =
+                    selection_for_created(self.selection, &outcome.created, &self.hierarchy);
+                self.global_error = None;
             }
             DriverUpdate::Terminal {
                 terminal_session_id,
@@ -285,6 +303,7 @@ impl MultiplexerView {
             .collect();
         self.requested_sizes.clear();
         self.selection = self.selection.normalized(&self.hierarchy);
+        self.pending_close = None;
     }
 
     fn retain_live_terminals(&mut self) {
@@ -342,6 +361,7 @@ impl MultiplexerView {
         self.selection.tab_id = None;
         self.selection.pane_id = None;
         self.selection = self.selection.normalized(&self.hierarchy);
+        self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -350,14 +370,81 @@ impl MultiplexerView {
         self.selection.tab_id = Some(tab_id);
         self.selection.pane_id = None;
         self.selection = self.selection.normalized(&self.hierarchy);
+        self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         self.selection.pane_id = Some(pane_id);
+        self.pending_close = None;
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn submit_core_command(&mut self, command: CoreCommand, cx: &mut Context<Self>) {
+        match self.driver.apply_core_command(command) {
+            Ok(()) => self.global_error = None,
+            Err(error) => self.global_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn create_space(&mut self, cx: &mut Context<Self>) {
+        match std::env::current_dir() {
+            Ok(directory) => self.submit_core_command(
+                CoreCommand::CreateSpace {
+                    name: format!("Space {}", self.hierarchy.spaces.len() + 1),
+                    directory,
+                },
+                cx,
+            ),
+            Err(error) => {
+                self.global_error = Some(format!("locate current directory: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn create_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(space) = self.selected_space() else {
+            return;
+        };
+        self.submit_core_command(
+            CoreCommand::CreateTab {
+                space_id: space.id,
+                name: format!("Terminal {}", space.tabs.len() + 1),
+            },
+            cx,
+        );
+    }
+
+    fn split_focused_pane(&mut self, axis: SplitAxis, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.selection.pane_id else {
+            return;
+        };
+        self.submit_core_command(
+            CoreCommand::SplitPane {
+                pane_id,
+                axis,
+                placement: SplitPlacement::After,
+                ratio: SplitRatio::EQUAL,
+            },
+            cx,
+        );
+    }
+
+    fn request_close_focused_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.selection.pane_id else {
+            return;
+        };
+        if self.pending_close == Some(pane_id) {
+            self.pending_close = None;
+            self.submit_core_command(CoreCommand::ClosePane { pane_id }, cx);
+        } else {
+            self.pending_close = Some(pane_id);
+            cx.notify();
+        }
     }
 
     fn resize_visible_terminals(&mut self, viewport: gpui::Size<Pixels>) {
@@ -402,11 +489,28 @@ impl MultiplexerView {
             .gap_1()
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .px_2()
-                    .py_2()
+                    .py_1()
                     .text_size(px(12.))
                     .text_color(rgb(0x8993a4))
-                    .child("SPACES"),
+                    .child("SPACES")
+                    .child(
+                        div()
+                            .id("create-space")
+                            .cursor_pointer()
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0x273247))
+                            .text_color(rgb(0xdbe6f5))
+                            .on_click(
+                                cx.listener(|view, _event, _window, cx| view.create_space(cx)),
+                            )
+                            .child("+"),
+                    ),
             );
         for space in &self.hierarchy.spaces {
             let space_id = space.id;
@@ -441,7 +545,7 @@ impl MultiplexerView {
             .h(px(TAB_BAR_HEIGHT_PX))
             .w_full()
             .flex_none()
-            .items_end()
+            .items_center()
             .bg(rgb(0x151a23))
             .border_b_1()
             .border_color(rgb(0x2b3240))
@@ -471,6 +575,69 @@ impl MultiplexerView {
                         .child(tab.name.clone()),
                 );
             }
+            tabs = tabs
+                .child(
+                    div()
+                        .id("create-tab")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(0xb4bdca))
+                        .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx)))
+                        .child("+"),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("split-horizontal")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xb4bdca))
+                        .on_click(cx.listener(|view, _event, _window, cx| {
+                            view.split_focused_pane(SplitAxis::Horizontal, cx)
+                        }))
+                        .child("Split H"),
+                )
+                .child(
+                    div()
+                        .id("split-vertical")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xb4bdca))
+                        .on_click(cx.listener(|view, _event, _window, cx| {
+                            view.split_focused_pane(SplitAxis::Vertical, cx)
+                        }))
+                        .child("Split V"),
+                )
+                .child(
+                    div()
+                        .id("close-pane")
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(12.))
+                        .text_color(if self.pending_close == self.selection.pane_id {
+                            rgb(0xffb4b4)
+                        } else {
+                            rgb(0xb4bdca)
+                        })
+                        .on_click(cx.listener(|view, _event, _window, cx| {
+                            view.request_close_focused_pane(cx)
+                        }))
+                        .child(if self.pending_close == self.selection.pane_id {
+                            "Confirm close"
+                        } else {
+                            "Close"
+                        }),
+                );
         }
         tabs.into_any_element()
     }
@@ -744,6 +911,55 @@ impl Render for MultiplexerView {
     }
 }
 
+fn selection_for_created(
+    current: UiSelection,
+    created: &CreatedResource,
+    hierarchy: &CoreSnapshot,
+) -> UiSelection {
+    let selected = match created {
+        CreatedResource::None => current,
+        CreatedResource::Space {
+            space_id,
+            tab_id,
+            pane_id,
+            ..
+        } => UiSelection {
+            space_id: Some(*space_id),
+            tab_id: Some(*tab_id),
+            pane_id: Some(*pane_id),
+        },
+        CreatedResource::Tab {
+            tab_id, pane_id, ..
+        } => {
+            let space_id = hierarchy
+                .spaces
+                .iter()
+                .find(|space| space.tabs.iter().any(|tab| tab.id == *tab_id))
+                .map(|space| space.id);
+            UiSelection {
+                space_id,
+                tab_id: Some(*tab_id),
+                pane_id: Some(*pane_id),
+            }
+        }
+        CreatedResource::Pane { pane_id, .. } => {
+            let location = hierarchy.spaces.iter().find_map(|space| {
+                space
+                    .tabs
+                    .iter()
+                    .find(|tab| layout_contains_pane(&tab.layout, *pane_id))
+                    .map(|tab| (space.id, tab.id))
+            });
+            UiSelection {
+                space_id: location.map(|(space_id, _)| space_id),
+                tab_id: location.map(|(_, tab_id)| tab_id),
+                pane_id: Some(*pane_id),
+            }
+        }
+    };
+    selected.normalized(hierarchy)
+}
+
 fn pane_extents(
     layout: &PaneLayout,
     width: f32,
@@ -878,9 +1094,12 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{UiSelection, accept_terminal_snapshot, pane_extents, terminal_input_bytes};
+    use super::{
+        UiSelection, accept_terminal_snapshot, pane_extents, selection_for_created,
+        terminal_input_bytes,
+    };
     use crate::{
-        CoreCommand, CoreModel, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
+        CoreCommand, CoreModel, CreatedResource, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
         TerminalLifecycle, TerminalSnapshot,
     };
     use gpui::Keystroke;
@@ -1011,5 +1230,45 @@ mod tests {
         );
 
         assert!(!terminals.contains_key(&terminal_session_id));
+    }
+
+    #[test]
+    fn created_resources_become_the_client_local_selection() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let initial = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "Space".into(),
+                    directory,
+                },
+            )
+            .expect("create Space");
+        let first_pane = match &initial.snapshot.spaces[0].tabs[0].layout {
+            PaneLayout::Pane(pane) => pane.id,
+            PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+        };
+        let split = model
+            .apply(
+                initial.revision,
+                CoreCommand::SplitPane {
+                    pane_id: first_pane,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("split Pane");
+        let CreatedResource::Pane { pane_id, .. } = split.created else {
+            panic!("split must identify the new Pane");
+        };
+
+        let selection =
+            selection_for_created(UiSelection::default(), &split.created, &split.snapshot);
+
+        assert_eq!(selection.space_id, Some(split.snapshot.spaces[0].id));
+        assert_eq!(selection.tab_id, Some(split.snapshot.spaces[0].tabs[0].id));
+        assert_eq!(selection.pane_id, Some(pane_id));
     }
 }
