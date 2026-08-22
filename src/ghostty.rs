@@ -242,4 +242,27 @@ mod tests {
         assert_eq!(forced.dirty_rows, vec![0, 1, 2]);
         assert_eq!(forced.cells.len(), 24);
     }
+
+    #[test]
+    fn reverse_video_is_reported_as_an_explicit_background() {
+        let mut terminal = Terminal::new(4, 1).expect("create terminal");
+        terminal.feed(b"\x1b[7mX\x1b[0mY");
+
+        let snapshot = terminal.snapshot().expect("snapshot terminal");
+        let reversed = snapshot
+            .cells
+            .iter()
+            .find(|cell| cell.x == 0)
+            .expect("reversed cell");
+        let plain = snapshot
+            .cells
+            .iter()
+            .find(|cell| cell.x == 1)
+            .expect("plain cell");
+
+        assert!(reversed.has_explicit_bg);
+        assert_eq!(reversed.bg, snapshot.default_fg);
+        assert!(!plain.has_explicit_bg);
+        assert_eq!(plain.bg, snapshot.default_bg);
+    }
 }

@@ -4,7 +4,10 @@ use std::ops::Range;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalFrame {
     pub rows: Vec<FrameRow>,
-    pub backgrounds: Vec<BackgroundRun>,
+    // Default-background cells reveal the pane surface. These runs contain only
+    // explicit terminal backgrounds and cursor fills, which must stay opaque
+    // when the pane surface becomes translucent.
+    pub opaque_backgrounds: Vec<BackgroundRun>,
     pub cursor_overlay: Option<BackgroundRun>,
 }
 
@@ -63,7 +66,7 @@ impl TerminalFrame {
         }
 
         let mut rows = Vec::with_capacity(usize::from(snapshot.rows));
-        let mut backgrounds = Vec::new();
+        let mut opaque_backgrounds = Vec::new();
         let mut cursor_overlay = None;
         for y in 0..snapshot.rows {
             let mut text = String::new();
@@ -86,20 +89,23 @@ impl TerminalFrame {
                 }
 
                 let mut foreground = cell.map(|cell| cell.fg).unwrap_or(snapshot.default_fg);
+                let cursor_here = snapshot.cursor == Some((x, y));
                 let mut background = cell.map(|cell| cell.bg).unwrap_or(snapshot.default_bg);
-                if snapshot.cursor == Some((x, y)) {
+                if cursor_here {
                     background = foreground;
                     foreground = snapshot.default_bg;
                 }
-                push_background(
-                    &mut backgrounds,
-                    BackgroundRun {
-                        x,
-                        y,
-                        width: u16::from(width),
-                        color: background,
-                    },
-                );
+                if cursor_here || cell.is_some_and(|cell| cell.has_explicit_bg) {
+                    push_background(
+                        &mut opaque_backgrounds,
+                        BackgroundRun {
+                            x,
+                            y,
+                            width: u16::from(width),
+                            color: background,
+                        },
+                    );
+                }
 
                 match cell.map(|cell| cell.text.as_str()) {
                     Some(value) if !value.is_empty() => {
@@ -129,7 +135,7 @@ impl TerminalFrame {
 
         Self {
             rows,
-            backgrounds,
+            opaque_backgrounds,
             cursor_overlay,
         }
     }
@@ -218,8 +224,49 @@ mod tests {
             frame.rows[0].runs.iter().map(|run| run.len).sum::<usize>(),
             5
         );
-        assert_eq!(frame.backgrounds.len(), 1);
-        assert_eq!(frame.backgrounds[0].width, 4);
+        assert!(frame.opaque_backgrounds.is_empty());
+    }
+
+    #[test]
+    fn only_explicit_and_cursor_backgrounds_become_opaque_runs() {
+        let mut explicit = cell(1, 0, 1, "b", [0xbb; 3]);
+        explicit.bg = [0x22; 3];
+        explicit.has_explicit_bg = true;
+        let mut explicit_default_color = cell(2, 0, 1, "c", [0xcc; 3]);
+        explicit_default_color.has_explicit_bg = true;
+        let frame = TerminalFrame::from_snapshot(&snapshot(
+            Some((3, 0)),
+            vec![
+                cell(0, 0, 1, "a", [0xaa; 3]),
+                explicit,
+                explicit_default_color,
+                cell(3, 0, 1, "d", [0xdd; 3]),
+            ],
+        ));
+
+        assert_eq!(
+            frame.opaque_backgrounds,
+            vec![
+                BackgroundRun {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    color: [0x22; 3],
+                },
+                BackgroundRun {
+                    x: 2,
+                    y: 0,
+                    width: 1,
+                    color: [0x11; 3],
+                },
+                BackgroundRun {
+                    x: 3,
+                    y: 0,
+                    width: 1,
+                    color: [0xdd; 3],
+                },
+            ]
+        );
     }
 
     #[test]
