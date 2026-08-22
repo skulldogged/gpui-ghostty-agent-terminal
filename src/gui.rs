@@ -907,7 +907,7 @@ impl MultiplexerView {
                     .collect::<Vec<_>>()
             },
             move |bounds, lines, window, _cx| {
-                for background in &frame.backgrounds {
+                for background in &frame.opaque_backgrounds {
                     window.paint_quad(fill(
                         Bounds::new(
                             point(

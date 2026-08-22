@@ -178,8 +178,18 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
         GhosttyResult bg_result = ghostty_render_state_row_cells_get(
             spike->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg);
         if (!success(fg_result)) fg = colors.foreground;
-        cell->has_explicit_bg = success(bg_result);
-        if (!cell->has_explicit_bg) bg = colors.background;
+        if (!success(bg_result)) bg = colors.background;
+
+        GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+        GhosttyResult style_result = ghostty_render_state_row_cells_get(
+            spike->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
+        bool inverse = success(style_result) && style.inverse;
+        if (inverse) {
+          GhosttyColorRgb swap = fg;
+          fg = bg;
+          bg = swap;
+        }
+        cell->has_explicit_bg = success(bg_result) || inverse;
         set_color(&cell->fg_r, &cell->fg_g, &cell->fg_b, fg);
         set_color(&cell->bg_r, &cell->bg_g, &cell->bg_b, bg);
       }
