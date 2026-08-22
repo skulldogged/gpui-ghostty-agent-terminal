@@ -1,4 +1,4 @@
-use crate::{CoreEndpoint, desktop_presence::DesktopPresence, gui};
+use crate::{CoreEndpoint, desktop_presence::DesktopPresence, gui, ui_shell::ShellAssets};
 use gpui::{App, Global, QuitMode, Task};
 use std::process::{Command, Stdio};
 
@@ -25,7 +25,9 @@ struct DesktopShellRuntime {
 impl Global for DesktopShellRuntime {}
 
 pub(crate) fn run() {
-    let application = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
+    let application = gpui_platform::application()
+        .with_assets(ShellAssets)
+        .with_quit_mode(QuitMode::Explicit);
     application.on_reopen(|cx| handle_intent(DesktopIntent::OpenOrFocus, cx));
     application.run(|cx| {
         install_desktop_presence(cx);
