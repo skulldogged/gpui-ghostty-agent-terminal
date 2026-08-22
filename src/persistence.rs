@@ -9,7 +9,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -47,11 +50,12 @@ pub(crate) struct SnapshotStore {
 
 pub(crate) struct SnapshotSaver {
     commands: flume::Sender<SaverCommand>,
+    latest: Arc<Mutex<Option<SnapshotRecord>>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 enum SaverCommand {
-    Dirty(SnapshotRecord),
+    Dirty,
     Flush(flume::Sender<Result<(), String>>),
     Stop(flume::Sender<Result<(), String>>),
 }
@@ -66,21 +70,37 @@ struct SaveSchedule {
 
 impl SnapshotSaver {
     pub(crate) fn start(store: SnapshotStore, durable_generation: u64) -> Result<Self, String> {
-        let (commands_tx, commands_rx) = flume::unbounded();
+        let (commands_tx, commands_rx) = flume::bounded(1);
+        let latest = Arc::new(Mutex::new(None));
+        let worker_latest = Arc::clone(&latest);
         let thread = thread::Builder::new()
             .name("resident-core-snapshot".into())
-            .spawn(move || run_saver(store, commands_rx, durable_generation))
+            .spawn(move || run_saver(store, commands_rx, worker_latest, durable_generation))
             .map_err(|error| format!("spawn snapshot saver: {error}"))?;
         Ok(Self {
             commands: commands_tx,
+            latest,
             thread: Some(thread),
         })
     }
 
     pub(crate) fn mark_dirty(&self, record: SnapshotRecord) -> Result<(), String> {
-        self.commands
-            .send(SaverCommand::Dirty(record))
-            .map_err(|_| "snapshot saver stopped".to_string())
+        {
+            let mut latest = self
+                .latest
+                .lock()
+                .expect("snapshot saver latest-record mutex poisoned");
+            if latest
+                .as_ref()
+                .is_none_or(|pending| record.generation >= pending.generation)
+            {
+                *latest = Some(record);
+            }
+        }
+        match self.commands.try_send(SaverCommand::Dirty) {
+            Ok(()) | Err(flume::TrySendError::Full(_)) => Ok(()),
+            Err(flume::TrySendError::Disconnected(_)) => Err("snapshot saver stopped".into()),
+        }
     }
 
     pub(crate) fn flush(&self) -> Result<(), String> {
@@ -108,6 +128,7 @@ impl Drop for SnapshotSaver {
 fn run_saver(
     store: SnapshotStore,
     commands: flume::Receiver<SaverCommand>,
+    latest: Arc<Mutex<Option<SnapshotRecord>>>,
     durable_generation: u64,
 ) {
     let mut schedule = SaveSchedule {
@@ -125,11 +146,13 @@ fn run_saver(
                 .map_err(|_| flume::RecvTimeoutError::Disconnected),
         };
         match command {
-            Ok(SaverCommand::Dirty(record)) => schedule.mark_dirty(record, Instant::now()),
+            Ok(SaverCommand::Dirty) => drain_latest(&latest, &mut schedule),
             Ok(SaverCommand::Flush(response)) => {
+                drain_latest(&latest, &mut schedule);
                 let _ = response.send(schedule.save(&store));
             }
             Ok(SaverCommand::Stop(response)) => {
+                drain_latest(&latest, &mut schedule);
                 let _ = response.send(schedule.save(&store));
                 break;
             }
@@ -139,10 +162,21 @@ fn run_saver(
                 }
             }
             Err(flume::RecvTimeoutError::Disconnected) => {
+                drain_latest(&latest, &mut schedule);
                 let _ = schedule.save(&store);
                 break;
             }
         }
+    }
+}
+
+fn drain_latest(latest: &Mutex<Option<SnapshotRecord>>, schedule: &mut SaveSchedule) {
+    if let Some(record) = latest
+        .lock()
+        .expect("snapshot saver latest-record mutex poisoned")
+        .take()
+    {
+        schedule.mark_dirty(record, Instant::now());
     }
 }
 
@@ -957,5 +991,36 @@ mod tests {
             })
         );
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn dirty_notifications_are_bounded_before_the_saver_can_run() {
+        let (commands, queued) = flume::bounded(1);
+        let latest = Arc::new(Mutex::new(None));
+        let saver = std::mem::ManuallyDrop::new(SnapshotSaver {
+            commands,
+            latest: Arc::clone(&latest),
+            thread: None,
+        });
+        let layout = populated_layout();
+
+        for generation in 1..=8 {
+            saver
+                .mark_dirty(SnapshotRecord {
+                    generation,
+                    layout: layout.clone(),
+                })
+                .expect("queue dirty generation");
+        }
+
+        assert_eq!(queued.len(), 1, "only one saver wake may remain queued");
+        assert_eq!(
+            latest
+                .lock()
+                .expect("latest snapshot mutex")
+                .as_ref()
+                .map(|record| record.generation),
+            Some(8)
+        );
     }
 }
