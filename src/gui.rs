@@ -262,14 +262,13 @@ impl MultiplexerView {
             DriverUpdate::Terminal {
                 terminal_session_id,
                 snapshot,
-            } => {
-                if let Some(message) = lifecycle_message(&snapshot.lifecycle) {
-                    self.terminal_errors.insert(terminal_session_id, message);
-                } else {
-                    self.terminal_errors.remove(&terminal_session_id);
-                }
-                self.terminals.insert(terminal_session_id, snapshot);
-            }
+            } => accept_terminal_snapshot(
+                &self.hierarchy,
+                &mut self.terminals,
+                &mut self.terminal_errors,
+                terminal_session_id,
+                snapshot,
+            ),
             DriverUpdate::Error(error) => self.global_error = Some(error),
         }
     }
@@ -677,6 +676,28 @@ impl MultiplexerView {
     }
 }
 
+fn accept_terminal_snapshot(
+    hierarchy: &CoreSnapshot,
+    terminals: &mut HashMap<TerminalSessionId, TerminalSnapshot>,
+    terminal_errors: &mut HashMap<TerminalSessionId, String>,
+    terminal_session_id: TerminalSessionId,
+    snapshot: TerminalSnapshot,
+) {
+    if !hierarchy
+        .terminal_sessions
+        .iter()
+        .any(|session| session.id == terminal_session_id)
+    {
+        return;
+    }
+    if let Some(message) = lifecycle_message(&snapshot.lifecycle) {
+        terminal_errors.insert(terminal_session_id, message);
+    } else {
+        terminal_errors.remove(&terminal_session_id);
+    }
+    terminals.insert(terminal_session_id, snapshot);
+}
+
 impl Render for MultiplexerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.resize_visible_terminals(window.viewport_size());
@@ -857,9 +878,13 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{UiSelection, pane_extents, terminal_input_bytes};
-    use crate::{CoreCommand, CoreModel, PaneLayout, SplitAxis, SplitPlacement, SplitRatio};
+    use super::{UiSelection, accept_terminal_snapshot, pane_extents, terminal_input_bytes};
+    use crate::{
+        CoreCommand, CoreModel, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
+        TerminalLifecycle, TerminalSnapshot,
+    };
     use gpui::Keystroke;
+    use std::collections::HashMap;
 
     #[test]
     fn named_space_key_maps_to_ascii_space_without_a_key_char() {
@@ -942,5 +967,49 @@ mod tests {
         assert!((extents[1].1 - 399.6).abs() < 0.1);
         assert_eq!(extents[0].2, 500.0);
         assert_eq!(extents[1].2, 500.0);
+    }
+
+    #[test]
+    fn late_terminal_updates_cannot_restore_a_closed_terminal_projection() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let initial = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "Space".into(),
+                    directory,
+                },
+            )
+            .expect("create Space");
+        let pane_id = match &initial.snapshot.spaces[0].tabs[0].layout {
+            PaneLayout::Pane(pane) => pane.id,
+            PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+        };
+        let terminal_session_id = initial.snapshot.terminal_sessions[0].id;
+        let closed = model
+            .apply(initial.revision, CoreCommand::ClosePane { pane_id })
+            .expect("close Pane");
+        let mut terminals = HashMap::new();
+        let mut terminal_errors = HashMap::new();
+
+        accept_terminal_snapshot(
+            &closed.snapshot,
+            &mut terminals,
+            &mut terminal_errors,
+            terminal_session_id,
+            TerminalSnapshot {
+                revision: 1,
+                lifecycle: TerminalLifecycle::Running,
+                cols: 1,
+                rows: 1,
+                cursor: None,
+                default_fg: [0xdd; 3],
+                default_bg: [0x11; 3],
+                cells: Vec::new(),
+            },
+        );
+
+        assert!(!terminals.contains_key(&terminal_session_id));
     }
 }
