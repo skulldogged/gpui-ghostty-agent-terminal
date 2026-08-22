@@ -5,19 +5,19 @@ use crate::{
     core_driver::{CoreDriver, CoreProjection, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
+    ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent,
-    Keystroke, Pixels, Point, Render, ShapedLine, SharedString, Task, TextRun, Window,
-    WindowBounds, WindowOptions, canvas, div, fill, font, point, prelude::*, px, rgb, size,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations, FocusHandle, IntoElement,
+    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, Render, ShapedLine,
+    SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill, font, point,
+    prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
-const SIDEBAR_WIDTH_PX: f32 = 188.0;
-const TAB_BAR_HEIGHT_PX: f32 = 38.0;
 const SPLIT_GAP_PX: f32 = 1.0;
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
@@ -35,37 +35,34 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
         .collect();
     let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
     let window = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let focus = cx.focus_handle();
-                focus.focus(window, cx);
-                let view = cx.new(|_| MultiplexerView {
-                    driver,
-                    hierarchy: projection.hierarchy,
-                    terminals: projection.terminals,
-                    selection,
-                    focus,
-                    refresh_task: Task::ready(()),
-                    terminal_errors,
-                    global_error: None,
-                    terminal_font,
-                    requested_sizes: HashMap::new(),
-                    pending_close: None,
-                    move_source: None,
-                    selections_after_commands: HashMap::new(),
-                });
-                view.update(cx, |view, cx| {
-                    view.start_refresh_task(cx);
-                    #[cfg(windows)]
-                    view.start_windows_probe(cx);
-                });
-                view
-            },
-        )
+        .open_window(WorkspaceShell::window_options(bounds), move |window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            let view = cx.new(|_| MultiplexerView {
+                driver,
+                hierarchy: projection.hierarchy,
+                terminals: projection.terminals,
+                selection,
+                focus,
+                refresh_task: Task::ready(()),
+                terminal_errors,
+                global_error: None,
+                terminal_font,
+                requested_sizes: HashMap::new(),
+                pending_close: None,
+                move_source: None,
+                selections_after_commands: HashMap::new(),
+                sidebar_width: WorkspaceShell::SIDEBAR_WIDTH,
+                sidebar_dragging: false,
+                titlebar_drag_armed: false,
+            });
+            view.update(cx, |view, cx| {
+                view.start_refresh_task(cx);
+                #[cfg(windows)]
+                view.start_windows_probe(cx);
+            });
+            view
+        })
         .map_err(|error| format!("open GPUI window: {error}"))?;
 
     window
@@ -88,6 +85,9 @@ struct MultiplexerView {
     pending_close: Option<PaneId>,
     move_source: Option<PaneId>,
     selections_after_commands: HashMap<u64, PaneId>,
+    sidebar_width: f32,
+    sidebar_dragging: bool,
+    titlebar_drag_armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -553,8 +553,8 @@ impl MultiplexerView {
         let Some(layout) = self.selected_tab().map(|tab| tab.layout.clone()) else {
             return;
         };
-        let width = (f32::from(viewport.width) - SIDEBAR_WIDTH_PX).max(1.0);
-        let height = (f32::from(viewport.height) - TAB_BAR_HEIGHT_PX).max(1.0);
+        let width = (f32::from(viewport.width) - self.sidebar_width).max(1.0);
+        let height = (f32::from(viewport.height) - WorkspaceShell::TITLE_BAR_HEIGHT).max(1.0);
         let mut panes = Vec::new();
         pane_extents(&layout, width, height, &mut panes);
         for (terminal_session_id, width, height) in panes {
@@ -581,78 +581,371 @@ impl MultiplexerView {
         let mut sidebar = div()
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_WIDTH_PX))
+            .relative()
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_none()
-            .bg(rgb(0x11151d))
+            .bg(WorkspaceShell::color(ShellColor::Sidebar))
             .border_r_1()
-            .border_color(rgb(0x2b3240))
-            .p_2()
-            .gap_1()
+            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .px_1()
+            .pt_2()
+            .gap(px(2.))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_2()
-                    .py_1()
-                    .text_size(px(12.))
-                    .text_color(rgb(0x8993a4))
+                    .h(px(28.))
+                    .px_3()
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(WorkspaceShell::color(ShellColor::FaintText))
                     .child("SPACES")
                     .child(
                         div()
-                            .id("create-space")
-                            .cursor_pointer()
-                            .rounded_md()
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(0x273247))
-                            .text_color(rgb(0xdbe6f5))
-                            .on_click(
-                                cx.listener(|view, _event, _window, cx| view.create_space(cx)),
-                            )
-                            .child("+"),
+                            .text_size(px(11.))
+                            .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                            .child(self.hierarchy.spaces.len().to_string()),
                     ),
             );
         for space in &self.hierarchy.spaces {
             let space_id = space.id;
             let selected = self.selection.space_id == Some(space_id);
+            let initial = space
+                .name
+                .chars()
+                .next()
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_else(|| "·".into());
+            let tab_count = space.tabs.len();
+            let tab_label = if tab_count == 1 { "tab" } else { "tabs" };
+            let metadata = format!(
+                "{tab_count} {tab_label}  ·  {}",
+                space.directory.to_string_lossy()
+            );
             sidebar = sidebar.child(
                 div()
                     .id(("space", space_id.as_u64()))
                     .cursor_pointer()
-                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(52.))
+                    .mx_1()
                     .px_2()
-                    .py_2()
-                    .text_size(px(13.))
-                    .text_color(if selected {
-                        rgb(0xf4f7fb)
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(if selected {
+                        WorkspaceShell::color(ShellColor::SelectedBorder)
                     } else {
-                        rgb(0xb4bdca)
+                        WorkspaceShell::color(ShellColor::Sidebar)
                     })
-                    .when(selected, |this| this.bg(rgb(0x273247)))
+                    .when(selected, |this| {
+                        this.bg(WorkspaceShell::color(ShellColor::Selected))
+                    })
+                    .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
                     .on_click(cx.listener(move |view, _event, window, cx| {
                         view.select_space(space_id, window, cx)
                     }))
-                    .child(space.name.clone()),
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(24.))
+                            .rounded_full()
+                            .bg(if selected {
+                                WorkspaceShell::color(ShellColor::AccentMuted)
+                            } else {
+                                WorkspaceShell::color(ShellColor::Hover)
+                            })
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if selected {
+                                WorkspaceShell::color(ShellColor::Accent)
+                            } else {
+                                WorkspaceShell::color(ShellColor::MutedText)
+                            })
+                            .child(initial),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(if selected {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(WorkspaceShell::color(ShellColor::Text))
+                                    .child(space.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                                    .child(metadata),
+                            ),
+                    ),
             );
         }
-        sidebar.into_any_element()
+        sidebar
+            .child(
+                div()
+                    .id("sidebar-resize")
+                    .absolute()
+                    .top_0()
+                    .right(px(-3.))
+                    .w(px(6.))
+                    .h_full()
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _event, _window, cx| {
+                            view.sidebar_dragging = true;
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
+            .into_any_element()
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut tabs = div()
+    fn chrome_tile(
+        &self,
+        id: &'static str,
+        icon: ShellIcon,
+        active: bool,
+        danger: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let color = if danger {
+            WorkspaceShell::color(ShellColor::Danger)
+        } else if active {
+            WorkspaceShell::color(ShellColor::Accent)
+        } else {
+            WorkspaceShell::color(ShellColor::MutedText)
+        };
+        div()
+            .id(id)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(WorkspaceShell::CHROME_TILE_SIZE))
+            .cursor_pointer()
+            .rounded_lg()
+            .when(active, |this| {
+                this.bg(WorkspaceShell::color(ShellColor::AccentMuted))
+            })
+            .hover(move |this| {
+                this.bg(WorkspaceShell::color(if danger {
+                    ShellColor::DangerHover
+                } else {
+                    ShellColor::Hover
+                }))
+            })
+            .child(WorkspaceShell::icon(icon, color))
+    }
+
+    fn render_titlebar_drag_region(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("titlebar-drag-region")
+            .flex_1()
+            .h_full()
+            .min_w(px(24.))
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, _cx| {
+                    view.titlebar_drag_armed = true;
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|view, _event, _window, _cx| {
+                view.titlebar_drag_armed = false;
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, _cx| {
+                    view.titlebar_drag_armed = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, _cx| {
+                    view.titlebar_drag_armed = false;
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, _event, window, _cx| {
+                if view.titlebar_drag_armed {
+                    view.titlebar_drag_armed = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_click(|event, window, _cx| {
+                if event.click_count() == 2 {
+                    if cfg!(target_os = "linux") {
+                        window.zoom_window();
+                    } else {
+                        window.titlebar_double_click();
+                    }
+                }
+            })
+            .into_any_element()
+    }
+
+    fn render_window_controls(&self, window: &Window) -> Option<AnyElement> {
+        if cfg!(target_os = "macos")
+            || (cfg!(target_os = "linux")
+                && !matches!(window.window_decorations(), Decorations::Client { .. }))
+        {
+            return None;
+        }
+
+        let supported = window.window_controls();
+        let caption_button =
+            |id: &'static str, glyph: &'static str, area: WindowControlArea, danger: bool| {
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(46.))
+                    .h_full()
+                    .text_size(px(if cfg!(windows) { 10. } else { 13. }))
+                    .text_color(WorkspaceShell::color(ShellColor::MutedText))
+                    .when(cfg!(windows), |this| this.font_family("Segoe Fluent Icons"))
+                    .window_control_area(area)
+                    .hover(move |this| {
+                        this.bg(WorkspaceShell::color(if danger {
+                            ShellColor::DangerHover
+                        } else {
+                            ShellColor::Hover
+                        }))
+                        .text_color(WorkspaceShell::color(if danger {
+                            ShellColor::Danger
+                        } else {
+                            ShellColor::Text
+                        }))
+                    })
+                    .child(glyph)
+            };
+        let minimize_glyph = if cfg!(windows) { "\u{e921}" } else { "−" };
+        let maximize_glyph = if cfg!(windows) {
+            if window.is_maximized() {
+                "\u{e923}"
+            } else {
+                "\u{e922}"
+            }
+        } else if window.is_maximized() {
+            "▣"
+        } else {
+            "□"
+        };
+        let close_glyph = if cfg!(windows) { "\u{e8bb}" } else { "×" };
+
+        let mut controls = div()
             .flex()
             .flex_row()
-            .h(px(TAB_BAR_HEIGHT_PX))
-            .w_full()
-            .flex_none()
             .items_center()
-            .bg(rgb(0x151a23))
-            .border_b_1()
-            .border_color(rgb(0x2b3240))
+            .justify_end()
+            .w(px(WorkspaceShell::WINDOW_CONTROLS_WIDTH))
+            .h_full()
+            .flex_none();
+        if supported.minimize {
+            controls = controls.child(
+                caption_button(
+                    "window-minimize",
+                    minimize_glyph,
+                    WindowControlArea::Min,
+                    false,
+                )
+                .when(cfg!(target_os = "linux"), |this| {
+                    this.on_click(|_event, window, cx| {
+                        cx.stop_propagation();
+                        window.minimize_window();
+                    })
+                }),
+            );
+        }
+        if supported.maximize {
+            controls = controls.child(
+                caption_button(
+                    "window-maximize",
+                    maximize_glyph,
+                    WindowControlArea::Max,
+                    false,
+                )
+                .when(cfg!(target_os = "linux"), |this| {
+                    this.on_click(|_event, window, cx| {
+                        cx.stop_propagation();
+                        window.zoom_window();
+                    })
+                }),
+            );
+        }
+        Some(
+            controls
+                .child(
+                    caption_button("window-close", close_glyph, WindowControlArea::Close, true)
+                        .when(cfg!(target_os = "linux"), |this| {
+                            this.on_click(|_event, window, cx| {
+                                cx.stop_propagation();
+                                window.remove_window();
+                            })
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let sidebar_chrome = div()
+            .flex()
+            .items_center()
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .border_r_1()
+            .border_color(WorkspaceShell::color(ShellColor::Border))
             .px_2()
-            .gap_1();
+            .when(cfg!(target_os = "macos"), |this| this.pl(px(78.)))
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(WorkspaceShell::CHROME_TILE_SIZE))
+                        .child(WorkspaceShell::icon(
+                            ShellIcon::AppMark,
+                            WorkspaceShell::color(ShellColor::Accent),
+                        )),
+                )
+            })
+            .child(self.render_titlebar_drag_region(cx))
+            .child(
+                self.chrome_tile("create-space", ShellIcon::Plus, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| view.create_space(cx))),
+            );
+
+        let mut tabs = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .h_full()
+            .flex_shrink(1.)
+            .min_w_0()
+            .overflow_hidden()
+            .pl_2();
         if let Some(space) = self.selected_space() {
             for tab in &space.tabs {
                 let tab_id = tab.id;
@@ -661,138 +954,122 @@ impl MultiplexerView {
                     div()
                         .id(("tab", tab_id.as_u64()))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(WorkspaceShell::TAB_HEIGHT))
+                        .max_w(px(180.))
                         .px_3()
-                        .py_2()
-                        .rounded_t_md()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(if selected {
+                            WorkspaceShell::color(ShellColor::SelectedBorder)
+                        } else {
+                            WorkspaceShell::color(ShellColor::Chrome)
+                        })
                         .text_size(px(13.))
                         .text_color(if selected {
-                            rgb(0xf4f7fb)
+                            WorkspaceShell::color(ShellColor::Text)
                         } else {
-                            rgb(0x929cac)
+                            WorkspaceShell::color(ShellColor::MutedText)
                         })
-                        .when(selected, |this| this.bg(rgb(0x0b0e13)))
+                        .when(selected, |this| {
+                            this.bg(WorkspaceShell::color(ShellColor::Selected))
+                        })
+                        .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
                         .on_click(cx.listener(move |view, _event, window, cx| {
                             view.select_tab(tab_id, window, cx)
                         }))
-                        .child(tab.name.clone()),
+                        .child(
+                            WorkspaceShell::icon(
+                                ShellIcon::AppMark,
+                                WorkspaceShell::color(if selected {
+                                    ShellColor::Accent
+                                } else {
+                                    ShellColor::FaintText
+                                }),
+                            )
+                            .size(px(11.)),
+                        )
+                        .child(div().truncate().child(tab.name.clone())),
                 );
             }
-            tabs = tabs
-                .child(
-                    div()
-                        .id("create-tab")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx)))
-                        .child("+"),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .id("split-horizontal")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.split_focused_pane(SplitAxis::Horizontal, cx)
-                        }))
-                        .child("Split H"),
-                )
-                .child(
-                    div()
-                        .id("split-vertical")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.split_focused_pane(SplitAxis::Vertical, cx)
-                        }))
-                        .child("Split V"),
-                )
-                .child(
-                    div()
-                        .id("shrink-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.resize_focused_pane(false, cx)
-                        }))
-                        .child("Shrink"),
-                )
-                .child(
-                    div()
-                        .id("grow-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xb4bdca))
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.resize_focused_pane(true, cx)
-                        }))
-                        .child("Grow"),
-                )
-                .child(
-                    div()
-                        .id("move-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .when(self.move_source.is_some(), |this| this.bg(rgb(0x273247)))
-                        .text_color(if self.move_source.is_some() {
-                            rgb(0xdbe6f5)
-                        } else {
-                            rgb(0xb4bdca)
-                        })
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.toggle_move_focused_pane(cx)
-                        }))
-                        .child(if self.move_source.is_some() {
-                            "Cancel move"
-                        } else {
-                            "Move"
-                        }),
-                )
-                .child(
-                    div()
-                        .id("close-pane")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(12.))
-                        .text_color(if self.pending_close == self.selection.pane_id {
-                            rgb(0xffb4b4)
-                        } else {
-                            rgb(0xb4bdca)
-                        })
-                        .on_click(cx.listener(|view, _event, _window, cx| {
-                            view.request_close_focused_pane(cx)
-                        }))
-                        .child(if self.pending_close == self.selection.pane_id {
-                            "Confirm close"
-                        } else {
-                            "Close"
-                        }),
-                );
+            tabs = tabs.child(
+                self.chrome_tile("create-tab", ShellIcon::Plus, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx))),
+            );
         }
-        tabs.into_any_element()
+
+        let pane_controls = div()
+            .flex()
+            .items_center()
+            .h_full()
+            .flex_none()
+            .child(
+                self.chrome_tile("split-horizontal", ShellIcon::SplitHorizontal, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| {
+                        view.split_focused_pane(SplitAxis::Horizontal, cx)
+                    })),
+            )
+            .child(
+                self.chrome_tile("split-vertical", ShellIcon::SplitVertical, false, false)
+                    .on_click(cx.listener(|view, _event, _window, cx| {
+                        view.split_focused_pane(SplitAxis::Vertical, cx)
+                    })),
+            )
+            .child(
+                self.chrome_tile("shrink-pane", ShellIcon::Shrink, false, false)
+                    .on_click(
+                        cx.listener(|view, _event, _window, cx| {
+                            view.resize_focused_pane(false, cx)
+                        }),
+                    ),
+            )
+            .child(
+                self.chrome_tile("grow-pane", ShellIcon::Grow, false, false)
+                    .on_click(
+                        cx.listener(|view, _event, _window, cx| view.resize_focused_pane(true, cx)),
+                    ),
+            )
+            .child(
+                self.chrome_tile(
+                    "move-pane",
+                    ShellIcon::Move,
+                    self.move_source.is_some(),
+                    false,
+                )
+                .on_click(
+                    cx.listener(|view, _event, _window, cx| view.toggle_move_focused_pane(cx)),
+                ),
+            )
+            .child(
+                self.chrome_tile(
+                    "close-pane",
+                    ShellIcon::Close,
+                    self.pending_close == self.selection.pane_id,
+                    true,
+                )
+                .on_click(
+                    cx.listener(|view, _event, _window, cx| view.request_close_focused_pane(cx)),
+                ),
+            );
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(WorkspaceShell::TITLE_BAR_HEIGHT))
+            .w_full()
+            .flex_none()
+            .bg(WorkspaceShell::color(ShellColor::Chrome))
+            .border_b_1()
+            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .child(sidebar_chrome)
+            .child(tabs)
+            .child(self.render_titlebar_drag_region(cx))
+            .child(pane_controls)
+            .children(self.render_window_controls(window))
+            .into_any_element()
     }
 
     fn render_selected_layout(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -803,8 +1080,8 @@ impl MultiplexerView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(0x0b0e13))
-                .text_color(rgb(0x8993a4))
+                .bg(WorkspaceShell::color(ShellColor::Window))
+                .text_color(WorkspaceShell::color(ShellColor::MutedText))
                 .child("No Spaces yet")
                 .into_any_element(),
         }
@@ -838,7 +1115,7 @@ impl MultiplexerView {
                     .when(split.axis == SplitAxis::Vertical, |this| this.flex_col())
                     .size_full()
                     .gap(px(SPLIT_GAP_PX))
-                    .bg(rgb(0x343c4a))
+                    .bg(WorkspaceShell::color(ShellColor::Border))
                     .child(first)
                     .child(
                         div()
@@ -971,7 +1248,11 @@ impl MultiplexerView {
             .overflow_hidden()
             .bg(default_bg)
             .border_1()
-            .border_color(if focused { rgb(0x5b8def) } else { default_bg })
+            .border_color(if focused {
+                WorkspaceShell::color(ShellColor::Accent)
+            } else {
+                default_bg
+            })
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
@@ -987,7 +1268,7 @@ impl MultiplexerView {
                             .absolute()
                             .bottom(px(8.))
                             .left(px(12.))
-                            .text_color(rgb(0xff6b6b))
+                            .text_color(WorkspaceShell::color(ShellColor::Danger))
                             .child(error),
                     )
                 },
@@ -1025,24 +1306,58 @@ impl Render for MultiplexerView {
             .id("multiplexer")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
+                if !view.sidebar_dragging {
+                    return;
+                }
+                let viewport = window.viewport_size().width.as_f32();
+                let max_width = (viewport - 500.)
+                    .max(WorkspaceShell::SIDEBAR_MIN_WIDTH)
+                    .min(viewport * 0.5);
+                view.sidebar_width = event
+                    .position
+                    .x
+                    .as_f32()
+                    .clamp(WorkspaceShell::SIDEBAR_MIN_WIDTH, max_width);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, cx| {
+                    if view.sidebar_dragging {
+                        view.sidebar_dragging = false;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _event, _window, cx| {
+                    if view.sidebar_dragging {
+                        view.sidebar_dragging = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x0b0e13))
-            .child(self.render_sidebar(cx))
+            .bg(WorkspaceShell::color(ShellColor::Window))
+            .child(self.render_title_bar(window, cx))
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.render_tab_bar(cx))
+                    .min_h_0()
+                    .w_full()
+                    .child(self.render_sidebar(cx))
                     .child(
                         div()
                             .flex_1()
                             .min_h_0()
+                            .min_w_0()
                             .w_full()
                             .child(self.render_selected_layout(cx)),
                     ),
@@ -1053,11 +1368,11 @@ impl Render for MultiplexerView {
                         .absolute()
                         .right(px(12.))
                         .bottom(px(10.))
-                        .rounded_md()
-                        .bg(rgb(0x55262a))
-                        .px_2()
-                        .py_1()
-                        .text_color(rgb(0xffb4b4))
+                        .rounded_lg()
+                        .bg(WorkspaceShell::color(ShellColor::DangerHover))
+                        .px_3()
+                        .py_2()
+                        .text_color(WorkspaceShell::color(ShellColor::Danger))
                         .child(error),
                 )
             })
