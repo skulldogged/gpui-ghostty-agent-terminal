@@ -42,6 +42,7 @@ const PROTOCOL_VERSION: u16 = 8;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SEMANTIC_EVENT_CAPACITY: usize = 64;
 const SESSION_TICK: Duration = Duration::from_millis(10);
+const CORE_ID_ALLOCATION_HEADROOM: u64 = 1 << 32;
 const AUTH_SECRET_BYTES: usize = 32;
 const AUTH_NONCE_BYTES: usize = 32;
 
@@ -282,6 +283,12 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
         .fill(&mut bytes)
         .map_err(|_| "generate Resident Core authentication randomness".to_string())?;
     Ok(bytes)
+}
+
+fn fresh_core_resource_id() -> Result<u64, String> {
+    let random = u64::from_le_bytes(random_bytes::<8>()?);
+    let maximum_start = u64::MAX - CORE_ID_ALLOCATION_HEADROOM;
+    Ok(random % maximum_start + 1)
 }
 
 #[cfg(any(windows, test))]
@@ -1809,6 +1816,7 @@ impl Drop for TerminalSubscription {
 
 impl ResidentCore {
     fn start(_endpoint: &CoreEndpoint) -> Result<Self, String> {
+        let first_resource_id = fresh_core_resource_id()?;
         let (commands_tx, commands_rx) = flume::bounded::<WorkerCommand>(32);
         let (ready_tx, ready_rx) = flume::bounded(1);
         let subscribers = Arc::new(Mutex::new(Vec::new()));
@@ -1824,7 +1832,7 @@ impl ResidentCore {
             .spawn(move || {
                 let started = std::env::current_dir()
                     .map_err(|error| format!("resolve initial Space directory: {error}"))
-                    .and_then(|directory| CoreRuntime::start(&directory));
+                    .and_then(|directory| CoreRuntime::start(&directory, first_resource_id));
                 let mut runtime = match started {
                     Ok(runtime) => runtime,
                     Err(error) => {
@@ -3193,6 +3201,32 @@ mod tests {
         assert_eq!(after_restart.spaces.len(), 1);
         assert_eq!(after_restart.spaces[0].tabs.len(), 1);
         assert_eq!(after_restart.terminal_sessions.len(), 1);
+        let old_terminal_ids = before_restart
+            .terminal_sessions
+            .iter()
+            .map(|terminal| terminal.id)
+            .collect::<std::collections::HashSet<_>>();
+        let new_terminal_ids = after_restart
+            .terminal_sessions
+            .iter()
+            .map(|terminal| terminal.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            old_terminal_ids.is_disjoint(&new_terminal_ids),
+            "a cold Core must not reuse Terminal Session identities from its predecessor"
+        );
+        let old_initial_pane = match &before_restart.spaces[0].tabs[0].layout {
+            crate::PaneLayout::Pane(pane) => pane.id,
+            crate::PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+        };
+        let new_initial_pane = match &after_restart.spaces[0].tabs[0].layout {
+            crate::PaneLayout::Pane(pane) => pane.id,
+            crate::PaneLayout::Split(_) => panic!("fresh Tab must contain one Pane"),
+        };
+        assert_ne!(
+            old_initial_pane, new_initial_pane,
+            "a cold Core must not reuse Pane identities from its predecessor"
+        );
         assert!(
             after_restart
                 .spaces

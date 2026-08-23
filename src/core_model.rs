@@ -264,13 +264,18 @@ impl Default for CoreModel {
 
 impl CoreModel {
     pub fn new() -> Self {
+        Self::with_id_namespace(1)
+    }
+
+    pub(crate) fn with_id_namespace(first_id: u64) -> Self {
+        assert_ne!(first_id, 0, "Core resource IDs must be nonzero");
         Self {
             snapshot: CoreSnapshot {
                 revision: 0,
                 spaces: Vec::new(),
                 terminal_sessions: Vec::new(),
             },
-            next_id: 1,
+            next_id: first_id,
         }
     }
 
