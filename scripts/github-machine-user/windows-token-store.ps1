@@ -8,6 +8,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$securityAssembly = [System.Reflection.Assembly]::LoadWithPartialName("System.Security")
+if ($null -eq $securityAssembly) {
+    throw "Windows DPAPI assembly System.Security could not be loaded"
+}
 $entropy = [Text.Encoding]::UTF8.GetBytes("codex-github-machine-user-v1")
 
 switch ($Command) {
