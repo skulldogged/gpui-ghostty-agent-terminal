@@ -10,8 +10,14 @@ normal `gh` and Git identities:
 - `token-store` keeps the API token outside the repository and uses an
   owner-only file when Secret Service is unavailable.
 
-Run `scripts/setup-github-machine-user.sh` from the repository root for the initial
-account setup. The wizard preserves the operator's existing GitHub sessions.
+Run `scripts/setup-github-machine-user.sh` from the repository root for the
+initial account setup. On Windows, run it from Git Bash; it installs `.cmd`
+shims so later PowerShell sessions can invoke the same commands. The wizard
+preserves the operator's existing GitHub sessions.
+
+Windows stores the API token as a current-user DPAPI credential. Each Windows
+machine receives its own SSH authentication and signing keys, while the public
+account identity and guarded command interface remain the same across machines.
 
 ## Register another repository
 

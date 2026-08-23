@@ -196,10 +196,17 @@ DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-github-machine"
 BIN_ROOT="$HOME/.local/bin"
 ENV_FILE="$CONFIG_ROOT/setup.env"
 START_STAGE=1
+WINDOWS_HOST=false
+EXISTING_MACHINE_USER=""
+
+case "$(uname -s 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*) WINDOWS_HOST=true ;;
+esac
 
 usage() {
-  printf 'Usage: %s [--from-stage 1-6]\n' "${0##*/}"
+  printf 'Usage: %s [--from-stage 1-6] [--existing-machine-user USER]\n' "${0##*/}"
   printf 'Resume after completed work with, for example, --from-stage 4.\n'
+  printf 'Skip account creation for an existing invited machine user with --existing-machine-user.\n'
 }
 
 while (( $# )); do
@@ -211,6 +218,14 @@ while (( $# )); do
       ;;
     --from-stage=*)
       START_STAGE=${1#--from-stage=}
+      ;;
+    --existing-machine-user)
+      shift
+      [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+      EXISTING_MACHINE_USER=$1
+      ;;
+    --existing-machine-user=*)
+      EXISTING_MACHINE_USER=${1#--existing-machine-user=}
       ;;
     -h|--help)
       usage
@@ -279,6 +294,25 @@ verify_machine_user_exists() {
     return 1
   fi
 }
+
+if [[ -n "$EXISTING_MACHINE_USER" ]]; then
+  if (( START_STAGE != 1 )); then
+    printf '%s\n' '--existing-machine-user cannot be combined with --from-stage.' >&2
+    exit 2
+  fi
+  if ! validate_username "$EXISTING_MACHINE_USER" || \
+     ! verify_machine_user_exists "$EXISTING_MACHINE_USER"; then
+    printf 'The existing machine user is invalid or unavailable: %s\n' \
+      "$EXISTING_MACHINE_USER" >&2
+    exit 1
+  fi
+  AGENT_GITHUB_USER=$EXISTING_MACHINE_USER
+  write_env TARGET_REPO "$TARGET_REPO"
+  write_env OWNER_LOGIN "$OWNER_LOGIN"
+  write_env AGENT_GITHUB_USER "$AGENT_GITHUB_USER"
+  START_STAGE=3
+  _STAGE_INDEX=2
+fi
 
 if (( START_STAGE > 1 )); then
   banner "GitHub machine-user setup · resume at stage $START_STAGE"
@@ -381,7 +415,11 @@ if (( START_STAGE <= 4 )); then
 stage "Create and store the API token"
 say "This public personal repository currently requires a classic public_repo PAT for a collaborator."
 warn "Keep the account limited to intended automation repositories; classic PATs are not per-repository."
-TOKEN_FILE="$DATA_ROOT/$AGENT_GITHUB_USER/github-token"
+if [[ "$WINDOWS_HOST" == true ]]; then
+  TOKEN_FILE="$DATA_ROOT/$AGENT_GITHUB_USER/github-token.xml"
+else
+  TOKEN_FILE="$DATA_ROOT/$AGENT_GITHUB_USER/github-token"
+fi
 TOKEN_STORE_SOURCE="$SCRIPT_DIR/github-machine-user/token-store"
 if [[ ! -x "$TOKEN_STORE_SOURCE" ]]; then
   warn "Missing token-store helper: $TOKEN_STORE_SOURCE"
@@ -407,7 +445,14 @@ if ! GH_TOKEN="$AGENT_GITHUB_PAT" gh api "repos/$TARGET_REPO" --silent >/dev/nul
   warn "The token cannot access $TARGET_REPO; check the accepted invitation and public_repo scope."
   exit 1
 fi
-if printf '%s' "$AGENT_GITHUB_PAT" | "$TOKEN_STORE_SOURCE" store-secret-service; then
+if [[ "$WINDOWS_HOST" == true ]]; then
+  if ! printf '%s' "$AGENT_GITHUB_PAT" | "$TOKEN_STORE_SOURCE" store-windows-dpapi; then
+    unset AGENT_GITHUB_PAT
+    warn "Windows could not protect the token with current-user DPAPI."
+    exit 1
+  fi
+  say "The token is encrypted with Windows DPAPI for the current user."
+elif printf '%s' "$AGENT_GITHUB_PAT" | "$TOKEN_STORE_SOURCE" store-secret-service; then
   say "The token is stored in Secret Service, not a file or GitHub Actions secret."
 else
   warn "No usable Secret Service is available in this headless session."
@@ -454,6 +499,35 @@ done
 install -m 700 "$AGENT_GH_SOURCE" "$BIN_ROOT/agent-gh"
 install -m 700 "$AGENT_GIT_SOURCE" "$BIN_ROOT/agent-git"
 install -m 700 "$TOKEN_STORE_SOURCE" "$BIN_ROOT/agent-token-store"
+if [[ "$WINDOWS_HOST" == true ]]; then
+  for source_file in \
+    "$SCRIPT_DIR/github-machine-user/agent-gh.cmd" \
+    "$SCRIPT_DIR/github-machine-user/agent-git.cmd" \
+    "$SCRIPT_DIR/github-machine-user/windows-token-store.ps1"; do
+    if [[ ! -r "$source_file" ]]; then
+      warn "Missing Windows wrapper file: $source_file"
+      exit 1
+    fi
+  done
+  install -m 700 "$SCRIPT_DIR/github-machine-user/agent-gh.cmd" "$BIN_ROOT/agent-gh.cmd"
+  install -m 700 "$SCRIPT_DIR/github-machine-user/agent-git.cmd" "$BIN_ROOT/agent-git.cmd"
+  install -m 600 \
+    "$SCRIPT_DIR/github-machine-user/windows-token-store.ps1" \
+    "$BIN_ROOT/windows-token-store.ps1"
+
+  BIN_ROOT_WINDOWS=$(cygpath -w "$BIN_ROOT")
+  AGENT_MACHINE_BIN="$BIN_ROOT_WINDOWS" powershell.exe -NoProfile -Command '
+    $bin = $env:AGENT_MACHINE_BIN
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $entries = @($userPath -split ";" | Where-Object { $_ })
+    if ($entries -notcontains $bin) {
+      $newPath = (@($entries) + $bin) -join ";"
+      [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    }
+  '
+  say "Installed PowerShell command shims and added $BIN_ROOT_WINDOWS to the user PATH."
+  note "Open a new PowerShell window before invoking agent-gh or agent-git there."
+fi
 say "Installed $BIN_ROOT/agent-gh, $BIN_ROOT/agent-git, and the token-store helper."
 "$BIN_ROOT/agent-gh" register "$TARGET_REPO"
 "$BIN_ROOT/agent-gh" identity

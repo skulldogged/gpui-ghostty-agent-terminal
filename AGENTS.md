@@ -4,6 +4,10 @@
 
 Issues and specs are tracked in this repository's GitHub Issues. See `docs/agents/issue-tracker.md`.
 
+### Resuming work
+
+When starting, resuming, or moving implementation between development machines, follow `docs/agents/cross-machine-work.md`.
+
 ### Triage labels
 
 Triage uses the five default Matt Pocock skill labels. See `docs/agents/triage-labels.md`.
@@ -29,3 +33,4 @@ This is a single-context repository. See `docs/agents/domain.md`.
 ### Review signal
 
 - Report correctness, process-lifetime, resource-safety, security, and supported-platform regressions introduced by the change. Do not report style preferences, naming opinions, or speculative abstractions without a concrete failure mode.
+- Request one `@codex review` from the operator's GitHub session only after a PR is a merge candidate. Request another only after a material review finding required changes.

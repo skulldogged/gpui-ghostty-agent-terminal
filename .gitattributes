@@ -1,0 +1,6 @@
+*.sh text eol=lf
+scripts/github-machine-user/agent-gh text eol=lf
+scripts/github-machine-user/agent-git text eol=lf
+scripts/github-machine-user/token-store text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
