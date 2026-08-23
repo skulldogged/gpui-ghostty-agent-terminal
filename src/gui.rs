@@ -9,9 +9,9 @@ use crate::{
 };
 use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations, FocusHandle, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, Render, ShapedLine,
-    SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill, font, point,
-    prelude::*, px, rgb, size,
+    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel,
+    Render, ShapedLine, SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill,
+    font, point, prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -344,10 +344,10 @@ impl MultiplexerView {
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if pane_close_shortcut(&event.keystroke) {
             if let Some(pane_id) = self.selection.pane_id {
-                self.close_target(CloseTarget::Pane(pane_id), cx);
+                self.close_target(CloseTarget::Pane(pane_id), window, cx);
             }
             cx.stop_propagation();
             return;
@@ -516,12 +516,57 @@ impl MultiplexerView {
         self.move_source = None;
     }
 
-    fn close_target(&mut self, target: CloseTarget, cx: &mut Context<Self>) {
+    fn close_target(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
         if !self.close_target_exists(target) {
+            return;
+        }
+        let active_sessions = self.active_session_count(target);
+        if active_sessions > 0 {
+            let noun = if active_sessions == 1 {
+                "session"
+            } else {
+                "sessions"
+            };
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "Close active terminal work?",
+                Some(&format!(
+                    "{active_sessions} terminal {noun} appear to be busy. Closing will stop the running work."
+                )),
+                &[
+                    PromptButton::ok("Close anyway"),
+                    PromptButton::cancel("Keep open"),
+                ],
+                cx,
+            );
+            cx.spawn(async move |this, cx| {
+                if answer.await.ok() == Some(0)
+                    && let Some(this) = this.upgrade()
+                {
+                    this.update(cx, move |view, cx| {
+                        if view.close_target_exists(target) {
+                            view.cancel_move();
+                            view.submit_core_command(target.command(), cx);
+                        }
+                    });
+                }
+            })
+            .detach();
             return;
         }
         self.cancel_move();
         self.submit_core_command(target.command(), cx);
+    }
+
+    fn active_session_count(&self, target: CloseTarget) -> usize {
+        terminal_sessions_for_target(&self.hierarchy, target)
+            .into_iter()
+            .filter(|terminal_session_id| {
+                self.terminals
+                    .get(terminal_session_id)
+                    .is_none_or(|snapshot| snapshot.active_work)
+            })
+            .count()
     }
 
     fn close_target_exists(&self, target: CloseTarget) -> bool {
@@ -696,7 +741,7 @@ impl MultiplexerView {
                 )
                 .on_click(cx.listener(move |view, _event, _window, cx| {
                     cx.stop_propagation();
-                    view.close_target(CloseTarget::Space(space_id), cx);
+                    view.close_target(CloseTarget::Space(space_id), _window, cx);
                 }))
                 .child(
                     self.shell
@@ -1051,7 +1096,7 @@ impl MultiplexerView {
                     )
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         cx.stop_propagation();
-                        view.close_target(CloseTarget::Tab(tab_id), cx);
+                        view.close_target(CloseTarget::Tab(tab_id), _window, cx);
                     }))
                     .child(
                         self.shell
@@ -1441,7 +1486,7 @@ impl Render for MultiplexerView {
         div()
             .id("multiplexer")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
+            .on_key_down(cx.listener(|view, event, window, cx| view.on_key_down(event, window, cx)))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 if view.sidebar_dragging {
                     let viewport = window.viewport_size().width.as_f32();
@@ -1800,6 +1845,45 @@ fn pane_close_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> 
     }
 }
 
+fn terminal_sessions_for_target(
+    hierarchy: &CoreSnapshot,
+    target: CloseTarget,
+) -> Vec<TerminalSessionId> {
+    let layouts = hierarchy.spaces.iter().flat_map(|space| {
+        space
+            .tabs
+            .iter()
+            .filter(move |tab| match target {
+                CloseTarget::Space(space_id) => space.id == space_id,
+                CloseTarget::Tab(tab_id) => tab.id == tab_id,
+                CloseTarget::Pane(_) => true,
+            })
+            .map(|tab| &tab.layout)
+    });
+    match target {
+        CloseTarget::Pane(pane_id) => layouts
+            .filter_map(|layout| terminal_for_pane(layout, pane_id))
+            .collect(),
+        CloseTarget::Space(_) | CloseTarget::Tab(_) => {
+            let mut terminal_sessions = Vec::new();
+            for layout in layouts {
+                collect_terminal_sessions(layout, &mut terminal_sessions);
+            }
+            terminal_sessions
+        }
+    }
+}
+
+fn collect_terminal_sessions(layout: &PaneLayout, output: &mut Vec<TerminalSessionId>) {
+    match layout {
+        PaneLayout::Pane(pane) => output.push(pane.terminal_session_id),
+        PaneLayout::Split(split) => {
+            collect_terminal_sessions(&split.first, output);
+            collect_terminal_sessions(&split.second, output);
+        }
+    }
+}
+
 fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
     if key.modifiers.control && key.key.len() == 1 {
         let byte = key.key.as_bytes()[0].to_ascii_uppercase();
@@ -2136,6 +2220,7 @@ mod tests {
             TerminalSnapshot {
                 revision: 1,
                 lifecycle: TerminalLifecycle::Running,
+                active_work: false,
                 cols: 1,
                 rows: 1,
                 cursor: None,

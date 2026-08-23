@@ -530,6 +530,7 @@ fn publish_semantic_event(
 pub struct TerminalSnapshot {
     pub revision: u64,
     pub lifecycle: TerminalLifecycle,
+    pub active_work: bool,
     pub cols: u16,
     pub rows: u16,
     pub cursor: Option<(u16, u16)>,
@@ -561,6 +562,7 @@ impl TerminalSnapshot {
         Ok(Self {
             revision: update.revision,
             lifecycle: update.lifecycle,
+            active_work: update.active_work,
             cols: update.cols,
             rows: update.rows,
             cursor: update.cursor,
@@ -590,6 +592,7 @@ impl TerminalSnapshot {
         self.cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
         self.revision = update.revision;
         self.lifecycle = update.lifecycle;
+        self.active_work = update.active_work;
         self.cursor = update.cursor;
         self.default_fg = update.default_fg;
         self.default_bg = update.default_bg;
@@ -602,6 +605,7 @@ struct TerminalUpdate {
     base_revision: Option<u64>,
     revision: u64,
     lifecycle: TerminalLifecycle,
+    active_work: bool,
     cols: u16,
     rows: u16,
     cursor: Option<(u16, u16)>,
@@ -617,11 +621,13 @@ impl TerminalUpdate {
         base_revision: Option<u64>,
         revision: u64,
         lifecycle: TerminalLifecycle,
+        active_work: bool,
     ) -> Self {
         Self {
             base_revision: if snapshot.full { None } else { base_revision },
             revision,
             lifecycle,
+            active_work,
             cols: snapshot.cols,
             rows: snapshot.rows,
             cursor: snapshot.cursor,
@@ -639,6 +645,7 @@ impl TerminalUpdate {
             base_revision: None,
             revision,
             lifecycle,
+            active_work: false,
             cols: COLS,
             rows: ROWS,
             cursor: None,

@@ -34,6 +34,7 @@ struct RuntimeTerminal {
     revision: u64,
     lifecycle: TerminalLifecycle,
     last_snapshot_revision: Option<u64>,
+    interactive_prompt_seen: bool,
 }
 
 impl CoreRuntime {
@@ -192,11 +193,18 @@ impl CoreRuntime {
         };
         let force_full = since.is_none() || since != runtime.last_snapshot_revision;
         let snapshot = session.render_update(force_full)?;
+        runtime.interactive_prompt_seen |= snapshot.bracketed_paste;
+        let active_work = close_confirmation_required(
+            runtime.interactive_prompt_seen,
+            snapshot.bracketed_paste,
+            snapshot.alternate_screen,
+        );
         let update = TerminalUpdate::from_terminal(
             snapshot,
             runtime.last_snapshot_revision,
             runtime.revision,
             runtime.lifecycle.clone(),
+            active_work,
         );
         runtime.last_snapshot_revision = Some(runtime.revision);
         Ok(Some(update))
@@ -302,6 +310,7 @@ impl RuntimeTerminal {
             revision: 0,
             lifecycle: TerminalLifecycle::Running,
             last_snapshot_revision: None,
+            interactive_prompt_seen: false,
         })
     }
 
@@ -312,6 +321,7 @@ impl RuntimeTerminal {
             revision: 1,
             lifecycle: TerminalLifecycle::Failed(error),
             last_snapshot_revision: None,
+            interactive_prompt_seen: false,
         }
     }
 
@@ -362,6 +372,14 @@ impl RuntimeTerminal {
     }
 }
 
+fn close_confirmation_required(
+    interactive_prompt_seen: bool,
+    bracketed_paste: bool,
+    alternate_screen: bool,
+) -> bool {
+    alternate_screen || (interactive_prompt_seen && !bracketed_paste)
+}
+
 fn pane_for_terminal(
     snapshot: &CoreSnapshot,
     terminal_session_id: TerminalSessionId,
@@ -399,6 +417,14 @@ mod tests {
     use super::*;
     use crate::{CreatedResource, SplitAxis, SplitPlacement, SplitRatio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn close_confirmation_tracks_work_after_an_interactive_prompt() {
+        assert!(!close_confirmation_required(false, false, false));
+        assert!(!close_confirmation_required(true, true, false));
+        assert!(close_confirmation_required(true, false, false));
+        assert!(close_confirmation_required(false, true, true));
+    }
 
     #[test]
     fn registry_runs_multiple_terminal_sessions_in_their_space_directories() {

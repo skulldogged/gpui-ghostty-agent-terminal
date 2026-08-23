@@ -312,6 +312,7 @@ mod tests {
         TerminalSnapshot {
             revision: 1,
             lifecycle: TerminalLifecycle::Running,
+            active_work: false,
             cols: 4,
             rows: 1,
             cursor,

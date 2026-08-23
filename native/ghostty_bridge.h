@@ -32,6 +32,8 @@ typedef struct {
   uint16_t cursor_x;
   uint16_t cursor_y;
   bool cursor_visible;
+  bool bracketed_paste;
+  bool alternate_screen;
   uint8_t default_fg_r;
   uint8_t default_fg_g;
   uint8_t default_fg_b;

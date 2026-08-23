@@ -28,6 +28,8 @@ struct RawSnapshot {
     cursor_x: u16,
     cursor_y: u16,
     cursor_visible: bool,
+    bracketed_paste: bool,
+    alternate_screen: bool,
     default_fg_r: u8,
     default_fg_g: u8,
     default_fg_b: u8,
@@ -80,6 +82,8 @@ pub struct Snapshot {
     pub cols: u16,
     pub rows: u16,
     pub cursor: Option<(u16, u16)>,
+    pub bracketed_paste: bool,
+    pub alternate_screen: bool,
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
     pub cells: Vec<Cell>,
@@ -203,6 +207,8 @@ impl Terminal {
             cursor: raw_snapshot
                 .cursor_visible
                 .then_some((raw_snapshot.cursor_x, raw_snapshot.cursor_y)),
+            bracketed_paste: raw_snapshot.bracketed_paste,
+            alternate_screen: raw_snapshot.alternate_screen,
             default_fg: [
                 raw_snapshot.default_fg_r,
                 raw_snapshot.default_fg_g,
@@ -322,6 +328,25 @@ mod tests {
                 .expect("encode bracketed paste"),
             b"\x1b[200~line one\nline two\x1b[201~"
         );
+    }
+
+    #[test]
+    fn snapshots_report_interactive_and_full_screen_modes() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+
+        let initial = terminal.snapshot().expect("snapshot initial modes");
+        assert!(!initial.bracketed_paste);
+        assert!(!initial.alternate_screen);
+
+        terminal.feed(b"\x1b[?2004h\x1b[?1049h");
+        let active = terminal.snapshot().expect("snapshot enabled modes");
+        assert!(active.bracketed_paste);
+        assert!(active.alternate_screen);
+
+        terminal.feed(b"\x1b[?2004l\x1b[?1049l");
+        let inactive = terminal.snapshot().expect("snapshot disabled modes");
+        assert!(!inactive.bracketed_paste);
+        assert!(!inactive.alternate_screen);
     }
 
     #[test]
