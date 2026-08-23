@@ -49,11 +49,6 @@ pub fn run_gui() {
 
 #[cfg(feature = "gui")]
 pub fn run_development_gui() -> Result<(), String> {
-    // This is the process entry point for `--development`, before GPUI or any
-    // worker threads start. Remove only the host's development-runner color
-    // preference so the app and the child Core inherit a normal terminal
-    // environment; regular launches continue to honor an explicit NO_COLOR.
-    unsafe { std::env::remove_var("NO_COLOR") };
     let endpoint = CoreEndpoint::for_development_launch()?;
     desktop_shell::run(endpoint, true)
 }
