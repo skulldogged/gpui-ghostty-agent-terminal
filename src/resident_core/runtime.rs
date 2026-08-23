@@ -149,12 +149,21 @@ impl CoreRuntime {
             .session
             .as_mut()
             .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
-        let changed = session.drain_pending_output()?;
-        if changed {
-            runtime.revision = runtime.revision.saturating_add(1);
+        let result = session.paste(bytes);
+        match result {
+            Ok(changed) => {
+                if changed {
+                    runtime.revision = runtime.revision.saturating_add(1);
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                // The ordered reader barrier may have fed terminal output even
+                // when encoding, writing, or resuming subsequently failed.
+                runtime.revision = runtime.revision.saturating_add(1);
+                Err(error)
+            }
         }
-        session.paste(bytes)?;
-        Ok(changed)
     }
 
     pub(super) fn resize(
