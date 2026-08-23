@@ -47,6 +47,9 @@ void spike_terminal_free(SpikeTerminal* terminal);
 void spike_terminal_write(SpikeTerminal* terminal, const uint8_t* data, size_t len);
 int spike_terminal_resize(SpikeTerminal* terminal, uint16_t cols, uint16_t rows,
                           uint32_t cell_width_px, uint32_t cell_height_px);
+int spike_terminal_encode_paste(SpikeTerminal* terminal, uint8_t* data,
+                                size_t data_len, uint8_t* output,
+                                size_t output_len, size_t* output_written);
 int spike_terminal_snapshot(SpikeTerminal* terminal, bool force_full,
                             SpikeSnapshot* snapshot, SpikeCell* cells,
                             size_t capacity);

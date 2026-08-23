@@ -53,6 +53,23 @@ int spike_terminal_resize(SpikeTerminal* spike, uint16_t cols, uint16_t rows,
                                  cell_height_px);
 }
 
+int spike_terminal_encode_paste(SpikeTerminal* spike, uint8_t* data,
+                                size_t data_len, uint8_t* output,
+                                size_t output_len, size_t* output_written) {
+  if (spike == NULL || (data == NULL && data_len > 0) ||
+      (output == NULL && output_len > 0) || output_written == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+
+  bool bracketed = false;
+  GhosttyResult result = ghostty_terminal_mode_get(
+      spike->terminal, GHOSTTY_MODE_BRACKETED_PASTE, &bracketed);
+  if (!success(result)) return result;
+
+  return ghostty_paste_encode((char*)data, data_len, bracketed, (char*)output,
+                              output_len, output_written);
+}
+
 static void set_color(uint8_t* r, uint8_t* g, uint8_t* b, GhosttyColorRgb color) {
   *r = color.r;
   *g = color.g;

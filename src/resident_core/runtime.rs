@@ -139,6 +139,24 @@ impl CoreRuntime {
         self.live_terminal_mut(terminal_session_id)?.input(bytes)
     }
 
+    pub(super) fn paste(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        bytes: &[u8],
+    ) -> Result<bool, String> {
+        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let session = runtime
+            .session
+            .as_mut()
+            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
+        let changed = session.drain_pending_output()?;
+        if changed {
+            runtime.revision = runtime.revision.saturating_add(1);
+        }
+        session.paste(bytes)?;
+        Ok(changed)
+    }
+
     pub(super) fn resize(
         &mut self,
         terminal_session_id: TerminalSessionId,

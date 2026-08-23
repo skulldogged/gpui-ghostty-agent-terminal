@@ -353,6 +353,16 @@ impl MultiplexerView {
         let Some(terminal_session_id) = self.focused_terminal_session_id() else {
             return;
         };
+        if terminal_paste_shortcut(&event.keystroke) {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                && let Err(error) = self.driver.paste_to(terminal_session_id, text.into_bytes())
+            {
+                self.global_error = Some(error);
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
             if let Err(error) = self.driver.input_to(terminal_session_id, bytes) {
                 self.global_error = Some(error);
@@ -1638,6 +1648,45 @@ fn terminal_for_pane(layout: &PaneLayout, pane_id: PaneId) -> Option<TerminalSes
     }
 }
 
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum PasteShortcutPlatform {
+    MacOs,
+    Linux,
+    Windows,
+}
+
+fn terminal_paste_shortcut(key: &Keystroke) -> bool {
+    #[cfg(target_os = "macos")]
+    let platform = PasteShortcutPlatform::MacOs;
+    #[cfg(target_os = "linux")]
+    let platform = PasteShortcutPlatform::Linux;
+    #[cfg(target_os = "windows")]
+    let platform = PasteShortcutPlatform::Windows;
+
+    terminal_paste_shortcut_for(key, platform)
+}
+
+fn terminal_paste_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> bool {
+    if !key.key.eq_ignore_ascii_case("v")
+        || key.modifiers.alt
+        || key.modifiers.function
+        || key.modifiers.platform && !matches!(platform, PasteShortcutPlatform::MacOs)
+    {
+        return false;
+    }
+
+    match platform {
+        PasteShortcutPlatform::MacOs => {
+            key.modifiers.platform && !key.modifiers.control && !key.modifiers.shift
+        }
+        PasteShortcutPlatform::Linux => {
+            key.modifiers.control && key.modifiers.shift && !key.modifiers.platform
+        }
+        PasteShortcutPlatform::Windows => key.modifiers.control && !key.modifiers.platform,
+    }
+}
+
 fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
     if key.modifiers.control && key.key.len() == 1 {
         let byte = key.key.as_bytes()[0].to_ascii_uppercase();
@@ -1744,15 +1793,15 @@ fn windows_caption_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        SplitGeometry, UiSelection, accept_terminal_snapshot, first_pane_id, pane_extents,
-        selection_for_created, selection_for_pane, split_ratio_at, terminal_input_bytes,
-        windows_caption_font_for_build,
+        PasteShortcutPlatform, SplitGeometry, UiSelection, accept_terminal_snapshot, first_pane_id,
+        pane_extents, selection_for_created, selection_for_pane, split_ratio_at,
+        terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
     };
     use crate::{
         CoreCommand, CoreModel, CreatedResource, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
         TerminalLifecycle, TerminalSnapshot,
     };
-    use gpui::Keystroke;
+    use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
 
     #[test]
@@ -1764,6 +1813,63 @@ mod tests {
         };
 
         assert_eq!(terminal_input_bytes(&key), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn paste_shortcuts_follow_each_desktop_convention() {
+        let key = |modifiers| Keystroke {
+            key: "v".into(),
+            key_char: None,
+            modifiers,
+        };
+        let command_v = key(Modifiers {
+            platform: true,
+            ..Default::default()
+        });
+        let control_v = key(Modifiers {
+            control: true,
+            ..Default::default()
+        });
+        let control_shift_v = key(Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        });
+
+        assert!(terminal_paste_shortcut_for(
+            &command_v,
+            PasteShortcutPlatform::MacOs
+        ));
+        assert!(terminal_paste_shortcut_for(
+            &control_shift_v,
+            PasteShortcutPlatform::Linux
+        ));
+        assert!(terminal_paste_shortcut_for(
+            &control_v,
+            PasteShortcutPlatform::Windows
+        ));
+        assert!(terminal_paste_shortcut_for(
+            &control_shift_v,
+            PasteShortcutPlatform::Windows
+        ));
+        assert!(!terminal_paste_shortcut_for(
+            &control_v,
+            PasteShortcutPlatform::Linux
+        ));
+    }
+
+    #[test]
+    fn control_c_remains_terminal_input() {
+        let key = Keystroke {
+            key: "c".into(),
+            key_char: None,
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(terminal_input_bytes(&key), Some(vec![0x03]));
     }
 
     #[test]

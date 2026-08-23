@@ -34,9 +34,9 @@ mod wire;
 
 use runtime::{CoreRuntime, RuntimeEvent};
 
-// Version 7 makes the authoritative hierarchy and stable Terminal Session IDs
-// part of the attachment, command, snapshot, lease, and event protocol.
-const PROTOCOL_VERSION: u16 = 7;
+// Version 8 adds lease-controlled terminal paste commands whose encoding is
+// resolved inside the Resident Core against its authoritative VT modes.
+const PROTOCOL_VERSION: u16 = 8;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SEMANTIC_EVENT_CAPACITY: usize = 64;
 const SESSION_TICK: Duration = Duration::from_millis(10);
@@ -655,6 +655,49 @@ impl CoreClient {
             Response::Error(error) => Err(CoreCommandError::Message(error)),
             response => Err(CoreCommandError::Message(format!(
                 "invalid input response: {response:?}"
+            ))),
+        }
+    }
+
+    pub fn paste(&mut self, bytes: &[u8]) -> Result<(), CoreCommandError> {
+        let terminal_session_id = self
+            .active_terminal_session_id
+            .ok_or_else(|| CoreCommandError::Message("no active Terminal Session".into()))?;
+        self.paste_to(terminal_session_id, bytes)
+    }
+
+    pub fn paste_to(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        bytes: &[u8],
+    ) -> Result<(), CoreCommandError> {
+        let lease_generation = self
+            .control_leases
+            .get(&terminal_session_id)
+            .ok_or_else(|| {
+                CoreCommandError::Message(format!(
+                    "Terminal Session {} has no Control Lease",
+                    terminal_session_id.as_u64()
+                ))
+            })?
+            .generation;
+        match self
+            .request(Request::Paste {
+                terminal_session_id,
+                lease_generation,
+                bytes: bytes.to_vec(),
+            })
+            .map_err(CoreCommandError::Message)?
+        {
+            Response::Ack => Ok(()),
+            Response::ControlLeaseDenied { reason, lease } => {
+                self.control_leases
+                    .insert(lease.terminal_session_id, lease.clone());
+                Err(CoreCommandError::ControlLeaseDenied { reason, lease })
+            }
+            Response::Error(error) => Err(CoreCommandError::Message(error)),
+            response => Err(CoreCommandError::Message(format!(
+                "invalid paste response: {response:?}"
             ))),
         }
     }
@@ -1559,6 +1602,11 @@ enum Request {
         lease_generation: u64,
         bytes: Vec<u8>,
     },
+    Paste {
+        terminal_session_id: TerminalSessionId,
+        lease_generation: u64,
+        bytes: Vec<u8>,
+    },
     Resize {
         terminal_session_id: TerminalSessionId,
         lease_generation: u64,
@@ -1617,6 +1665,10 @@ enum Response {
 
 enum WorkerRequest {
     Input {
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    },
+    Paste {
         terminal_session_id: TerminalSessionId,
         bytes: Vec<u8>,
     },
@@ -1880,6 +1932,21 @@ impl ResidentCore {
                                 } => runtime
                                     .input(terminal_session_id, &bytes)
                                     .map(|()| WorkerResponse::Ack),
+                                WorkerRequest::Paste {
+                                    terminal_session_id,
+                                    bytes,
+                                } => match runtime.paste(terminal_session_id, &bytes) {
+                                    Ok(changed) => {
+                                        if changed {
+                                            changed_terminal = runtime
+                                                .terminal_revision(terminal_session_id)
+                                                .ok()
+                                                .map(|revision| (terminal_session_id, revision));
+                                        }
+                                        Ok(WorkerResponse::Ack)
+                                    }
+                                    Err(error) => Err(error),
+                                },
                                 WorkerRequest::Resize {
                                     terminal_session_id,
                                     size,
@@ -2678,6 +2745,10 @@ fn handle_client(
                 Response::Error("terminal input command exceeds 1 MiB".into()),
                 None,
             ),
+            Request::Paste { bytes, .. } if bytes.len() > 1024 * 1024 => (
+                Response::Error("terminal paste command exceeds 1 MiB".into()),
+                None,
+            ),
             Request::Input {
                 terminal_session_id,
                 lease_generation,
@@ -2688,6 +2759,22 @@ fn handle_client(
                     terminal_session_id,
                     lease_generation,
                     WorkerRequest::Input {
+                        terminal_session_id,
+                        bytes,
+                    },
+                ),
+                None,
+            ),
+            Request::Paste {
+                terminal_session_id,
+                lease_generation,
+                bytes,
+            } => (
+                core.controlled_call(
+                    client_id,
+                    terminal_session_id,
+                    lease_generation,
+                    WorkerRequest::Paste {
                         terminal_session_id,
                         bytes,
                     },

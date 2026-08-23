@@ -127,6 +127,13 @@ fn hierarchy_commands_run_multiple_terminals_and_reconnect_by_stable_id() {
             ..
         })
     ));
+    assert!(matches!(
+        stale_observer.paste_to(first_terminal, b"MUST_NOT_PASTE_TO_FIRST"),
+        Err(CoreCommandError::ControlLeaseDenied {
+            reason: ControlLeaseDenial::HeldByOther,
+            ..
+        })
+    ));
     wait_for_terminal_text(
         &mut stale_observer,
         second_terminal,

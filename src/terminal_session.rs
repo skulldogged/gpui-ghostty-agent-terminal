@@ -157,6 +157,11 @@ impl TerminalSession {
         self.process.write(bytes)
     }
 
+    pub fn paste(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let encoded = self.terminal.encode_paste(bytes)?;
+        self.process.write(&encoded)
+    }
+
     pub(crate) fn size(&self) -> TerminalSize {
         self.size
     }
@@ -290,10 +295,39 @@ mod tests {
         ghostty,
         pty::{PtyOutput, PtySize},
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     struct OutputDuringResize {
         output: flume::Sender<PtyOutput>,
+    }
+
+    struct RecordingTransport {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl TerminalTransport for RecordingTransport {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     impl TerminalTransport for OutputDuringResize {
@@ -362,6 +396,36 @@ mod tests {
             snapshot.cursor,
             Some((previous_size.cols - 1, 0)),
             "bytes accepted before the transport resize must use the previous grid"
+        );
+    }
+
+    #[test]
+    fn paste_writes_ghostty_encoded_unicode_and_multiline_bytes_once() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (_output_tx, output_rx) = flume::unbounded();
+        let mut terminal =
+            ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        terminal.feed(b"\x1b[?2004h");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        session
+            .paste("first 雪\nsecond".as_bytes())
+            .expect("paste through terminal session");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[200~first \xe9\x9b\xaa\nsecond\x1b[201~"
         );
     }
 

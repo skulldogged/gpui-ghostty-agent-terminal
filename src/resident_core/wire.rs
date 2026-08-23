@@ -22,6 +22,7 @@ const REQUEST_ACQUIRE_CONTROL: u8 = 8;
 const REQUEST_DETACH: u8 = 9;
 const REQUEST_CORE_SNAPSHOT: u8 = 10;
 const REQUEST_APPLY_CORE_COMMAND: u8 = 11;
+const REQUEST_PASTE: u8 = 12;
 const RESPONSE_READY: u8 = 1;
 const RESPONSE_ACK: u8 = 2;
 const RESPONSE_SNAPSHOT: u8 = 3;
@@ -51,6 +52,16 @@ pub(super) fn encode_request(request: &Request) -> io::Result<Vec<u8>> {
             bytes,
         } => {
             payload.push(REQUEST_INPUT);
+            put_terminal_session_id(&mut payload, *terminal_session_id);
+            payload.extend_from_slice(&lease_generation.to_le_bytes());
+            put_bytes(&mut payload, bytes)?;
+        }
+        Request::Paste {
+            terminal_session_id,
+            lease_generation,
+            bytes,
+        } => {
+            payload.push(REQUEST_PASTE);
             put_terminal_session_id(&mut payload, *terminal_session_id);
             payload.extend_from_slice(&lease_generation.to_le_bytes());
             put_bytes(&mut payload, bytes)?;
@@ -133,6 +144,11 @@ pub(super) fn decode_request(frame: &[u8]) -> io::Result<Request> {
             nonce: decoder.array()?,
         },
         REQUEST_INPUT => Request::Input {
+            terminal_session_id: decode_terminal_session_id(&mut decoder)?,
+            lease_generation: decoder.u64()?,
+            bytes: decoder.bytes()?.to_vec(),
+        },
+        REQUEST_PASTE => Request::Paste {
             terminal_session_id: decode_terminal_session_id(&mut decoder)?,
             lease_generation: decoder.u64()?,
             bytes: decoder.bytes()?.to_vec(),
@@ -1234,9 +1250,14 @@ mod tests {
                 lease_generation: 11,
                 bytes: vec![0, 0xff, b'\n', b'{', b'}'],
             },
-            Request::Resize {
+            Request::Paste {
                 terminal_session_id,
                 lease_generation: 12,
+                bytes: "Unicode: 雪\nnext line".as_bytes().to_vec(),
+            },
+            Request::Resize {
+                terminal_session_id,
+                lease_generation: 13,
                 size: TerminalSize::new(132, 43, 9, 18),
             },
             Request::Snapshot {
