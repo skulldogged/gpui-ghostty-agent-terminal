@@ -1836,76 +1836,85 @@ impl ResidentCore {
                 let mut event_sequence = 0_u64;
 
                 loop {
-                    for event in runtime.refresh() {
-                        match event {
-                            RuntimeEvent::TerminalLifecycleChanged {
-                                terminal_session_id,
-                                lifecycle,
-                                terminal_revision,
-                            } => {
-                                publish_semantic_event(
-                                    &worker_semantic,
-                                    SemanticEventKind::TerminalLifecycleChanged {
-                                        terminal_session_id,
-                                        lifecycle,
-                                        terminal_revision,
-                                    },
-                                );
-                            }
-                            RuntimeEvent::TerminalChanged {
-                                terminal_session_id,
-                                terminal_revision,
-                            } => {
-                                publish_terminal_change(
-                                    &worker_subscribers,
-                                    &mut event_sequence,
-                                    terminal_session_id,
-                                    terminal_revision,
-                                );
-                            }
-                        }
-                    }
+                    publish_runtime_events(
+                        runtime.refresh(),
+                        &worker_subscribers,
+                        &mut event_sequence,
+                        &worker_semantic,
+                    );
                     match commands_rx.recv_timeout(SESSION_TICK) {
                         Ok(command) => {
+                            // A terminal may exit while this worker is blocked waiting for
+                            // the next command. Reconcile that exit before touching its
+                            // transport so an already queued resize or input becomes a
+                            // harmless no-op instead of a closed-pipe error.
+                            publish_runtime_events(
+                                runtime.refresh(),
+                                &worker_subscribers,
+                                &mut event_sequence,
+                                &worker_semantic,
+                            );
                             let stop = matches!(command.request, WorkerRequest::Stop);
                             let mut changed_terminal = None;
                             let result = match command.request {
                                 WorkerRequest::Input {
                                     terminal_session_id,
                                     bytes,
-                                } => runtime
-                                    .input(terminal_session_id, &bytes)
-                                    .map(|()| WorkerResponse::Ack),
+                                } => {
+                                    if runtime.contains_terminal(terminal_session_id) {
+                                        runtime
+                                            .input(terminal_session_id, &bytes)
+                                            .map(|()| WorkerResponse::Ack)
+                                    } else {
+                                        Ok(WorkerResponse::Ack)
+                                    }
+                                }
                                 WorkerRequest::Paste {
                                     terminal_session_id,
                                     bytes,
-                                } => match runtime.paste(terminal_session_id, &bytes) {
-                                    Ok(changed) => {
-                                        if changed {
-                                            changed_terminal = runtime
-                                                .terminal_revision(terminal_session_id)
-                                                .ok()
-                                                .map(|revision| (terminal_session_id, revision));
+                                } => {
+                                    if runtime.contains_terminal(terminal_session_id) {
+                                        match runtime.paste(terminal_session_id, &bytes) {
+                                            Ok(changed) => {
+                                                if changed {
+                                                    changed_terminal = runtime
+                                                        .terminal_revision(terminal_session_id)
+                                                        .ok()
+                                                        .map(|revision| {
+                                                            (terminal_session_id, revision)
+                                                        });
+                                                }
+                                                Ok(WorkerResponse::Ack)
+                                            }
+                                            Err(error) => Err(error),
                                         }
+                                    } else {
                                         Ok(WorkerResponse::Ack)
                                     }
-                                    Err(error) => Err(error),
-                                },
+                                }
                                 WorkerRequest::Resize {
                                     terminal_session_id,
                                     size,
-                                } => match runtime.resize(terminal_session_id, size) {
-                                    Ok(changed) => {
-                                        if changed {
-                                            changed_terminal = runtime
-                                                .terminal_revision(terminal_session_id)
-                                                .ok()
-                                                .map(|revision| (terminal_session_id, revision));
+                                } => {
+                                    if runtime.contains_terminal(terminal_session_id) {
+                                        match runtime.resize(terminal_session_id, size) {
+                                            Ok(changed) => {
+                                                if changed {
+                                                    changed_terminal = runtime
+                                                        .terminal_revision(terminal_session_id)
+                                                        .ok()
+                                                        .map(|revision| {
+                                                            (terminal_session_id, revision)
+                                                        });
+                                                }
+                                                Ok(WorkerResponse::Ack)
+                                            }
+                                            Err(error) => Err(error),
                                         }
+                                    } else {
                                         Ok(WorkerResponse::Ack)
                                     }
-                                    Err(error) => Err(error),
-                                },
+                                }
                                 WorkerRequest::Snapshot {
                                     terminal_session_id,
                                     since,
@@ -2026,19 +2035,6 @@ impl ResidentCore {
             .leases
             .get(&terminal_session_id)
             .cloned()
-    }
-
-    fn control_leases(&self) -> Vec<ControlLease> {
-        let mut leases = self
-            .control
-            .lock()
-            .expect("Resident Core Control Lease mutex poisoned")
-            .leases
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        leases.sort_unstable_by_key(|lease| lease.terminal_session_id);
-        leases
     }
 
     fn controlled_call(
@@ -2255,7 +2251,21 @@ impl ResidentCore {
             WorkerResponse::CoreSnapshot(snapshot) => snapshot,
             _ => return Err("invalid Core snapshot worker response".into()),
         };
-        Ok((snapshot, self.control_leases()))
+        let session_ids = snapshot
+            .terminal_sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        let mut control = self
+            .control
+            .lock()
+            .expect("Resident Core Control Lease mutex poisoned");
+        control
+            .leases
+            .retain(|terminal_session_id, _| session_ids.contains(terminal_session_id));
+        let mut leases = control.leases.values().cloned().collect::<Vec<_>>();
+        leases.sort_unstable_by_key(|lease| lease.terminal_session_id);
+        Ok((snapshot, leases))
     }
 
     fn subscribe_semantic(
@@ -2325,6 +2335,56 @@ impl ResidentCore {
         response_rx
             .recv()
             .map_err(|_| "Resident Core terminal thread stopped before responding".to_string())?
+    }
+}
+
+fn publish_runtime_events(
+    events: Vec<RuntimeEvent>,
+    subscribers: &Arc<Mutex<Vec<TerminalSubscriber>>>,
+    terminal_sequence: &mut u64,
+    semantic: &Arc<Mutex<SemanticState>>,
+) {
+    for event in events {
+        match event {
+            RuntimeEvent::TerminalLifecycleChanged {
+                terminal_session_id,
+                lifecycle,
+                terminal_revision,
+            } => publish_semantic_event(
+                semantic,
+                SemanticEventKind::TerminalLifecycleChanged {
+                    terminal_session_id,
+                    lifecycle,
+                    terminal_revision,
+                },
+            ),
+            RuntimeEvent::TerminalChanged {
+                terminal_session_id,
+                terminal_revision,
+            } => publish_terminal_change(
+                subscribers,
+                terminal_sequence,
+                terminal_session_id,
+                terminal_revision,
+            ),
+            RuntimeEvent::PaneClosed {
+                terminal_session_id,
+                revision,
+            } => {
+                for subscriber in subscribers
+                    .lock()
+                    .expect("Resident Core subscriber mutex poisoned")
+                    .iter()
+                {
+                    subscriber
+                        .pending
+                        .lock()
+                        .expect("Resident Core pending-change mutex poisoned")
+                        .remove(&terminal_session_id);
+                }
+                publish_semantic_event(semantic, SemanticEventKind::HierarchyChanged { revision });
+            }
+        }
     }
 }
 

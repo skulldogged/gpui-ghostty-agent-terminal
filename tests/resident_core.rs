@@ -1,7 +1,7 @@
 use agent_terminal::{
     ControlLeaseDenial, CoreClient, CoreCommand, CoreCommandError, CoreEndpoint, CoreModelError,
-    CreatedResource, PaneLayout, SemanticEventKind, TerminalLifecycle, TerminalSessionId,
-    TerminalSize,
+    CreatedResource, PaneLayout, SemanticEventKind, SplitAxis, SplitPlacement, SplitRatio,
+    TerminalLifecycle, TerminalSessionId, TerminalSize,
 };
 use std::{
     process::{Child, ChildStdin, Command, Stdio},
@@ -265,6 +265,78 @@ fn an_empty_hierarchy_can_reconnect_and_create_a_new_space() {
         .expect("new Terminal Session is controllable");
     wait_for_text(&mut reattached, "RECREATED_AFTER_EMPTY");
     reattached.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[test]
+fn natural_shell_exit_closes_its_pane_and_collapses_empty_ancestors() {
+    let endpoint = isolated_endpoint("natural-exit-closes-pane");
+    let mut core = spawn_core(&endpoint);
+    let mut client =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
+    let initial = client.core_snapshot().clone();
+    let first_terminal = client
+        .active_terminal_session_id()
+        .expect("initial Terminal Session");
+    let first_pane = match &initial.spaces[0].tabs[0].layout {
+        PaneLayout::Pane(pane) => pane.id,
+        PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+    };
+    let split = client
+        .apply_core_command(CoreCommand::SplitPane {
+            pane_id: first_pane,
+            axis: SplitAxis::Vertical,
+            placement: SplitPlacement::After,
+            ratio: SplitRatio::EQUAL,
+        })
+        .expect("split initial Pane");
+    let CreatedResource::Pane {
+        pane_id: second_pane,
+        terminal_session_id: second_terminal,
+        ..
+    } = split.created
+    else {
+        panic!("split must identify the new Pane and Terminal Session");
+    };
+
+    client
+        .input_to(first_terminal, b"exit\r")
+        .expect("exit first shell");
+    let first_exit_revision = wait_for_hierarchy_event(&mut client, split.revision);
+    client
+        .resize_terminal(first_terminal, TerminalSize::new(81, 24, 10, 20))
+        .expect("an already queued resize for an exited Pane is a harmless no-op");
+    let after_first_exit = client
+        .refresh_core_snapshot()
+        .expect("refresh hierarchy after first natural exit");
+    assert!(after_first_exit.revision >= first_exit_revision);
+    assert_eq!(after_first_exit.spaces.len(), 1);
+    assert_eq!(after_first_exit.spaces[0].tabs.len(), 1);
+    assert_eq!(after_first_exit.terminal_sessions.len(), 1);
+    assert_eq!(after_first_exit.terminal_sessions[0].id, second_terminal);
+    assert!(client.control_lease_for(first_terminal).is_none());
+    assert!(matches!(
+        after_first_exit.spaces[0].tabs[0].layout,
+        PaneLayout::Pane(ref pane) if pane.id == second_pane
+    ));
+
+    client
+        .input_to(second_terminal, b"echo SURVIVING_PANE_UNCHANGED\r")
+        .expect("write surviving Terminal Session");
+    wait_for_terminal_text(&mut client, second_terminal, "SURVIVING_PANE_UNCHANGED");
+
+    client
+        .input_to(second_terminal, b"exit\r")
+        .expect("exit final shell");
+    let final_exit_revision = wait_for_hierarchy_event(&mut client, after_first_exit.revision);
+    let after_final_exit = client
+        .refresh_core_snapshot()
+        .expect("refresh hierarchy after final natural exit");
+    assert!(after_final_exit.revision >= final_exit_revision);
+    assert!(after_final_exit.spaces.is_empty());
+    assert!(after_final_exit.terminal_sessions.is_empty());
+
+    client.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
 }
 
@@ -565,7 +637,7 @@ fn a_slow_semantic_observer_recovers_without_blocking_the_controller_or_terminal
 }
 
 #[test]
-fn snapshots_report_revisions_and_terminal_exit() {
+fn running_terminal_snapshots_report_revisions() {
     let endpoint = isolated_endpoint("revision-lifecycle");
     let mut core = spawn_core(&endpoint);
     let mut client =
@@ -595,24 +667,7 @@ fn snapshots_report_revisions_and_terminal_exit() {
         "oversized grids must be rejected before reaching libghostty-vt"
     );
 
-    client
-        .input(b"\rexit\r")
-        .expect("release shell revision hold and exit");
-    let lifecycle_event = client
-        .wait_for_semantic_event(Duration::from_secs(10))
-        .expect("wait for Terminal Session lifecycle event")
-        .expect("terminal exit must publish a semantic event");
-    let lifecycle_revision = match lifecycle_event.kind {
-        SemanticEventKind::TerminalLifecycleChanged {
-            lifecycle: TerminalLifecycle::Exited,
-            terminal_revision,
-            ..
-        } => terminal_revision,
-        event => panic!("expected Terminal Session exit event, got {event:?}"),
-    };
-    let exited = wait_for_snapshot_after(&mut client, initial.revision);
-    assert_eq!(exited.lifecycle, TerminalLifecycle::Exited);
-    assert!(exited.revision >= lifecycle_revision);
+    client.input(b"\r").expect("release shell revision hold");
     client.stop_resident_core().expect("stop Resident Core");
     wait_for_core_exit(&mut core);
 }
@@ -729,25 +784,22 @@ fn wait_for_process_exit(process: &mut ChildGuard, process_name: &str) {
     panic!("{process_name} did not exit before timeout");
 }
 
-fn wait_for_snapshot_after(
-    client: &mut CoreClient,
-    mut revision: u64,
-) -> agent_terminal::TerminalSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn wait_for_hierarchy_event(client: &mut CoreClient, after_revision: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        match client
-            .snapshot_since(revision)
-            .expect("request changed Terminal Session snapshot")
+        let Some(event) = client
+            .wait_for_semantic_event(Duration::from_millis(100))
+            .expect("wait for natural-exit hierarchy event")
+        else {
+            continue;
+        };
+        if let SemanticEventKind::HierarchyChanged { revision } = event.kind
+            && revision > after_revision
         {
-            Some(snapshot) if snapshot.lifecycle != TerminalLifecycle::Running => return snapshot,
-            Some(snapshot) => {
-                revision = snapshot.revision;
-            }
-            None => {}
+            return revision;
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("Terminal Session did not report a lifecycle change before timeout");
+    panic!("natural shell exit did not close its Pane before timeout");
 }
 
 fn wait_for_text(client: &mut CoreClient, marker: &str) {
