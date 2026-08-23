@@ -19,6 +19,8 @@ LEGACY_TARGET_REPO=${TARGET_REPO:-}
 
 DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-github-machine"
 TOKEN_FILE="${AGENT_GITHUB_TOKEN_FILE:-$DATA_ROOT/$AGENT_GITHUB_USER/github-token}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+WINDOWS_TOKEN_STORE="$SCRIPT_DIR/windows-token-store.ps1"
 
 read_token() {
   TOKEN=""
@@ -52,8 +54,47 @@ lookup_file_token() {
   printf '%s' "$TOKEN"
 }
 
+windows_dpapi_available() {
+  [[ -n "${WINDIR:-}" ]] && command -v powershell.exe >/dev/null 2>&1 && \
+    command -v cygpath >/dev/null 2>&1 && [[ -r "$WINDOWS_TOKEN_STORE" ]]
+}
+
+windows_token_file() {
+  cygpath -w "$TOKEN_FILE"
+}
+
+store_windows_dpapi_token() {
+  local token_file_windows
+  token_file_windows=$(windows_token_file)
+  printf '%s' "$TOKEN" | powershell.exe \
+    -NoProfile \
+    -ExecutionPolicy Bypass \
+    -File "$(cygpath -w "$WINDOWS_TOKEN_STORE")" \
+    store "$token_file_windows"
+}
+
+lookup_windows_dpapi_token() {
+  local token_file_windows
+  token_file_windows=$(windows_token_file)
+  powershell.exe \
+    -NoProfile \
+    -ExecutionPolicy Bypass \
+    -File "$(cygpath -w "$WINDOWS_TOKEN_STORE")" \
+    lookup "$token_file_windows"
+}
+
 COMMAND=${1:-}
 case "$COMMAND" in
+  store-windows-dpapi)
+    read_token
+    if ! windows_dpapi_available; then
+      unset TOKEN
+      printf 'token-store: Windows DPAPI is unavailable\n' >&2
+      exit 1
+    fi
+    store_windows_dpapi_token
+    unset TOKEN
+    ;;
   store-secret-service)
     read_token
     if [[ "${CODEX_GITHUB_DISABLE_SECRET_SERVICE:-}" == "1" ]] || \
@@ -93,6 +134,13 @@ case "$COMMAND" in
     ;;
   lookup)
     TOKEN=""
+    if windows_dpapi_available && [[ -f "$TOKEN_FILE" ]]; then
+      if lookup_windows_dpapi_token; then
+        exit 0
+      fi
+      printf 'token-store: the Windows token could not be decrypted by this user\n' >&2
+      exit 1
+    fi
     if [[ "${CODEX_GITHUB_DISABLE_SECRET_SERVICE:-}" != "1" ]] && \
        command -v secret-tool >/dev/null 2>&1; then
       TOKEN=$(secret-tool lookup \
@@ -119,7 +167,7 @@ case "$COMMAND" in
     exit 1
     ;;
   *)
-    printf 'Usage: token-store {store-secret-service|store-file|lookup}\n' >&2
+    printf 'Usage: token-store {store-windows-dpapi|store-secret-service|store-file|lookup}\n' >&2
     exit 2
     ;;
 esac
