@@ -25,6 +25,7 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
     let terminal_font = TerminalFont::resolve(cx)?;
     let core = CoreClient::connect_or_spawn()?;
     let (driver, projection) = CoreDriver::start(core)?;
+    let shell = WorkspaceShell::from_environment();
     let selection = UiSelection::initial(&projection.hierarchy);
     let terminal_errors = projection
         .terminals
@@ -35,10 +36,11 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
         .collect();
     let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
     let window = cx
-        .open_window(WorkspaceShell::window_options(bounds), move |window, cx| {
+        .open_window(shell.window_options(bounds), move |window, cx| {
             let focus = cx.focus_handle();
             focus.focus(window, cx);
             let view = cx.new(|_| MultiplexerView {
+                shell,
                 driver,
                 hierarchy: projection.hierarchy,
                 terminals: projection.terminals,
@@ -75,6 +77,7 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
 }
 
 struct MultiplexerView {
+    shell: WorkspaceShell,
     driver: CoreDriver,
     hierarchy: CoreSnapshot,
     terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
@@ -615,9 +618,9 @@ impl MultiplexerView {
             .w(px(self.sidebar_width))
             .h_full()
             .flex_none()
-            .bg(WorkspaceShell::color(ShellColor::Sidebar))
+            .bg(self.shell.color(ShellColor::Sidebar))
             .border_r_1()
-            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .border_color(self.shell.color(ShellColor::Border))
             .px_1()
             .pt_2()
             .gap(px(2.))
@@ -630,12 +633,12 @@ impl MultiplexerView {
                     .px_3()
                     .text_size(px(11.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                    .text_color(self.shell.color(ShellColor::FaintText))
                     .child("SPACES")
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                            .text_color(self.shell.color(ShellColor::FaintText))
                             .child(self.hierarchy.spaces.len().to_string()),
                     ),
             );
@@ -667,14 +670,14 @@ impl MultiplexerView {
                     .rounded_lg()
                     .border_1()
                     .border_color(if selected {
-                        WorkspaceShell::color(ShellColor::SelectedBorder)
+                        self.shell.color(ShellColor::SelectedBorder)
                     } else {
-                        WorkspaceShell::color(ShellColor::Sidebar)
+                        self.shell.color(ShellColor::Sidebar)
                     })
                     .when(selected, |this| {
-                        this.bg(WorkspaceShell::color(ShellColor::Selected))
+                        this.bg(self.shell.color(ShellColor::Selected))
                     })
-                    .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
+                    .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
                     .on_click(cx.listener(move |view, _event, window, cx| {
                         view.select_space(space_id, window, cx)
                     }))
@@ -687,16 +690,16 @@ impl MultiplexerView {
                             .size(px(24.))
                             .rounded_full()
                             .bg(if selected {
-                                WorkspaceShell::color(ShellColor::AccentMuted)
+                                self.shell.color(ShellColor::AccentMuted)
                             } else {
-                                WorkspaceShell::color(ShellColor::Hover)
+                                self.shell.color(ShellColor::Hover)
                             })
                             .text_size(px(11.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(if selected {
-                                WorkspaceShell::color(ShellColor::Accent)
+                                self.shell.color(ShellColor::Accent)
                             } else {
-                                WorkspaceShell::color(ShellColor::MutedText)
+                                self.shell.color(ShellColor::MutedText)
                             })
                             .child(initial),
                     )
@@ -716,14 +719,14 @@ impl MultiplexerView {
                                     } else {
                                         gpui::FontWeight::NORMAL
                                     })
-                                    .text_color(WorkspaceShell::color(ShellColor::Text))
+                                    .text_color(self.shell.color(ShellColor::Text))
                                     .child(space.name.clone()),
                             )
                             .child(
                                 div()
                                     .truncate()
                                     .text_size(px(11.))
-                                    .text_color(WorkspaceShell::color(ShellColor::FaintText))
+                                    .text_color(self.shell.color(ShellColor::FaintText))
                                     .child(metadata),
                             ),
                     ),
@@ -758,11 +761,11 @@ impl MultiplexerView {
         danger: bool,
     ) -> gpui::Stateful<gpui::Div> {
         let color = if danger {
-            WorkspaceShell::color(ShellColor::Danger)
+            self.shell.color(ShellColor::Danger)
         } else if active {
-            WorkspaceShell::color(ShellColor::Accent)
+            self.shell.color(ShellColor::Accent)
         } else {
-            WorkspaceShell::color(ShellColor::MutedText)
+            self.shell.color(ShellColor::MutedText)
         };
         div()
             .id(id)
@@ -774,16 +777,16 @@ impl MultiplexerView {
             .cursor_pointer()
             .rounded_lg()
             .when(active, |this| {
-                this.bg(WorkspaceShell::color(ShellColor::AccentMuted))
+                this.bg(self.shell.color(ShellColor::AccentMuted))
             })
             .hover(move |this| {
-                this.bg(WorkspaceShell::color(if danger {
+                this.bg(self.shell.color(if danger {
                     ShellColor::DangerHover
                 } else {
                     ShellColor::Hover
                 }))
             })
-            .child(WorkspaceShell::icon(icon, color))
+            .child(self.shell.icon(icon, color))
     }
 
     fn render_titlebar_drag_region(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
@@ -852,16 +855,16 @@ impl MultiplexerView {
                     .w(px(46.))
                     .h_full()
                     .text_size(px(if cfg!(windows) { 10. } else { 13. }))
-                    .text_color(WorkspaceShell::color(ShellColor::MutedText))
+                    .text_color(self.shell.color(ShellColor::MutedText))
                     .when(cfg!(windows), |this| this.font_family(windows_caption_font))
                     .window_control_area(area)
                     .hover(move |this| {
-                        this.bg(WorkspaceShell::color(if danger {
+                        this.bg(self.shell.color(if danger {
                             ShellColor::DangerHover
                         } else {
                             ShellColor::Hover
                         }))
-                        .text_color(WorkspaceShell::color(if danger {
+                        .text_color(self.shell.color(if danger {
                             ShellColor::Danger
                         } else {
                             ShellColor::Text
@@ -946,7 +949,7 @@ impl MultiplexerView {
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .border_color(self.shell.color(ShellColor::Border))
             .px_2()
             .when(cfg!(target_os = "macos"), |this| this.pl(px(78.)))
             .when(!cfg!(target_os = "macos"), |this| {
@@ -956,10 +959,10 @@ impl MultiplexerView {
                         .items_center()
                         .justify_center()
                         .size(px(WorkspaceShell::CHROME_TILE_SIZE))
-                        .child(WorkspaceShell::icon(
-                            ShellIcon::AppMark,
-                            WorkspaceShell::color(ShellColor::Accent),
-                        )),
+                        .child(
+                            self.shell
+                                .icon(ShellIcon::AppMark, self.shell.color(ShellColor::Accent)),
+                        ),
                 )
             })
             .child(self.render_titlebar_drag_region("sidebar-titlebar-drag-region", cx))
@@ -994,33 +997,34 @@ impl MultiplexerView {
                         .rounded_lg()
                         .border_1()
                         .border_color(if selected {
-                            WorkspaceShell::color(ShellColor::SelectedBorder)
+                            self.shell.color(ShellColor::SelectedBorder)
                         } else {
-                            WorkspaceShell::color(ShellColor::Chrome)
+                            self.shell.color(ShellColor::Chrome)
                         })
                         .text_size(px(13.))
                         .text_color(if selected {
-                            WorkspaceShell::color(ShellColor::Text)
+                            self.shell.color(ShellColor::Text)
                         } else {
-                            WorkspaceShell::color(ShellColor::MutedText)
+                            self.shell.color(ShellColor::MutedText)
                         })
                         .when(selected, |this| {
-                            this.bg(WorkspaceShell::color(ShellColor::Selected))
+                            this.bg(self.shell.color(ShellColor::Selected))
                         })
-                        .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
+                        .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
                         .on_click(cx.listener(move |view, _event, window, cx| {
                             view.select_tab(tab_id, window, cx)
                         }))
                         .child(
-                            WorkspaceShell::icon(
-                                ShellIcon::AppMark,
-                                WorkspaceShell::color(if selected {
-                                    ShellColor::Accent
-                                } else {
-                                    ShellColor::FaintText
-                                }),
-                            )
-                            .size(px(11.)),
+                            self.shell
+                                .icon(
+                                    ShellIcon::AppMark,
+                                    self.shell.color(if selected {
+                                        ShellColor::Accent
+                                    } else {
+                                        ShellColor::FaintText
+                                    }),
+                                )
+                                .size(px(11.)),
                         )
                         .child(div().truncate().child(tab.name.clone())),
                 );
@@ -1067,9 +1071,9 @@ impl MultiplexerView {
             .h(px(WorkspaceShell::TITLE_BAR_HEIGHT))
             .w_full()
             .flex_none()
-            .bg(WorkspaceShell::color(ShellColor::Chrome))
+            .bg(self.shell.color(ShellColor::Chrome))
             .border_b_1()
-            .border_color(WorkspaceShell::color(ShellColor::Border))
+            .border_color(self.shell.color(ShellColor::Border))
             .child(sidebar_chrome)
             .child(tabs)
             .child(self.render_titlebar_drag_region("main-titlebar-drag-region", cx))
@@ -1086,8 +1090,8 @@ impl MultiplexerView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(WorkspaceShell::color(ShellColor::Window))
-                .text_color(WorkspaceShell::color(ShellColor::MutedText))
+                .bg(self.shell.color(ShellColor::Window))
+                .text_color(self.shell.color(ShellColor::MutedText))
                 .child("No Spaces yet")
                 .into_any_element(),
         }
@@ -1113,9 +1117,9 @@ impl MultiplexerView {
                 this.h(px(SPLIT_DIVIDER_PX)).w_full().cursor_row_resize()
             })
             .when(active, |this| {
-                this.bg(WorkspaceShell::color(ShellColor::AccentMuted))
+                this.bg(self.shell.color(ShellColor::AccentMuted))
             })
-            .hover(|this| this.bg(WorkspaceShell::color(ShellColor::Hover)))
+            .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, _event, _window, cx| {
@@ -1129,7 +1133,7 @@ impl MultiplexerView {
                         this.w(px(1.)).h_full()
                     })
                     .when(axis == SplitAxis::Vertical, |this| this.h(px(1.)).w_full())
-                    .bg(WorkspaceShell::color(if active {
+                    .bg(self.shell.color(if active {
                         ShellColor::Accent
                     } else {
                         ShellColor::Border
@@ -1200,13 +1204,13 @@ impl MultiplexerView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(0x0b0e13))
+                .bg(self.shell.terminal_background(rgb(0x0b0e13)))
                 .text_color(rgb(0x8993a4))
                 .child("Starting terminal…")
                 .into_any_element();
         };
         let frame = TerminalFrame::from_snapshot(snapshot);
-        let default_bg = color(snapshot.default_bg);
+        let default_bg = self.shell.terminal_background(color(snapshot.default_bg));
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
         let shape_frame = frame.clone();
@@ -1305,7 +1309,7 @@ impl MultiplexerView {
             .bg(default_bg)
             .border_1()
             .border_color(if focused {
-                WorkspaceShell::color(ShellColor::Accent)
+                self.shell.color(ShellColor::Accent)
             } else {
                 default_bg
             })
@@ -1324,7 +1328,7 @@ impl MultiplexerView {
                             .absolute()
                             .bottom(px(8.))
                             .left(px(12.))
-                            .text_color(WorkspaceShell::color(ShellColor::Danger))
+                            .text_color(self.shell.color(ShellColor::Danger))
                             .child(error),
                     )
                 },
@@ -1401,7 +1405,7 @@ impl Render for MultiplexerView {
             .flex_col()
             .size_full()
             .overflow_hidden()
-            .bg(WorkspaceShell::color(ShellColor::Window))
+            .bg(self.shell.root_color())
             .child(self.render_title_bar(window, cx))
             .child(
                 div()
@@ -1427,10 +1431,10 @@ impl Render for MultiplexerView {
                         .right(px(12.))
                         .bottom(px(10.))
                         .rounded_lg()
-                        .bg(WorkspaceShell::color(ShellColor::DangerHover))
+                        .bg(self.shell.color(ShellColor::DangerHover))
                         .px_3()
                         .py_2()
-                        .text_color(WorkspaceShell::color(ShellColor::Danger))
+                        .text_color(self.shell.color(ShellColor::Danger))
                         .child(error),
                 )
             })
