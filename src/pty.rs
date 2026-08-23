@@ -89,7 +89,8 @@ mod unix {
 
             let mut command = CommandBuilder::new(shell());
             command.cwd(working_directory);
-            configure_terminal_environment(&mut command);
+            command.env("TERM", "xterm-256color");
+            command.env("COLORTERM", "truecolor");
 
             let child = pair
                 .slave
@@ -206,12 +207,6 @@ mod unix {
                 .map(|_| ())
                 .map_err(|error| format!("reap terminal process: {error}"))
         }
-    }
-
-    fn configure_terminal_environment(command: &mut CommandBuilder) {
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env_remove("NO_COLOR");
     }
 
     fn drain_ready_output(
@@ -341,20 +336,6 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use portable_pty::CommandBuilder;
-
-        #[test]
-        fn interactive_terminal_environment_enables_color() {
-            let mut command = CommandBuilder::new("shell");
-            command.env("NO_COLOR", "1");
-
-            super::configure_terminal_environment(&mut command);
-
-            assert_eq!(command.get_env("TERM"), Some("xterm-256color".as_ref()));
-            assert_eq!(command.get_env("COLORTERM"), Some("truecolor".as_ref()));
-            assert_eq!(command.get_env("NO_COLOR"), None);
-        }
-
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_eio_is_a_normal_pty_exit() {

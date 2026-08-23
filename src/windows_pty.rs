@@ -596,11 +596,7 @@ fn push_argument(output: &mut Vec<u16>, argument: &OsStr) -> Result<(), String> 
 }
 
 fn environment_block() -> Result<Vec<u16>, String> {
-    environment_block_from(std::env::vars_os().collect())
-}
-
-fn environment_block_from(mut environment: Vec<(OsString, OsString)>) -> Result<Vec<u16>, String> {
-    environment.retain(|(key, _)| !key.eq_ignore_ascii_case("NO_COLOR"));
+    let mut environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     for (key, value) in [
         (OsString::from("TERM"), OsString::from("xterm-256color")),
         (OsString::from("COLORTERM"), OsString::from("truecolor")),
@@ -709,29 +705,4 @@ fn last_error(operation: &str) -> String {
 
 fn hresult_error(operation: &str, result: i32) -> String {
     format!("{operation}: HRESULT 0x{:08X}", result as u32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::environment_block_from;
-    use std::ffi::OsString;
-
-    #[test]
-    fn interactive_terminal_environment_enables_color() {
-        let block = environment_block_from(vec![
-            (OsString::from("Path"), OsString::from("C:\\Windows")),
-            (OsString::from("NO_COLOR"), OsString::from("1")),
-            (OsString::from("TERM"), OsString::from("dumb")),
-        ])
-        .expect("encode terminal environment");
-        let entries = block
-            .split(|value| *value == 0)
-            .take_while(|entry| !entry.is_empty())
-            .map(String::from_utf16_lossy)
-            .collect::<Vec<_>>();
-
-        assert!(entries.iter().any(|entry| entry == "TERM=xterm-256color"));
-        assert!(entries.iter().any(|entry| entry == "COLORTERM=truecolor"));
-        assert!(!entries.iter().any(|entry| entry.starts_with("NO_COLOR=")));
-    }
 }
