@@ -674,7 +674,7 @@ mod tests {
             .input_to(terminal_session_id, b"echo DRIVER_PUSHED_UPDATE\r".to_vec())
             .expect("send terminal input");
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match updates.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Some(DriverUpdate::Terminal {

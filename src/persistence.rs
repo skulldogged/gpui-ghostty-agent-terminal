@@ -811,9 +811,11 @@ fn decode_os_string(bytes: &[u8]) -> Result<OsString, DecodeError> {
             "snapshot Windows path has an odd byte length".into(),
         ));
     }
-    let wide = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    let wide = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect::<Vec<_>>();
     Ok(OsString::from_wide(&wide))
 }
