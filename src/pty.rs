@@ -32,9 +32,15 @@ pub(crate) fn reader_checkpoint(
     control: &flume::Receiver<ReaderControl>,
     output: &flume::Sender<PtyOutput>,
     shutdown: &flume::Receiver<()>,
+    drain_pending: impl FnOnce() -> bool,
 ) -> bool {
     match control.try_recv() {
         Ok(ReaderControl::Pause) => {
+            // The marker is an ordering guarantee, not merely an acknowledgement:
+            // every byte already readable from the platform PTY must be published first.
+            if !drain_pending() {
+                return false;
+            }
             if !send_or_shutdown(output, shutdown, PtyOutput::Paused) {
                 return false;
             }
@@ -113,7 +119,16 @@ mod unix {
                 .spawn(move || {
                     let mut buffer = [0_u8; 16 * 1024];
                     loop {
-                        if !reader_checkpoint(&control_rx, &output_tx, &shutdown_rx) {
+                        if !reader_checkpoint(&control_rx, &output_tx, &shutdown_rx, || {
+                            drain_ready_output(
+                                reader_fd,
+                                &mut reader,
+                                &mut buffer,
+                                &output_tx,
+                                &events,
+                                &shutdown_rx,
+                            )
+                        }) {
                             break;
                         }
                         match wait_until_readable(reader_fd) {
@@ -128,36 +143,14 @@ mod unix {
                                 break;
                             }
                         }
-                        match reader.read(&mut buffer) {
-                            Ok(0) => {
-                                let _ =
-                                    send_or_shutdown(&events, &shutdown_rx, TerminalEvent::Exited);
-                                break;
-                            }
-                            Ok(read)
-                                if !send_or_shutdown(
-                                    &output_tx,
-                                    &shutdown_rx,
-                                    PtyOutput::Bytes(buffer[..read].to_vec()),
-                                ) =>
-                            {
-                                break;
-                            }
-                            Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
-                            Ok(_) => {}
-                            Err(error) if is_normal_pty_exit(&error) => {
-                                let _ =
-                                    send_or_shutdown(&events, &shutdown_rx, TerminalEvent::Exited);
-                                break;
-                            }
-                            Err(error) => {
-                                let _ = send_or_shutdown(
-                                    &events,
-                                    &shutdown_rx,
-                                    TerminalEvent::Failed(format!("PTY read stopped: {error}")),
-                                );
-                                break;
-                            }
+                        if !read_and_publish(
+                            &mut reader,
+                            &mut buffer,
+                            &output_tx,
+                            &events,
+                            &shutdown_rx,
+                        ) {
+                            break;
                         }
                     }
                 })
@@ -216,6 +209,71 @@ mod unix {
         }
     }
 
+    fn drain_ready_output(
+        reader_fd: libc::c_int,
+        reader: &mut dyn Read,
+        buffer: &mut [u8],
+        output: &flume::Sender<PtyOutput>,
+        events: &flume::Sender<TerminalEvent>,
+        shutdown: &flume::Receiver<()>,
+    ) -> bool {
+        loop {
+            match poll_readable(reader_fd, 0) {
+                Ok(false) => return true,
+                Ok(true) => {}
+                Err(error) => {
+                    let _ = send_or_shutdown(
+                        events,
+                        shutdown,
+                        TerminalEvent::Failed(format!("wait for PTY output barrier: {error}")),
+                    );
+                    return false;
+                }
+            }
+            if !read_and_publish(reader, buffer, output, events, shutdown) {
+                return false;
+            }
+        }
+    }
+
+    fn read_and_publish(
+        reader: &mut dyn Read,
+        buffer: &mut [u8],
+        output: &flume::Sender<PtyOutput>,
+        events: &flume::Sender<TerminalEvent>,
+        shutdown: &flume::Receiver<()>,
+    ) -> bool {
+        match reader.read(buffer) {
+            Ok(0) => {
+                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                false
+            }
+            Ok(read)
+                if !send_or_shutdown(
+                    output,
+                    shutdown,
+                    PtyOutput::Bytes(buffer[..read].to_vec()),
+                ) =>
+            {
+                false
+            }
+            Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => true,
+            Ok(_) => true,
+            Err(error) if is_normal_pty_exit(&error) => {
+                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                false
+            }
+            Err(error) => {
+                let _ = send_or_shutdown(
+                    events,
+                    shutdown,
+                    TerminalEvent::Failed(format!("PTY read stopped: {error}")),
+                );
+                false
+            }
+        }
+    }
+
     impl Drop for PtySession {
         fn drop(&mut self) {
             drop(self.shutdown.take());
@@ -255,13 +313,17 @@ mod unix {
     }
 
     fn wait_until_readable(fd: libc::c_int) -> std::io::Result<bool> {
+        poll_readable(fd, 10)
+    }
+
+    fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> std::io::Result<bool> {
         let mut descriptor = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
         loop {
-            let result = unsafe { libc::poll(&mut descriptor, 1, 10) };
+            let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
             if result >= 0 {
                 return Ok(result > 0);
             }
@@ -288,6 +350,8 @@ pub use unix::PtySession;
 
 #[cfg(test)]
 mod tests {
+    use super::{PtyOutput, ReaderControl, reader_checkpoint};
+
     #[test]
     fn shutdown_cancels_a_blocked_worker_send() {
         let (events, _event_receiver) = flume::bounded(1);
@@ -296,5 +360,29 @@ mod tests {
         drop(shutdown);
 
         assert!(!super::send_or_shutdown(&events, &shutdown_receiver, ()));
+    }
+
+    #[test]
+    fn pause_barrier_drains_platform_output_before_its_marker() {
+        let (control, controls) = flume::unbounded();
+        control.send(ReaderControl::Pause).expect("queue pause");
+        control.send(ReaderControl::Resume).expect("queue resume");
+        let (output, outputs) = flume::unbounded();
+        let (_shutdown, shutdown) = flume::bounded::<()>(1);
+
+        assert!(reader_checkpoint(&controls, &output, &shutdown, || {
+            output
+                .send(PtyOutput::Bytes(b"\x1b[?2004h".to_vec()))
+                .is_ok()
+        }));
+
+        assert!(matches!(
+            outputs.recv().expect("receive buffered platform bytes"),
+            PtyOutput::Bytes(bytes) if bytes == b"\x1b[?2004h"
+        ));
+        assert!(matches!(
+            outputs.recv().expect("receive pause marker"),
+            PtyOutput::Paused
+        ));
     }
 }

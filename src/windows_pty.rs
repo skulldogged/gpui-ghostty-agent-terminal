@@ -127,70 +127,27 @@ impl PtySession {
             .spawn(move || {
                 let mut buffer = [0_u8; 16 * 1024];
                 loop {
-                    if !reader_checkpoint(&control_rx, &output_tx, &reader_shutdown) {
+                    if !reader_checkpoint(&control_rx, &output_tx, &reader_shutdown, || {
+                        drain_available_output(
+                            &output_handle,
+                            &mut buffer,
+                            &output_tx,
+                            &reader_events,
+                            &reader_shutdown,
+                        )
+                    }) {
                         break;
                     }
-                    let available = match available_bytes(output_handle.raw()) {
-                        Ok(0) => {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                            continue;
-                        }
-                        Ok(available) => available,
-                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                            let _ = send_or_shutdown(
-                                &reader_events,
-                                &reader_shutdown,
-                                TerminalEvent::Exited,
-                            );
-                            break;
-                        }
-                        Err(error) => {
-                            let _ = send_or_shutdown(
-                                &reader_events,
-                                &reader_shutdown,
-                                TerminalEvent::Failed(format!("inspect ConPTY output: {error}")),
-                            );
-                            break;
-                        }
-                    };
-                    let read_len = available.min(buffer.len());
-                    match read_handle(output_handle.raw(), &mut buffer[..read_len]) {
-                        Ok(0) => {
-                            let _ = send_or_shutdown(
-                                &reader_events,
-                                &reader_shutdown,
-                                TerminalEvent::Exited,
-                            );
-                            break;
-                        }
-                        Ok(read)
-                            if !send_or_shutdown(
-                                &output_tx,
-                                &reader_shutdown,
-                                PtyOutput::Bytes(buffer[..read].to_vec()),
-                            ) =>
-                        {
-                            break;
-                        }
-                        Ok(_) if reader_events.try_send(TerminalEvent::Changed).is_err() => {}
-                        Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                            let _ = send_or_shutdown(
-                                &reader_events,
-                                &reader_shutdown,
-                                TerminalEvent::Exited,
-                            );
-                            break;
-                        }
-                        Err(error) => {
-                            let _ = send_or_shutdown(
-                                &reader_events,
-                                &reader_shutdown,
-                                TerminalEvent::Failed(format!("ConPTY read stopped: {error}")),
-                            );
-                            break;
-                        }
+                    if !drain_available_output(
+                        &output_handle,
+                        &mut buffer,
+                        &output_tx,
+                        &reader_events,
+                        &reader_shutdown,
+                    ) {
+                        break;
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 let _ = output_handle.close();
             })
@@ -273,6 +230,63 @@ impl PtySession {
         // The dedicated ConPTY waiter owns a duplicate process handle and
         // waits for termination before it closes the pseudoconsole.
         Ok(())
+    }
+}
+
+fn drain_available_output(
+    output_handle: &OwnedHandle,
+    buffer: &mut [u8],
+    output: &flume::Sender<PtyOutput>,
+    events: &flume::Sender<TerminalEvent>,
+    shutdown: &flume::Receiver<()>,
+) -> bool {
+    loop {
+        let available = match available_bytes(output_handle.raw()) {
+            Ok(0) => return true,
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                return false;
+            }
+            Err(error) => {
+                let _ = send_or_shutdown(
+                    events,
+                    shutdown,
+                    TerminalEvent::Failed(format!("inspect ConPTY output: {error}")),
+                );
+                return false;
+            }
+        };
+        let read_len = available.min(buffer.len());
+        match read_handle(output_handle.raw(), &mut buffer[..read_len]) {
+            Ok(0) => {
+                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                return false;
+            }
+            Ok(read)
+                if !send_or_shutdown(
+                    output,
+                    shutdown,
+                    PtyOutput::Bytes(buffer[..read].to_vec()),
+                ) =>
+            {
+                return false;
+            }
+            Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                return false;
+            }
+            Err(error) => {
+                let _ = send_or_shutdown(
+                    events,
+                    shutdown,
+                    TerminalEvent::Failed(format!("ConPTY read stopped: {error}")),
+                );
+                return false;
+            }
+        }
     }
 }
 
