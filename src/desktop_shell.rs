@@ -35,8 +35,8 @@ struct DesktopShellRuntime {
 
 impl Global for DesktopShellRuntime {}
 
-pub(crate) fn run(endpoint: CoreEndpoint, stop_on_interrupt: bool) -> Result<(), String> {
-    let stop_core_after_ui_exit = Arc::new(AtomicBool::new(false));
+pub(crate) fn run(endpoint: CoreEndpoint, stop_core_on_exit: bool) -> Result<(), String> {
+    let stop_core_after_ui_exit = Arc::new(AtomicBool::new(stop_core_on_exit));
     let launch_fallback = stop_core_after_ui_exit.clone();
     let launch_endpoint = endpoint.clone();
     let application = gpui_platform::application()
@@ -45,7 +45,7 @@ pub(crate) fn run(endpoint: CoreEndpoint, stop_on_interrupt: bool) -> Result<(),
     application.on_reopen(|cx| handle_intent(DesktopIntent::OpenOrFocus, cx));
     application.run(move |cx| {
         if let Err(error) =
-            install_desktop_presence(cx, launch_endpoint, stop_on_interrupt, launch_fallback)
+            install_desktop_presence(cx, launch_endpoint, stop_core_on_exit, launch_fallback)
         {
             eprintln!("Could not start Desktop Shell: {error}");
             cx.quit();
@@ -64,11 +64,11 @@ pub(crate) fn run(endpoint: CoreEndpoint, stop_on_interrupt: bool) -> Result<(),
 fn install_desktop_presence(
     cx: &mut App,
     endpoint: CoreEndpoint,
-    stop_on_interrupt: bool,
+    stop_core_on_exit: bool,
     stop_core_after_ui_exit: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (intent_sender, intent_receiver) = flume::unbounded();
-    if let Some(interrupt_intent) = interrupt_intent(stop_on_interrupt) {
+    if let Some(interrupt_intent) = interrupt_intent(stop_core_on_exit) {
         let interrupt_sender = intent_sender.clone();
         ctrlc::set_handler(move || {
             let _ = interrupt_sender.send(interrupt_intent);
@@ -124,13 +124,20 @@ pub(crate) fn handle_intent(intent: DesktopIntent, cx: &mut App) {
         }
         DesktopAction::Quit => cx.quit(),
         DesktopAction::StopResidentCoreAndQuit => {
-            if let Err(error) = spawn_full_exit_stopper(&endpoint) {
+            let stop_core_after_ui_exit = cx
+                .global::<DesktopShellRuntime>()
+                .stop_core_after_ui_exit
+                .clone();
+            if stop_core_after_ui_exit.load(Ordering::Acquire) {
+                // Development Cores are private to one launch, so every route
+                // out of GPUI stops them synchronously after the run loop has
+                // torn down its CoreDrivers. This also makes repeated terminal
+                // interrupts harmless.
+            } else if let Err(error) = spawn_full_exit_stopper(&endpoint) {
                 // The UI must still terminate if its on-disk executable can no
                 // longer launch the after-parent helper. Once GPUI has fully
                 // torn down its CoreDrivers, `run` performs the stop itself.
-                cx.global::<DesktopShellRuntime>()
-                    .stop_core_after_ui_exit
-                    .store(true, Ordering::Release);
+                stop_core_after_ui_exit.store(true, Ordering::Release);
                 eprintln!("Could not prepare full exit helper: {error}");
             }
             cx.quit();
