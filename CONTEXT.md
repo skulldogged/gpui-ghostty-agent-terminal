@@ -37,7 +37,7 @@ Closing a UI view while its Space, Panes, and Terminal Sessions continue running
 _Avoid_: Quit, Stop
 
 **Close Pane**:
-An explicit destructive action that removes a Pane and stops its referenced Terminal Session after confirmation. A shell that exits naturally has already ended its own work and closes the corresponding Pane through the same hierarchy mutation without another confirmation.
+An explicit destructive action that immediately removes a Pane and stops its referenced Terminal Session. A shell that exits naturally has already ended its own work and closes the corresponding Pane through the same hierarchy mutation.
 _Avoid_: Detach, Close Window
 
 **Control Lease**:

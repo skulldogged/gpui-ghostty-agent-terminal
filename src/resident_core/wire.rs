@@ -631,6 +631,14 @@ fn put_core_command(output: &mut Vec<u8>, command: &CoreCommand) -> io::Result<(
             output.push(8);
             output.extend_from_slice(&pane_id.as_u64().to_le_bytes());
         }
+        CoreCommand::CloseTab { tab_id } => {
+            output.push(9);
+            output.extend_from_slice(&tab_id.as_u64().to_le_bytes());
+        }
+        CoreCommand::CloseSpace { space_id } => {
+            output.push(10);
+            output.extend_from_slice(&space_id.as_u64().to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -676,6 +684,12 @@ fn decode_core_command(decoder: &mut Decoder<'_>) -> io::Result<CoreCommand> {
         }),
         8 => Ok(CoreCommand::ClosePane {
             pane_id: PaneId::from_u64(decode_nonzero_id(decoder)?),
+        }),
+        9 => Ok(CoreCommand::CloseTab {
+            tab_id: TabId::from_u64(decode_nonzero_id(decoder)?),
+        }),
+        10 => Ok(CoreCommand::CloseSpace {
+            space_id: SpaceId::from_u64(decode_nonzero_id(decoder)?),
         }),
         _ => Err(invalid("invalid Core command kind")),
     }
@@ -1188,8 +1202,9 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decoder, decode_request, decode_response, decode_terminal_launch, encode_request,
-        encode_response, put_path, put_terminal_launch, read_request, write_response,
+        Decoder, decode_core_command, decode_request, decode_response, decode_terminal_launch,
+        encode_request, encode_response, put_path, put_terminal_launch, read_request,
+        write_response,
     };
     use crate::resident_core::{
         ControlLease, ControlLeaseDenial, CoreCommandOutcome, Request, Response, SemanticEvent,
@@ -1333,6 +1348,12 @@ mod tests {
             CoreCommand::ClosePane {
                 pane_id: PaneId::from_u64(3),
             },
+            CoreCommand::CloseTab {
+                tab_id: TabId::from_u64(2),
+            },
+            CoreCommand::CloseSpace {
+                space_id: SpaceId::from_u64(1),
+            },
         ];
 
         for command in commands {
@@ -1346,6 +1367,23 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn resource_close_commands_reject_missing_and_zero_ids() {
+        assert!(decode_core_command(&mut Decoder::new(&[9])).is_err());
+        assert!(decode_core_command(&mut Decoder::new(&[10])).is_err());
+
+        let mut zero_id = vec![9];
+        zero_id.extend_from_slice(&0_u64.to_le_bytes());
+        let error = decode_core_command(&mut Decoder::new(&zero_id))
+            .expect_err("CloseTab must reject a zero Tab ID");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        zero_id[0] = 10;
+        let error = decode_core_command(&mut Decoder::new(&zero_id))
+            .expect_err("CloseSpace must reject a zero Space ID");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

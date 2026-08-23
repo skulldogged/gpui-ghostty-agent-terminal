@@ -33,12 +33,10 @@ mod wire;
 
 use runtime::{CoreRuntime, RuntimeEvent};
 
-// Version 8 adds lease-controlled terminal paste commands whose encoding is
-// resolved inside the Resident Core against its authoritative VT modes. Layout
-// persistence was later removed without changing the protocol: Terminal launch
-// frames retain and ignore the former Restore Disposition byte so an upgraded
-// Desktop Shell can attach to an already-running v8 Resident Core.
-const PROTOCOL_VERSION: u16 = 8;
+// Version 9 adds resource-scoped CloseTab and CloseSpace commands. Terminal
+// launch frames retain and ignore the former Restore Disposition byte from v8
+// even though layout persistence is no longer supported.
+const PROTOCOL_VERSION: u16 = 9;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SEMANTIC_EVENT_CAPACITY: usize = 64;
 const SESSION_TICK: Duration = Duration::from_millis(10);
@@ -2976,10 +2974,10 @@ mod tests {
     }
 
     #[test]
-    fn removing_layout_persistence_preserves_running_v8_core_compatibility() {
+    fn resource_close_commands_use_protocol_v9() {
         assert_eq!(
-            PROTOCOL_VERSION, 8,
-            "a Desktop Shell upgrade must still attach to an already-running v8 Resident Core"
+            PROTOCOL_VERSION, 9,
+            "CloseTab and CloseSpace require a versioned protocol boundary"
         );
     }
 
