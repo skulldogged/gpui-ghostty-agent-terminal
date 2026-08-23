@@ -48,6 +48,48 @@ fn terminal_session_survives_ui_client_disconnect_and_reconnect() {
     wait_for_core_exit(&mut core);
 }
 
+#[cfg(windows)]
+#[test]
+fn control_c_interrupts_a_foreground_process_through_the_resident_core() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    };
+
+    let endpoint = isolated_endpoint("resident-core-control-c");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-terminal"));
+    command
+        .arg("--resident-core")
+        .arg(endpoint.argument())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let mut core = ChildGuard(
+        command
+            .spawn()
+            .expect("spawn Resident Core with inherited Ctrl+C ignore state"),
+    );
+    let mut client =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
+
+    client
+        .input(b"ping -t 127.0.0.1\r")
+        .expect("start foreground ping process");
+    std::thread::sleep(Duration::from_secs(1));
+    client
+        .input(&[0x03])
+        .expect("send Ctrl+C through the Resident Core");
+    std::thread::sleep(Duration::from_secs(1));
+    client
+        .input(b"cmd /d /c echo RESIDENT_CORE_^CONTROL_C_RETURNED\r")
+        .expect("write marker after Ctrl+C");
+
+    wait_for_text(&mut client, "RESIDENT_CORE_CONTROL_C_RETURNED");
+    client.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
 #[test]
 fn hierarchy_commands_run_multiple_terminals_and_reconnect_by_stable_id() {
     let endpoint = isolated_endpoint("multiplexer-hierarchy");

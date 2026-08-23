@@ -17,7 +17,10 @@ use windows_sys::Win32::{
     },
     Security::SECURITY_ATTRIBUTES,
     System::{
-        Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole},
+        Console::{
+            COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+            SetConsoleCtrlHandler,
+        },
         Pipes::{CreatePipe, PeekNamedPipe},
         Threading::{
             CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -78,6 +81,7 @@ impl PtySession {
         working_directory: &std::path::Path,
         events: flume::Sender<TerminalEvent>,
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
+        allow_ctrl_c_in_children();
         let input = Pipe::create()?;
         let output = Pipe::create()?;
         let mut pseudoconsole: HPCON = 0;
@@ -269,6 +273,15 @@ impl PtySession {
         // The dedicated ConPTY waiter owns a duplicate process handle and
         // waits for termination before it closes the pseudoconsole.
         Ok(())
+    }
+}
+
+fn allow_ctrl_c_in_children() {
+    // CREATE_NEW_PROCESS_GROUP and an ignoring parent both set an inherited
+    // process flag that prevents ConPTY descendants from receiving CTRL_C_EVENT.
+    // Clearing it immediately before every shell spawn is cheap and idempotent.
+    unsafe {
+        SetConsoleCtrlHandler(None, 0);
     }
 }
 

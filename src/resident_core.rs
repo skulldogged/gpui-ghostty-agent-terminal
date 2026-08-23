@@ -2947,9 +2947,13 @@ fn detach_command(command: &mut Command) {
 #[cfg(windows)]
 fn detach_command(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    command.creation_flags(WINDOWS_RESIDENT_CORE_CREATION_FLAGS);
 }
+
+#[cfg(windows)]
+const WINDOWS_RESIDENT_CORE_CREATION_FLAGS: u32 =
+    windows_sys::Win32::System::Threading::DETACHED_PROCESS
+        | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 #[cfg(test)]
 mod tests {
@@ -2974,6 +2978,18 @@ mod tests {
         assert_ne!(first, default);
         assert_ne!(first, second);
         assert!(first.argument().contains("-development-"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resident_core_spawn_does_not_disable_ctrl_c_for_terminal_descendants() {
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+        assert_eq!(
+            super::WINDOWS_RESIDENT_CORE_CREATION_FLAGS & CREATE_NEW_PROCESS_GROUP,
+            0,
+            "the detached Resident Core must not make every ConPTY descendant ignore Ctrl+C"
+        );
     }
 
     impl std::io::Read for TransientWouldBlock {
