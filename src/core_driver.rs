@@ -237,6 +237,10 @@ enum Command {
         terminal_session_id: TerminalSessionId,
         bytes: Vec<u8>,
     },
+    Paste {
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    },
     Resize {
         terminal_session_id: TerminalSessionId,
         size: TerminalSize,
@@ -304,6 +308,17 @@ impl CoreDriver {
         bytes: Vec<u8>,
     ) -> Result<(), String> {
         self.send(Command::Input {
+            terminal_session_id,
+            bytes,
+        })
+    }
+
+    pub(crate) fn paste_to(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        self.send(Command::Paste {
             terminal_session_id,
             bytes,
         })
@@ -414,6 +429,13 @@ fn run_driver(
                 bytes,
             })) => core
                 .input_to(terminal_session_id, &bytes)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::Paste {
+                terminal_session_id,
+                bytes,
+            })) => core
+                .paste_to(terminal_session_id, &bytes)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
             DriverEvent::Command(Ok(Command::Resize {

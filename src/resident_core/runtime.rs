@@ -139,6 +139,33 @@ impl CoreRuntime {
         self.live_terminal_mut(terminal_session_id)?.input(bytes)
     }
 
+    pub(super) fn paste(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        bytes: &[u8],
+    ) -> Result<bool, String> {
+        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let session = runtime
+            .session
+            .as_mut()
+            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
+        let result = session.paste(bytes);
+        match result {
+            Ok(changed) => {
+                if changed {
+                    runtime.revision = runtime.revision.saturating_add(1);
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                // The ordered reader barrier may have fed terminal output even
+                // when encoding, writing, or resuming subsequently failed.
+                runtime.revision = runtime.revision.saturating_add(1);
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn resize(
         &mut self,
         terminal_session_id: TerminalSessionId,

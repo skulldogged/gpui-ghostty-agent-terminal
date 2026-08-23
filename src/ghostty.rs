@@ -49,6 +49,14 @@ unsafe extern "C" {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> i32;
+    fn spike_terminal_encode_paste(
+        terminal: *mut c_void,
+        data: *mut u8,
+        data_len: usize,
+        output: *mut u8,
+        output_len: usize,
+        output_written: *mut usize,
+    ) -> i32;
     fn spike_terminal_snapshot(
         terminal: *mut c_void,
         force_full: bool,
@@ -115,6 +123,36 @@ impl Terminal {
             spike_terminal_resize(self.raw.as_ptr(), cols, rows, cell_width_px, cell_height_px)
         };
         result_ok(result, "resize")
+    }
+
+    pub fn encode_paste(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        const BRACKETED_PASTE_OVERHEAD: usize = 12;
+        let capacity = bytes
+            .len()
+            .checked_add(BRACKETED_PASTE_OVERHEAD)
+            .ok_or_else(|| "terminal paste is too large".to_string())?;
+        let mut input = bytes.to_vec();
+        let mut output = vec![0; capacity];
+        let mut written = 0;
+        let result = unsafe {
+            spike_terminal_encode_paste(
+                self.raw.as_ptr(),
+                input.as_mut_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+            )
+        };
+        result_ok(result, "encode paste")?;
+        if written > output.len() {
+            return Err(format!(
+                "libghostty-vt paste needs {written} bytes, buffer has {}",
+                output.len()
+            ));
+        }
+        output.truncate(written);
+        Ok(output)
     }
 
     #[cfg_attr(feature = "gui", allow(dead_code))]
@@ -264,5 +302,38 @@ mod tests {
         assert_eq!(reversed.bg, snapshot.default_fg);
         assert!(!plain.has_explicit_bg);
         assert_eq!(plain.bg, snapshot.default_bg);
+    }
+
+    #[test]
+    fn paste_encoding_uses_ghostty_terminal_modes() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+
+        assert_eq!(
+            terminal
+                .encode_paste("plain\nUnicode: 雪".as_bytes())
+                .expect("encode ordinary paste"),
+            "plain\rUnicode: 雪".as_bytes()
+        );
+
+        terminal.feed(b"\x1b[?2004h");
+        assert_eq!(
+            terminal
+                .encode_paste("line one\nline two".as_bytes())
+                .expect("encode bracketed paste"),
+            b"\x1b[200~line one\nline two\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn paste_encoding_sanitizes_control_bytes_through_ghostty() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal.feed(b"\x1b[?2004h");
+
+        assert_eq!(
+            terminal
+                .encode_paste(b"before\x1b[201~after\0")
+                .expect("encode unsafe paste"),
+            b"\x1b[200~before [201~after \x1b[201~"
+        );
     }
 }

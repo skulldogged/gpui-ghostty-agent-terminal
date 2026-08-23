@@ -157,6 +157,27 @@ impl TerminalSession {
         self.process.write(bytes)
     }
 
+    pub fn paste(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        self.process.pause_reader()?;
+        let changed = match self.drain_until_reader_paused() {
+            Ok(changed) => changed,
+            Err(error) => {
+                let resume_error = self.process.resume_reader().err();
+                return Err(combine_errors(error, resume_error));
+            }
+        };
+
+        let paste_result = self
+            .terminal
+            .encode_paste(bytes)
+            .and_then(|encoded| self.process.write(&encoded));
+        let resume_error = self.process.resume_reader().err();
+        match paste_result {
+            Ok(()) => resume_error.map_or(Ok(changed), Err),
+            Err(error) => Err(combine_errors(error, resume_error)),
+        }
+    }
+
     pub(crate) fn size(&self) -> TerminalSize {
         self.size
     }
@@ -253,7 +274,8 @@ impl TerminalSession {
         }
     }
 
-    fn drain_until_reader_paused(&mut self) -> Result<(), String> {
+    fn drain_until_reader_paused(&mut self) -> Result<bool, String> {
+        let mut changed = false;
         loop {
             let message = self
                 .output
@@ -262,8 +284,11 @@ impl TerminalSession {
                 .recv()
                 .map_err(|_| "pause terminal reader: output stream stopped".to_string())?;
             match message {
-                PtyOutput::Bytes(bytes) => self.terminal.feed(&bytes),
-                PtyOutput::Paused => return Ok(()),
+                PtyOutput::Bytes(bytes) => {
+                    self.terminal.feed(&bytes);
+                    changed = true;
+                }
+                PtyOutput::Paused => return Ok(changed),
             }
         }
     }
@@ -290,10 +315,49 @@ mod tests {
         ghostty,
         pty::{PtyOutput, PtySize},
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     struct OutputDuringResize {
         output: flume::Sender<PtyOutput>,
+    }
+
+    struct OutputBeforePaste {
+        output: flume::Sender<PtyOutput>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+        resumed: Arc<Mutex<bool>>,
+        fail_write: bool,
+    }
+
+    struct RecordingTransport {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        output: flume::Sender<PtyOutput>,
+    }
+
+    impl TerminalTransport for RecordingTransport {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Paused)
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     impl TerminalTransport for OutputDuringResize {
@@ -313,6 +377,35 @@ mod tests {
         }
 
         fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl TerminalTransport for OutputBeforePaste {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+            if self.fail_write {
+                return Err("injected paste write failure".into());
+            }
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Bytes(b"\x1b[?2004h".to_vec()))
+                .and_then(|_| self.output.send(PtyOutput::Paused))
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            *self.resumed.lock().expect("resume marker mutex poisoned") = true;
             Ok(())
         }
     }
@@ -366,6 +459,102 @@ mod tests {
     }
 
     #[test]
+    fn paste_writes_ghostty_encoded_unicode_and_multiline_bytes_once() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let mut terminal =
+            ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        terminal.feed(b"\x1b[?2004h");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx,
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        session
+            .paste("first 雪\nsecond".as_bytes())
+            .expect("paste through terminal session");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[200~first \xe9\x9b\xaa\nsecond\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn paste_consumes_output_accepted_before_the_reader_barrier() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let resumed = Arc::new(Mutex::new(false));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows)
+            .expect("create test terminal without bracketed paste enabled");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(OutputBeforePaste {
+                output: output_tx,
+                bytes: Arc::clone(&bytes),
+                resumed: Arc::clone(&resumed),
+                fail_write: false,
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        session
+            .paste(b"first\nsecond")
+            .expect("paste through ordered terminal session barrier");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[200~first\nsecond\x1b[201~",
+            "paste encoding must observe preceding PTY mode changes"
+        );
+        assert!(
+            *resumed.lock().expect("resume marker mutex poisoned"),
+            "the reader must resume after an ordered paste"
+        );
+    }
+
+    #[test]
+    fn paste_resumes_the_reader_after_a_write_failure() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let resumed = Arc::new(Mutex::new(false));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows)
+            .expect("create test terminal without bracketed paste enabled");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(OutputBeforePaste {
+                output: output_tx,
+                bytes,
+                resumed: Arc::clone(&resumed),
+                fail_write: true,
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        assert!(session.paste(b"payload").is_err());
+        assert!(
+            *resumed.lock().expect("resume marker mutex poisoned"),
+            "a failed paste must not leave the PTY reader paused"
+        );
+    }
+
+    #[test]
     fn interactive_shell_round_trips_input_through_the_session() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
@@ -392,6 +581,53 @@ mod tests {
         }
 
         panic!("shell did not return the input marker before the timeout");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_c_interrupts_a_windows_conpty_foreground_process() {
+        let (mut session, events) =
+            TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
+        session
+            .input(b"ping -t 127.0.0.1\r")
+            .expect("start foreground ping process");
+
+        // Give the shell time to start ping. The command's own echo is not a
+        // sufficient readiness signal because it precedes process creation.
+        std::thread::sleep(Duration::from_secs(1));
+        session.input(&[0x03]).expect("send Ctrl+C through ConPTY");
+        // Console control handlers run asynchronously. Do not let the
+        // foreground process consume the marker before it handles Ctrl+C.
+        std::thread::sleep(Duration::from_secs(1));
+        session
+            .input(b"cmd /d /c echo CONPTY_^CONTROL_C_RETURNED\r")
+            .expect("write marker after Ctrl+C");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last_screen = String::new();
+        while Instant::now() < deadline {
+            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(TerminalEvent::Changed) => {
+                    let snapshot = session.snapshot().expect("snapshot terminal session");
+                    last_screen = snapshot_text(&snapshot);
+                    if last_screen.contains("CONPTY_CONTROL_C_RETURNED") {
+                        return;
+                    }
+                }
+                Ok(TerminalEvent::Exited) => {
+                    panic!("shell exited instead of returning after Ctrl+C")
+                }
+                Ok(TerminalEvent::Failed(error)) => panic!("terminal session failed: {error}"),
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    panic!("terminal event stream disconnected")
+                }
+            }
+        }
+
+        panic!(
+            "Ctrl+C did not return control from ping to the Windows shell; final screen:\n{last_screen}"
+        );
     }
 
     #[test]
