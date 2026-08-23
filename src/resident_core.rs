@@ -1918,9 +1918,21 @@ impl ResidentCore {
                                 WorkerRequest::Snapshot {
                                     terminal_session_id,
                                     since,
-                                } => runtime
-                                    .snapshot(terminal_session_id, since)
-                                    .map(WorkerResponse::Snapshot),
+                                } => match runtime.snapshot(terminal_session_id, since) {
+                                    Ok(snapshot) => Ok(WorkerResponse::Snapshot(snapshot)),
+                                    Err(_)
+                                        if since.is_some()
+                                            && !runtime.contains_terminal(terminal_session_id) =>
+                                    {
+                                        // A visual invalidation may already be in a UI Client's
+                                        // stream when natural exit removes the Terminal Session.
+                                        // Conditional snapshots are coalescible wake follow-ups,
+                                        // so removal supersedes the announced revision rather
+                                        // than turning normal exit into a persistent UI error.
+                                        Ok(WorkerResponse::Snapshot(None))
+                                    }
+                                    Err(error) => Err(error),
+                                },
                                 WorkerRequest::CoreSnapshot => {
                                     Ok(WorkerResponse::CoreSnapshot(runtime.model_snapshot()))
                                 }

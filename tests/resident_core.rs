@@ -341,6 +341,73 @@ fn natural_shell_exit_closes_its_pane_and_collapses_empty_ancestors() {
 }
 
 #[test]
+fn an_announced_terminal_snapshot_becomes_harmless_after_natural_exit() {
+    let endpoint = isolated_endpoint("natural-exit-supersedes-snapshot");
+    let mut core = spawn_core(&endpoint);
+    let mut client =
+        CoreClient::connect(&endpoint, Duration::from_secs(10)).expect("attach UI Client");
+    let initial_hierarchy = client.core_snapshot().clone();
+    let terminal_session_id = client
+        .active_terminal_session_id()
+        .expect("initial Terminal Session");
+    let initial_terminal = client
+        .terminal_snapshot(terminal_session_id)
+        .expect("take initial Terminal snapshot");
+
+    client
+        .input_to(terminal_session_id, final_output_then_exit_command())
+        .expect("write final output and exit the shell");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let announced = loop {
+        if let Some(change) = client
+            .wait_for_terminal_change(Duration::from_millis(250))
+            .expect("wait for final-output invalidation")
+            && change.terminal_session_id == terminal_session_id
+            && change.terminal_revision > initial_terminal.revision
+        {
+            break change;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "final shell output did not announce a newer Terminal snapshot"
+        );
+    };
+
+    wait_for_hierarchy_event(&mut client, initial_hierarchy.revision);
+    assert!(
+        client
+            .terminal_snapshot_since(terminal_session_id, initial_terminal.revision)
+            .expect("a superseded conditional snapshot request must be harmless")
+            .is_none(),
+        "a removed Terminal Session cannot publish the announced revision {}",
+        announced.terminal_revision
+    );
+    let after_exit = client
+        .refresh_core_snapshot()
+        .expect("refresh hierarchy after natural exit");
+    assert!(
+        after_exit
+            .terminal_sessions
+            .iter()
+            .all(|terminal| terminal.id != terminal_session_id),
+        "natural exit must remove the Terminal Session before the delayed snapshot fetch"
+    );
+
+    client.stop_resident_core().expect("stop Resident Core");
+    wait_for_core_exit(&mut core);
+}
+
+#[cfg(unix)]
+fn final_output_then_exit_command() -> &'static [u8] {
+    b"printf 'FINAL_OUTPUT_BEFORE_EXIT\\n'; sleep 0.1; exit\r"
+}
+
+#[cfg(windows)]
+fn final_output_then_exit_command() -> &'static [u8] {
+    b"Write-Output 'FINAL_OUTPUT_BEFORE_EXIT'; Start-Sleep -Milliseconds 100; exit\r"
+}
+
+#[test]
 fn full_exit_stopper_waits_for_the_desktop_shell_before_stopping_the_core() {
     let endpoint = isolated_endpoint("full-exit-stopper");
     let mut core = spawn_core(&endpoint);
