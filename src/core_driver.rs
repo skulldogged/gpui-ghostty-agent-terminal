@@ -11,6 +11,7 @@ use std::{
 };
 
 const COMMAND_CAPACITY: usize = 256;
+const MAX_HIERARCHY_REFRESH_ATTEMPTS: usize = 8;
 
 pub(crate) struct CoreDriver {
     commands: flume::Sender<Command>,
@@ -544,23 +545,32 @@ fn run_driver(
 }
 
 fn load_projection(core: &mut CoreClient) -> Result<CoreProjection, String> {
-    let hierarchy = core.core_snapshot().clone();
-    let terminal_ids = hierarchy
-        .terminal_sessions
-        .iter()
-        .map(|session| session.id)
-        .collect::<Vec<_>>();
-    let mut terminals = HashMap::with_capacity(terminal_ids.len());
-    for terminal_session_id in terminal_ids {
-        terminals.insert(
-            terminal_session_id,
-            core.terminal_snapshot(terminal_session_id)?,
-        );
+    let mut hierarchy = core.core_snapshot().clone();
+    for _ in 0..MAX_HIERARCHY_REFRESH_ATTEMPTS {
+        let terminal_ids = terminal_ids(&hierarchy);
+        let mut terminals = HashMap::with_capacity(terminal_ids.len());
+        let mut superseded = None;
+        for terminal_session_id in terminal_ids {
+            match snapshot_for_hierarchy(core, terminal_session_id, hierarchy.revision)? {
+                HierarchySnapshot::Terminal(snapshot) => {
+                    terminals.insert(terminal_session_id, snapshot);
+                }
+                HierarchySnapshot::Superseded(snapshot) => {
+                    superseded = Some(snapshot);
+                    break;
+                }
+            }
+        }
+        if let Some(snapshot) = superseded {
+            hierarchy = snapshot;
+            continue;
+        }
+        return Ok(CoreProjection {
+            hierarchy,
+            terminals,
+        });
     }
-    Ok(CoreProjection {
-        hierarchy,
-        terminals,
-    })
+    Err("Resident Core hierarchy kept changing while loading terminal snapshots".into())
 }
 
 fn synchronize_hierarchy(
@@ -570,30 +580,82 @@ fn synchronize_hierarchy(
     revisions: &mut HashMap<TerminalSessionId, u64>,
     counters: &DriverCounters,
 ) -> Result<Vec<DriverUpdate>, String> {
-    *hierarchy_revision = snapshot.revision;
-    let terminal_ids = snapshot
+    let mut snapshot = snapshot;
+    for _ in 0..MAX_HIERARCHY_REFRESH_ATTEMPTS {
+        let terminal_ids = terminal_ids(&snapshot).into_iter().collect::<HashSet<_>>();
+        let mut next_revisions = revisions.clone();
+        next_revisions.retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+        let mut updates = vec![DriverUpdate::Hierarchy(snapshot.clone())];
+        let mut new_terminals = terminal_ids
+            .into_iter()
+            .filter(|terminal_session_id| !next_revisions.contains_key(terminal_session_id))
+            .collect::<Vec<_>>();
+        new_terminals.sort_unstable();
+        let mut superseded = None;
+        for terminal_session_id in new_terminals {
+            counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
+            match snapshot_for_hierarchy(core, terminal_session_id, snapshot.revision)? {
+                HierarchySnapshot::Terminal(terminal) => {
+                    next_revisions.insert(terminal_session_id, terminal.revision);
+                    updates.push(DriverUpdate::Terminal {
+                        terminal_session_id,
+                        snapshot: terminal,
+                    });
+                }
+                HierarchySnapshot::Superseded(current) => {
+                    superseded = Some(current);
+                    break;
+                }
+            }
+        }
+        if let Some(current) = superseded {
+            snapshot = current;
+            continue;
+        }
+        *hierarchy_revision = snapshot.revision;
+        *revisions = next_revisions;
+        counters.snapshots_published.fetch_add(
+            updates.len().saturating_sub(1) as u64,
+            Ordering::Relaxed,
+        );
+        return Ok(updates);
+    }
+    Err("Resident Core hierarchy kept changing while synchronizing terminal snapshots".into())
+}
+
+enum HierarchySnapshot {
+    Terminal(TerminalSnapshot),
+    Superseded(CoreSnapshot),
+}
+
+fn terminal_ids(snapshot: &CoreSnapshot) -> Vec<TerminalSessionId> {
+    snapshot
         .terminal_sessions
         .iter()
         .map(|session| session.id)
-        .collect::<HashSet<_>>();
-    revisions.retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
-    let mut updates = vec![DriverUpdate::Hierarchy(snapshot)];
-    let mut new_terminals = terminal_ids
-        .into_iter()
-        .filter(|terminal_session_id| !revisions.contains_key(terminal_session_id))
-        .collect::<Vec<_>>();
-    new_terminals.sort_unstable();
-    for terminal_session_id in new_terminals {
-        counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
-        let terminal = core.terminal_snapshot(terminal_session_id)?;
-        revisions.insert(terminal_session_id, terminal.revision);
-        counters.snapshots_published.fetch_add(1, Ordering::Relaxed);
-        updates.push(DriverUpdate::Terminal {
-            terminal_session_id,
-            snapshot: terminal,
-        });
+        .collect()
+}
+
+fn snapshot_for_hierarchy(
+    core: &mut CoreClient,
+    terminal_session_id: TerminalSessionId,
+    hierarchy_revision: u64,
+) -> Result<HierarchySnapshot, String> {
+    match core.terminal_snapshot(terminal_session_id) {
+        Ok(snapshot) => Ok(HierarchySnapshot::Terminal(snapshot)),
+        Err(snapshot_error) => {
+            let current = core.refresh_core_snapshot()?;
+            let still_present = current
+                .terminal_sessions
+                .iter()
+                .any(|session| session.id == terminal_session_id);
+            if current.revision >= hierarchy_revision && !still_present {
+                Ok(HierarchySnapshot::Superseded(current))
+            } else {
+                Err(snapshot_error)
+            }
+        }
     }
-    Ok(updates)
 }
 
 fn refresh_terminal(
@@ -630,14 +692,15 @@ fn is_connection_failure(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreDriver, DriverUpdate, DriverUpdatePublisher, DriverUpdateState, DriverUpdates,
-        is_connection_failure,
+        CoreDriver, DriverCounters, DriverUpdate, DriverUpdatePublisher, DriverUpdateState,
+        DriverUpdates, is_connection_failure, synchronize_hierarchy,
     };
     use crate::{
-        CoreClient, CoreCommand, CoreEndpoint, CreatedResource, SpaceId, TerminalLifecycle,
-        TerminalSessionId, TerminalSnapshot, run_resident_core,
+        CoreClient, CoreCommand, CoreEndpoint, CoreSnapshot, CreatedResource, SemanticEventKind,
+        SpaceId, TerminalLifecycle, TerminalSessionId, TerminalSnapshot, run_resident_core,
     };
     use std::{
+        collections::HashMap,
         sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -720,6 +783,42 @@ mod tests {
         assert!(active.pushed_changes > 0);
         assert!(active.snapshot_requests > 0);
         assert!(active.snapshots_published > 0);
+    }
+
+    #[test]
+    fn driver_start_recovers_when_the_handshake_terminal_has_already_exited() {
+        let (_core, client, _) = client_with_superseded_handshake("driver-start");
+
+        let (_driver, projection) =
+            CoreDriver::start(client).expect("start from the authoritative current hierarchy");
+        assert!(projection.hierarchy.spaces.is_empty());
+        assert!(projection.hierarchy.terminal_sessions.is_empty());
+        assert!(projection.terminals.is_empty());
+    }
+
+    #[test]
+    fn hierarchy_sync_recovers_when_a_new_terminal_has_already_exited() {
+        let (_core, mut client, stale_hierarchy) =
+            client_with_superseded_handshake("hierarchy-sync");
+        let mut hierarchy_revision = 0;
+        let mut revisions = HashMap::new();
+
+        let updates = synchronize_hierarchy(
+            &mut client,
+            stale_hierarchy,
+            &mut hierarchy_revision,
+            &mut revisions,
+            &DriverCounters::default(),
+        )
+        .expect("synchronize from the authoritative current hierarchy");
+
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(
+            &updates[0],
+            DriverUpdate::Hierarchy(snapshot)
+                if snapshot.spaces.is_empty() && snapshot.terminal_sessions.is_empty()
+        ));
+        assert!(revisions.is_empty());
     }
 
     #[test]
@@ -902,5 +1001,30 @@ mod tests {
                 cells: Vec::new(),
             },
         }
+    }
+
+    fn client_with_superseded_handshake(
+        scenario: &str,
+    ) -> (TestCore, CoreClient, CoreSnapshot) {
+        let core = TestCore::start(scenario);
+        let mut client =
+            CoreClient::connect(&core.endpoint, Duration::from_secs(10)).expect("attach UI Client");
+        let stale_hierarchy = client.core_snapshot().clone();
+        let terminal_session_id = stale_hierarchy.terminal_sessions[0].id;
+        client
+            .input_to(terminal_session_id, b"exit\r")
+            .expect("exit the handshake Terminal Session");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let event = client
+                .wait_for_semantic_event(deadline.saturating_duration_since(Instant::now()))
+                .expect("wait for natural-exit hierarchy event")
+                .unwrap_or_else(|| panic!("natural exit did not update the hierarchy"));
+            if matches!(event.kind, SemanticEventKind::HierarchyChanged { .. }) {
+                break;
+            }
+        }
+        (core, client, stale_hierarchy)
     }
 }
