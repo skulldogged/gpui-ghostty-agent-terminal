@@ -39,7 +39,7 @@ pub(crate) enum ShellIcon {
 }
 
 impl WorkspaceShell {
-    const DEFAULT_OPACITY: f32 = 0.82;
+    const DEFAULT_OPACITY: f32 = 0.65;
     pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
     pub(crate) const SIDEBAR_WIDTH: f32 = 220.;
     pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 180.;
@@ -180,7 +180,6 @@ fn platform_appearance() -> WindowBackgroundAppearance {
 #[cfg(any(windows, test))]
 fn windows_appearance_for_build(build: u32) -> WindowBackgroundAppearance {
     match build {
-        22621.. => WindowBackgroundAppearance::MicaBackdrop,
         17763.. => WindowBackgroundAppearance::Blurred,
         _ => WindowBackgroundAppearance::Opaque,
     }
@@ -253,13 +252,17 @@ mod tests {
         assert_eq!(WorkspaceShell::parse_opacity("4"), Some(1.));
         assert_eq!(WorkspaceShell::parse_opacity("NaN"), None);
         assert_eq!(WorkspaceShell::parse_opacity("not-a-number"), None);
+        assert_eq!(
+            WorkspaceShell::resolve(WindowBackgroundAppearance::Blurred, None).opacity,
+            0.65
+        );
     }
 
     #[test]
     fn platform_fallbacks_never_request_unsupported_materials() {
         assert_eq!(
             windows_appearance_for_build(22621),
-            WindowBackgroundAppearance::MicaBackdrop
+            WindowBackgroundAppearance::Blurred
         );
         assert_eq!(
             windows_appearance_for_build(17763),

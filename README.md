@@ -48,12 +48,12 @@ fixed-pitch family, and `AGENT_TERMINAL_FONT_SIZE` accepts sizes from 8 through
 48 pixels.
 
 The native workspace shell uses platform window materials when they are
-available: Mica on Windows 11 22H2 and newer, native blur on supported older
-Windows and macOS, and compositor blur on Wayland. X11 and unknown platforms
-fall back to an opaque window. Shell and default terminal surfaces use 82%
-opacity by default; set `AGENT_TERMINAL_BACKGROUND_OPACITY` between `0.45` and
-`1.0` to override it. A value of `1.0` forces opaque mode. Explicit terminal
-cell backgrounds and cursor fills remain opaque regardless of this setting.
+available: Acrylic blur on supported Windows, native blur on macOS, and
+compositor blur on Wayland. X11 and unknown platforms fall back to an opaque
+window. Shell and default terminal surfaces use 65% opacity by default; set
+`AGENT_TERMINAL_BACKGROUND_OPACITY` between `0.45` and `1.0` to override it. A
+value of `1.0` forces opaque mode. Explicit terminal cell backgrounds and
+cursor fills remain opaque regardless of this setting.
 
 Closing the last window keeps the Desktop Shell available from its native tray
 item on macOS and Windows, or from a StatusNotifierItem host on Linux. Linux

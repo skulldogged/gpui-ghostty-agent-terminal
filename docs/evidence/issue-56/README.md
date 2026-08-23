@@ -1,22 +1,15 @@
 # Issue #56 Windows material evidence
 
-Captured on Windows 11 Pro 26H2, build 26300.8935, from the PR #64 branch.
-Both captures contain only the application window and use an isolated,
-deterministic ConPTY shell fixture with non-private display content.
+Validated on Windows 11 Pro 26H2, build 26300.8935, from the PR #64 branch.
 
-## Default Windows 11 Mica
+The initial Mica result was rejected because it appeared effectively opaque.
+The Windows default now uses Acrylic with 65% shell and default-terminal
+surface opacity. The operator approved that appearance in a live build with
+`AGENT_TERMINAL_BACKGROUND_OPACITY` unset. The explicit value `1` continues to
+select the opaque window and surface path.
 
-`AGENT_TERMINAL_BACKGROUND_OPACITY` was unset, selecting the default 82%
-surface opacity and the Windows 11 Mica backdrop.
-
-![Default Windows 11 Mica](windows-11-mica.jpg)
-
-## Opaque override
-
-`AGENT_TERMINAL_BACKGROUND_OPACITY=1` selected the opaque window and surface
-path.
-
-![Opaque Windows mode](windows-opaque.jpg)
+The superseded Mica and opaque screenshots were removed. Fresh app-only
+captures can be added when the Windows capture helper is available again.
 
 ## Interactive validation
 
@@ -37,10 +30,11 @@ path.
 
 - `cargo fmt --all -- --check`
 - `cargo check --locked`
-- `cargo test --locked --profile test` (78 unit tests and 10 integration tests)
+- `cargo test --locked --profile test -- --test-threads=1` (78 unit tests and
+  10 integration tests)
 - `cargo clippy --locked --profile test --all-targets -- -D warnings`
 
-The first cold-target parallel test pass followed a full dependency compile and
-timed out in four existing shell/process tests under resource contention. An
-immediate rerun of the exact test command from the warm target passed all 88
+Parallel test attempts timed out in existing shell/process tests under Windows
+resource contention. Each initially failing test passed in isolation, the
+integration suite passed serially, and the complete serial run passed all 88
 tests.
