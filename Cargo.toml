@@ -20,7 +20,6 @@ opt-level = 0
 default = ["gui"]
 gui = [
     "dep:ctrlc",
-    "dep:directories",
     "dep:flume",
     "dep:gpui",
     "dep:gpui_platform",
@@ -36,7 +35,6 @@ gui = [
 
 [dependencies]
 ctrlc = { version = "3.5", features = ["termination"], optional = true }
-directories = { version = "6", optional = true }
 flume = { version = "0.12", optional = true }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true, features = ["font-kit", "wayland", "x11"] }

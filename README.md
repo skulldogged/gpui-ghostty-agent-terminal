@@ -67,10 +67,11 @@ Resident Core running, while **Stop Sessions and Quit** also stops the Resident
 Core. Use the latter before rebuilding on Windows so the running Core releases
 `agent-terminal.exe`.
 
-The explicit `--development` launch uses an isolated, non-persistent Resident
+The explicit `--development` launch uses an isolated Resident
 Core profile. Interrupting its attached command with `Ctrl+C` stops both the
 development Desktop Shell and that development Core. A normal launch keeps the
-installed application's tray and persistent-session behavior.
+installed application's Resident Core and live sessions available across UI
+Client detach.
 
 ## Verdict
 

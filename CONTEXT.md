@@ -5,7 +5,7 @@ This context describes a graphical terminal multiplexer that organizes persisten
 ## Language
 
 **Space**:
-A persistent, directory-rooted work context containing an ordered collection of Tabs. Repository and worktree metadata are optional enrichment rather than identity.
+A long-lived, directory-rooted work context containing an ordered collection of Tabs. Repository and worktree metadata are optional enrichment rather than identity. It survives UI Client detach while its Resident Core is running; cold layout restoration is not currently supported.
 _Avoid_: Workspace, Session
 
 **Tab**:
@@ -19,10 +19,6 @@ _Avoid_: Panel, Agent Pane
 **Terminal Session**:
 A live shell or CLI execution stream with an immutable identity independent of Pane placement. It appears in at most one Pane and has at most one controlling UI Client at a time.
 _Avoid_: Agent Session
-
-**Restore Disposition**:
-The persistent instruction attached to a Pane's launch intent that determines whether cold restore creates a new Running Terminal Session or returns the Pane as ended. It is independent of a live Terminal Session's lifecycle and never preserves process identity.
-_Avoid_: Last Running State, Restored Process
 
 **Resident Core**:
 The long-lived local process that owns Spaces, Terminal Sessions, and agent-integration state independently of any native application window.

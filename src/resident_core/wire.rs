@@ -5,9 +5,8 @@ use super::{
 };
 use crate::{
     CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, PaneId, PaneLayout, PaneSnapshot,
-    ResourceKind, RestoreDisposition, SpaceId, SpaceSnapshot, SplitAxis, SplitId, SplitPlacement,
-    SplitRatio, SplitSnapshot, TabId, TabSnapshot, TerminalLaunch, TerminalSessionId,
-    TerminalSessionSnapshot,
+    ResourceKind, SpaceId, SpaceSnapshot, SplitAxis, SplitId, SplitPlacement, SplitRatio,
+    SplitSnapshot, TabId, TabSnapshot, TerminalLaunch, TerminalSessionId, TerminalSessionSnapshot,
 };
 use std::io::{self, Read, Write};
 
@@ -552,22 +551,12 @@ fn decode_pane_layout(decoder: &mut Decoder<'_>, depth: usize) -> io::Result<Pan
 }
 
 fn put_terminal_launch(output: &mut Vec<u8>, launch: &TerminalLaunch) -> io::Result<()> {
-    put_path(output, &launch.working_directory)?;
-    output.push(match launch.restore_disposition {
-        RestoreDisposition::Relaunch => 0,
-        RestoreDisposition::RemainEnded => 1,
-    });
-    Ok(())
+    put_path(output, &launch.working_directory)
 }
 
 fn decode_terminal_launch(decoder: &mut Decoder<'_>) -> io::Result<TerminalLaunch> {
     Ok(TerminalLaunch {
         working_directory: decode_path(decoder)?,
-        restore_disposition: match decoder.u8()? {
-            0 => RestoreDisposition::Relaunch,
-            1 => RestoreDisposition::RemainEnded,
-            _ => return Err(invalid("invalid Restore Disposition")),
-        },
     })
 }
 
@@ -633,17 +622,6 @@ fn put_core_command(output: &mut Vec<u8>, command: &CoreCommand) -> io::Result<(
             output.push(8);
             output.extend_from_slice(&pane_id.as_u64().to_le_bytes());
         }
-        CoreCommand::SetRestoreDisposition {
-            terminal_session_id,
-            disposition,
-        } => {
-            output.push(9);
-            put_terminal_session_id(output, *terminal_session_id);
-            output.push(match disposition {
-                RestoreDisposition::Relaunch => 0,
-                RestoreDisposition::RemainEnded => 1,
-            });
-        }
     }
     Ok(())
 }
@@ -689,14 +667,6 @@ fn decode_core_command(decoder: &mut Decoder<'_>) -> io::Result<CoreCommand> {
         }),
         8 => Ok(CoreCommand::ClosePane {
             pane_id: PaneId::from_u64(decode_nonzero_id(decoder)?),
-        }),
-        9 => Ok(CoreCommand::SetRestoreDisposition {
-            terminal_session_id: decode_terminal_session_id(decoder)?,
-            disposition: match decoder.u8()? {
-                0 => RestoreDisposition::Relaunch,
-                1 => RestoreDisposition::RemainEnded,
-                _ => return Err(invalid("invalid Restore Disposition")),
-            },
         }),
         _ => Err(invalid("invalid Core command kind")),
     }
@@ -1218,8 +1188,8 @@ mod tests {
         UiClientId,
     };
     use crate::{
-        CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, PaneId, RestoreDisposition,
-        SpaceId, SplitAxis, SplitId, SplitPlacement, SplitRatio, TabId, TerminalSessionId,
+        CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, PaneId, SpaceId, SplitAxis,
+        SplitId, SplitPlacement, SplitRatio, TabId, TerminalSessionId,
         terminal_session::TerminalSize,
     };
 
@@ -1334,10 +1304,6 @@ mod tests {
             },
             CoreCommand::ClosePane {
                 pane_id: PaneId::from_u64(3),
-            },
-            CoreCommand::SetRestoreDisposition {
-                terminal_session_id: TerminalSessionId::from_u64(6),
-                disposition: RestoreDisposition::RemainEnded,
             },
         ];
 

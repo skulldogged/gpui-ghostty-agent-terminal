@@ -2,8 +2,6 @@ mod core_model;
 mod ghostty;
 
 #[cfg(feature = "gui")]
-mod persistence;
-#[cfg(feature = "gui")]
 mod pty;
 #[cfg(feature = "gui")]
 mod resident_core;
@@ -29,9 +27,9 @@ mod gui;
 
 pub use core_model::{
     CoreCommand, CoreCommit, CoreEffect, CoreModel, CoreModelError, CoreSnapshot, CreatedResource,
-    PaneId, PaneLayout, PaneSnapshot, ResourceKind, RestoreDisposition, SpaceId, SpaceSnapshot,
-    SplitAxis, SplitId, SplitPlacement, SplitRatio, SplitSnapshot, TabId, TabSnapshot,
-    TerminalLaunch, TerminalSessionId, TerminalSessionSnapshot,
+    PaneId, PaneLayout, PaneSnapshot, ResourceKind, SpaceId, SpaceSnapshot, SplitAxis, SplitId,
+    SplitPlacement, SplitRatio, SplitSnapshot, TabId, TabSnapshot, TerminalLaunch,
+    TerminalSessionId, TerminalSessionSnapshot,
 };
 #[cfg(feature = "gui")]
 pub use resident_core::{
