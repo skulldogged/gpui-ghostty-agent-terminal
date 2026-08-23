@@ -18,25 +18,41 @@ enum DesktopAction {
 }
 
 struct DesktopShellRuntime {
+    endpoint: CoreEndpoint,
     _presence: Option<DesktopPresence>,
     _intent_task: Task<()>,
 }
 
 impl Global for DesktopShellRuntime {}
 
-pub(crate) fn run() {
+pub(crate) fn run(endpoint: CoreEndpoint, stop_on_interrupt: bool) {
     let application = gpui_platform::application()
         .with_assets(ShellAssets)
         .with_quit_mode(QuitMode::Explicit);
     application.on_reopen(|cx| handle_intent(DesktopIntent::OpenOrFocus, cx));
-    application.run(|cx| {
-        install_desktop_presence(cx);
+    application.run(move |cx| {
+        if let Err(error) = install_desktop_presence(cx, endpoint, stop_on_interrupt) {
+            eprintln!("Could not start Desktop Shell: {error}");
+            cx.quit();
+            return;
+        }
         handle_intent(DesktopIntent::OpenOrFocus, cx);
     });
 }
 
-fn install_desktop_presence(cx: &mut App) {
+fn install_desktop_presence(
+    cx: &mut App,
+    endpoint: CoreEndpoint,
+    stop_on_interrupt: bool,
+) -> Result<(), String> {
     let (intent_sender, intent_receiver) = flume::unbounded();
+    if let Some(interrupt_intent) = interrupt_intent(stop_on_interrupt) {
+        let interrupt_sender = intent_sender.clone();
+        ctrlc::set_handler(move || {
+            let _ = interrupt_sender.send(interrupt_intent);
+        })
+        .map_err(|error| format!("install development interrupt handler: {error}"))?;
+    }
     let presence = match DesktopPresence::start(intent_sender) {
         Ok(presence) => {
             cx.set_quit_mode(QuitMode::Explicit);
@@ -54,15 +70,22 @@ fn install_desktop_presence(cx: &mut App) {
         }
     });
     cx.set_global(DesktopShellRuntime {
+        endpoint,
         _presence: presence,
         _intent_task: intent_task,
     });
+    Ok(())
+}
+
+fn interrupt_intent(stop_on_interrupt: bool) -> Option<DesktopIntent> {
+    stop_on_interrupt.then_some(DesktopIntent::StopResidentCoreAndQuit)
 }
 
 pub(crate) fn handle_intent(intent: DesktopIntent, cx: &mut App) {
+    let endpoint = cx.global::<DesktopShellRuntime>().endpoint.clone();
     match action_for(intent, !cx.windows().is_empty()) {
         DesktopAction::OpenWindow => {
-            gui::open_terminal_window(cx).expect("open GPUI terminal window");
+            gui::open_terminal_window(cx, &endpoint).expect("open GPUI terminal window");
         }
         DesktopAction::FocusWindow => {
             let window = cx
@@ -77,7 +100,7 @@ pub(crate) fn handle_intent(intent: DesktopIntent, cx: &mut App) {
             }
         }
         DesktopAction::Quit => cx.quit(),
-        DesktopAction::StopResidentCoreAndQuit => match spawn_full_exit_stopper() {
+        DesktopAction::StopResidentCoreAndQuit => match spawn_full_exit_stopper(&endpoint) {
             Ok(()) => cx.quit(),
             Err(error) => eprintln!("Could not prepare full exit: {error}"),
         },
@@ -93,10 +116,9 @@ fn action_for(intent: DesktopIntent, has_window: bool) -> DesktopAction {
     }
 }
 
-fn spawn_full_exit_stopper() -> Result<(), String> {
+fn spawn_full_exit_stopper(endpoint: &CoreEndpoint) -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("locate Agent Terminal executable: {error}"))?;
-    let endpoint = CoreEndpoint::for_current_user()?;
     let mut stopper = Command::new(executable)
         .arg("--stop-resident-core-after-parent")
         .arg(endpoint.argument())
@@ -119,7 +141,16 @@ fn spawn_full_exit_stopper() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopAction, DesktopIntent, action_for};
+    use super::{DesktopAction, DesktopIntent, action_for, interrupt_intent};
+
+    #[test]
+    fn only_development_launches_turn_interrupts_into_full_exit() {
+        assert_eq!(interrupt_intent(false), None);
+        assert_eq!(
+            interrupt_intent(true),
+            Some(DesktopIntent::StopResidentCoreAndQuit)
+        );
+    }
 
     #[test]
     fn open_or_focus_reuses_an_existing_window() {

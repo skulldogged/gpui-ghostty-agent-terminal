@@ -37,8 +37,11 @@ nix develop
 # ABI/parser/render-state smoke test without GPUI
 cargo run --no-default-features
 
-# Native GPUI terminal
-cargo run
+# Native GPUI terminal development launch
+cargo run -- --development
+
+# Optimized development launch
+cargo run --release -- --development
 ```
 
 The renderer selects and verifies a native fixed-pitch family on each platform:
@@ -63,6 +66,11 @@ session lifetime explicit: **Quit Desktop Shell (Keep Sessions)** leaves the
 Resident Core running, while **Stop Sessions and Quit** also stops the Resident
 Core. Use the latter before rebuilding on Windows so the running Core releases
 `agent-terminal.exe`.
+
+The explicit `--development` launch uses an isolated, non-persistent Resident
+Core profile. Interrupting its attached command with `Ctrl+C` stops both the
+development Desktop Shell and that development Core. A normal launch keeps the
+installed application's tray and persistent-session behavior.
 
 ## Verdict
 
