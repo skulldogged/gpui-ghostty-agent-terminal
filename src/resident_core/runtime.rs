@@ -37,8 +37,8 @@ struct RuntimeTerminal {
 }
 
 impl CoreRuntime {
-    pub(super) fn start(working_directory: &Path) -> Result<Self, String> {
-        let mut model = CoreModel::new();
+    pub(super) fn start(working_directory: &Path, first_resource_id: u64) -> Result<Self, String> {
+        let mut model = CoreModel::with_id_namespace(first_resource_id);
         let space_name = working_directory
             .file_name()
             .and_then(|name| name.to_str())
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn registry_runs_multiple_terminal_sessions_in_their_space_directories() {
         let directory = std::env::current_dir().expect("current directory");
-        let mut runtime = CoreRuntime::start(&directory).expect("start Core runtime");
+        let mut runtime = CoreRuntime::start(&directory, 1).expect("start Core runtime");
         let first = runtime.default_terminal();
         let revision = runtime.model_snapshot().revision;
         let second = runtime
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn moving_a_pane_does_not_move_or_restart_its_runtime_terminal() {
         let directory = std::env::current_dir().expect("current directory");
-        let mut runtime = CoreRuntime::start(&directory).expect("start Core runtime");
+        let mut runtime = CoreRuntime::start(&directory, 1).expect("start Core runtime");
         let snapshot = runtime.model_snapshot();
         let source_pane = match &snapshot.spaces[0].tabs[0].layout {
             crate::PaneLayout::Pane(pane) => pane.id,
