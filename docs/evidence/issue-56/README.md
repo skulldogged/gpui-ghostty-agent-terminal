@@ -80,10 +80,10 @@ workspace as fully opaque:
 
 ![Linux opaque mode](linux-opaque.png)
 
-Interactive validation covered horizontal pane creation and dragging its seam
-from an equal split to approximately 35%. Explicit red, green, blue, and amber
-ANSI backgrounds and the terminal cursor remained opaque in the translucent
-path.
+Interactive validation covered integrated-titlebar window movement, native
+titlebar controls, horizontal pane creation, and dragging its seam from an
+equal split to approximately 35%. Explicit red, green, blue, and amber ANSI
+backgrounds and the terminal cursor remained opaque in the translucent path.
 
 The automated Linux gate passed on the current branch head:
 
