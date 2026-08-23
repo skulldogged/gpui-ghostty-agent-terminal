@@ -47,10 +47,7 @@ const AUTH_SECRET_BYTES: usize = 32;
 const AUTH_NONCE_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoreEndpoint {
-    argument: String,
-    development_launch: bool,
-}
+pub struct CoreEndpoint(String);
 
 impl CoreEndpoint {
     pub fn for_profile(profile: &str) -> Result<Self, String> {
@@ -67,10 +64,7 @@ impl CoreEndpoint {
             );
         }
 
-        Ok(Self {
-            argument: format!("agent-terminal-{profile}"),
-            development_launch: false,
-        })
+        Ok(Self(format!("agent-terminal-{profile}")))
     }
 
     pub fn for_current_user() -> Result<Self, String> {
@@ -103,12 +97,7 @@ impl CoreEndpoint {
 
     pub fn for_development_launch() -> Result<Self, String> {
         let nonce = u64::from_le_bytes(random_bytes::<8>()?);
-        let mut endpoint = Self::for_current_user_profile(&format!(
-            "development-{}-{nonce:016x}",
-            std::process::id()
-        ))?;
-        endpoint.development_launch = true;
-        Ok(endpoint)
+        Self::for_current_user_profile(&format!("development-{}-{nonce:016x}", std::process::id()))
     }
 
     pub fn from_argument(argument: String) -> Result<Self, String> {
@@ -119,7 +108,7 @@ impl CoreEndpoint {
     }
 
     pub fn argument(&self) -> &str {
-        &self.argument
+        &self.0
     }
 
     #[cfg(windows)]
@@ -144,18 +133,14 @@ impl CoreEndpoint {
 
     #[cfg(unix)]
     fn socket_path(&self) -> io::Result<std::path::PathBuf> {
-        Ok(private_runtime_directory()?.join(format!(
-            "{:016x}.sock",
-            stable_endpoint_hash(&self.argument)
-        )))
+        Ok(private_runtime_directory()?
+            .join(format!("{:016x}.sock", stable_endpoint_hash(&self.0))))
     }
 
     #[cfg(unix)]
     fn lock_path(&self) -> io::Result<std::path::PathBuf> {
-        Ok(private_runtime_directory()?.join(format!(
-            "{:016x}.lock",
-            stable_endpoint_hash(&self.argument)
-        )))
+        Ok(private_runtime_directory()?
+            .join(format!("{:016x}.lock", stable_endpoint_hash(&self.0))))
     }
 }
 
@@ -2921,7 +2906,12 @@ fn spawn_resident_core(endpoint: &CoreEndpoint) -> Result<(), String> {
         std::env::current_exe()
             .map_err(|error| format!("locate application executable: {error}"))?,
     );
-    configure_resident_core_command(&mut command, endpoint);
+    command
+        .arg("--resident-core")
+        .arg(endpoint.argument())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     detach_command(&mut command);
     let mut child = command
         .spawn()
@@ -2933,18 +2923,6 @@ fn spawn_resident_core(endpoint: &CoreEndpoint) -> Result<(), String> {
         })
         .map_err(|error| format!("spawn Resident Core reaper: {error}"))?;
     Ok(())
-}
-
-fn configure_resident_core_command(command: &mut Command, endpoint: &CoreEndpoint) {
-    command
-        .arg("--resident-core")
-        .arg(endpoint.argument())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if endpoint.development_launch {
-        command.env_remove("NO_COLOR");
-    }
 }
 
 #[cfg(unix)]
@@ -2976,12 +2954,10 @@ const WINDOWS_RESIDENT_CORE_CREATION_FLAGS: u32 =
 mod tests {
     use super::{
         CoreEndpoint, PROTOCOL_VERSION, ResidentCore, TerminalCell, TerminalLifecycle,
-        TerminalSnapshot, TerminalUpdate, WorkerRequest, WorkerResponse,
-        configure_resident_core_command, protected_endpoint_name, read_response_until,
-        server_proof, verify_server_proof,
+        TerminalSnapshot, TerminalUpdate, WorkerRequest, WorkerResponse, protected_endpoint_name,
+        read_response_until, server_proof, verify_server_proof,
     };
     use crate::CoreCommand;
-    use std::process::Command;
 
     struct TransientWouldBlock {
         bytes: std::io::Cursor<Vec<u8>>,
@@ -2997,30 +2973,6 @@ mod tests {
         assert_ne!(first, default);
         assert_ne!(first, second);
         assert!(first.argument().contains("-development-"));
-    }
-
-    #[test]
-    fn only_development_core_launches_drop_the_host_no_color_preference() {
-        let mut development = Command::new("agent-terminal");
-        development.env("NO_COLOR", "1");
-        let endpoint = CoreEndpoint::for_development_launch().expect("development endpoint");
-        configure_resident_core_command(&mut development, &endpoint);
-        assert!(
-            development
-                .get_envs()
-                .any(|(key, value)| { key == "NO_COLOR" && value.is_none() })
-        );
-
-        let mut normal = Command::new("agent-terminal");
-        normal.env("NO_COLOR", "1");
-        let endpoint = CoreEndpoint::for_profile("development-default")
-            .expect("production endpoint containing development");
-        configure_resident_core_command(&mut normal, &endpoint);
-        assert!(
-            normal.get_envs().any(|(key, value)| {
-                key == "NO_COLOR" && value == Some(std::ffi::OsStr::new("1"))
-            })
-        );
     }
 
     #[test]
