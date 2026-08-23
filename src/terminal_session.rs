@@ -458,6 +458,53 @@ mod tests {
         panic!("shell did not return the input marker before the timeout");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn control_c_interrupts_a_windows_conpty_foreground_process() {
+        let (mut session, events) =
+            TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
+        session
+            .input(b"ping -t 127.0.0.1\r")
+            .expect("start foreground ping process");
+
+        // Give the shell time to start ping. The command's own echo is not a
+        // sufficient readiness signal because it precedes process creation.
+        std::thread::sleep(Duration::from_secs(1));
+        session.input(&[0x03]).expect("send Ctrl+C through ConPTY");
+        // Console control handlers run asynchronously. Do not let the
+        // foreground process consume the marker before it handles Ctrl+C.
+        std::thread::sleep(Duration::from_secs(1));
+        session
+            .input(b"cmd /d /c echo CONPTY_^CONTROL_C_RETURNED\r")
+            .expect("write marker after Ctrl+C");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last_screen = String::new();
+        while Instant::now() < deadline {
+            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(TerminalEvent::Changed) => {
+                    let snapshot = session.snapshot().expect("snapshot terminal session");
+                    last_screen = snapshot_text(&snapshot);
+                    if last_screen.contains("CONPTY_CONTROL_C_RETURNED") {
+                        return;
+                    }
+                }
+                Ok(TerminalEvent::Exited) => {
+                    panic!("shell exited instead of returning after Ctrl+C")
+                }
+                Ok(TerminalEvent::Failed(error)) => panic!("terminal session failed: {error}"),
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    panic!("terminal event stream disconnected")
+                }
+            }
+        }
+
+        panic!(
+            "Ctrl+C did not return control from ping to the Windows shell; final screen:\n{last_screen}"
+        );
+    }
+
     #[test]
     fn normal_shell_exit_is_reported_as_exited() {
         let (mut session, events) =
