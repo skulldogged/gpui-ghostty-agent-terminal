@@ -551,13 +551,22 @@ fn decode_pane_layout(decoder: &mut Decoder<'_>, depth: usize) -> io::Result<Pan
 }
 
 fn put_terminal_launch(output: &mut Vec<u8>, launch: &TerminalLaunch) -> io::Result<()> {
-    put_path(output, &launch.working_directory)
+    put_path(output, &launch.working_directory)?;
+    // Protocol v8 included Restore Disposition here. Preserve the field so a
+    // new Desktop Shell can exchange snapshots with an already-running v8
+    // Resident Core, but always advertise the removed relaunch/default value.
+    output.push(0);
+    Ok(())
 }
 
 fn decode_terminal_launch(decoder: &mut Decoder<'_>) -> io::Result<TerminalLaunch> {
-    Ok(TerminalLaunch {
-        working_directory: decode_path(decoder)?,
-    })
+    let working_directory = decode_path(decoder)?;
+    match decoder.u8()? {
+        // Both former Restore Disposition values now have the same meaning:
+        // they are ignored because cold layout restoration no longer exists.
+        0 | 1 => Ok(TerminalLaunch { working_directory }),
+        _ => Err(invalid("invalid removed Restore Disposition")),
+    }
 }
 
 fn put_core_command(output: &mut Vec<u8>, command: &CoreCommand) -> io::Result<()> {
@@ -1179,8 +1188,8 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_request, decode_response, encode_request, encode_response, read_request,
-        write_response,
+        Decoder, decode_request, decode_response, decode_terminal_launch, encode_request,
+        encode_response, put_path, put_terminal_launch, read_request, write_response,
     };
     use crate::resident_core::{
         ControlLease, ControlLeaseDenial, CoreCommandOutcome, Request, Response, SemanticEvent,
@@ -1189,9 +1198,28 @@ mod tests {
     };
     use crate::{
         CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, PaneId, SpaceId, SplitAxis,
-        SplitId, SplitPlacement, SplitRatio, TabId, TerminalSessionId,
+        SplitId, SplitPlacement, SplitRatio, TabId, TerminalLaunch, TerminalSessionId,
         terminal_session::TerminalSize,
     };
+
+    #[test]
+    fn terminal_launch_retains_the_v8_compatibility_byte() {
+        let launch = TerminalLaunch::shell(std::env::current_dir().expect("current directory"));
+        let mut path = Vec::new();
+        put_path(&mut path, &launch.working_directory).expect("encode launch path");
+        let mut encoded = Vec::new();
+        put_terminal_launch(&mut encoded, &launch).expect("encode Terminal launch");
+
+        assert_eq!(encoded.len(), path.len() + 1);
+        assert_eq!(encoded.last(), Some(&0));
+
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(
+            decode_terminal_launch(&mut decoder).expect("decode v8 Terminal launch"),
+            launch
+        );
+        decoder.finish().expect("consume compatibility byte");
+    }
 
     #[test]
     fn hello_is_one_length_prefixed_binary_frame() {

@@ -33,9 +33,12 @@ mod wire;
 
 use runtime::{CoreRuntime, RuntimeEvent};
 
-// Version 9 removes cold-layout restore intent from Terminal launches and Core
-// commands. A newly started Resident Core always creates a fresh hierarchy.
-const PROTOCOL_VERSION: u16 = 9;
+// Version 8 adds lease-controlled terminal paste commands whose encoding is
+// resolved inside the Resident Core against its authoritative VT modes. Layout
+// persistence was later removed without changing the protocol: Terminal launch
+// frames retain and ignore the former Restore Disposition byte so an upgraded
+// Desktop Shell can attach to an already-running v8 Resident Core.
+const PROTOCOL_VERSION: u16 = 8;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SEMANTIC_EVENT_CAPACITY: usize = 64;
 const SESSION_TICK: Duration = Duration::from_millis(10);
@@ -2870,8 +2873,8 @@ const WINDOWS_RESIDENT_CORE_CREATION_FLAGS: u32 =
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreEndpoint, ResidentCore, TerminalCell, TerminalLifecycle, TerminalSnapshot,
-        TerminalUpdate, WorkerRequest, WorkerResponse, protected_endpoint_name,
+        CoreEndpoint, PROTOCOL_VERSION, ResidentCore, TerminalCell, TerminalLifecycle,
+        TerminalSnapshot, TerminalUpdate, WorkerRequest, WorkerResponse, protected_endpoint_name,
         read_response_until, server_proof, verify_server_proof,
     };
     use crate::CoreCommand;
@@ -2890,6 +2893,14 @@ mod tests {
         assert_ne!(first, default);
         assert_ne!(first, second);
         assert!(first.argument().contains("-development-"));
+    }
+
+    #[test]
+    fn removing_layout_persistence_preserves_running_v8_core_compatibility() {
+        assert_eq!(
+            PROTOCOL_VERSION, 8,
+            "a Desktop Shell upgrade must still attach to an already-running v8 Resident Core"
+        );
     }
 
     #[cfg(windows)]
