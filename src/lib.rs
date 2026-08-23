@@ -51,7 +51,7 @@ pub fn run_gui() {
 
 #[cfg(feature = "gui")]
 pub fn run_development_gui() -> Result<(), String> {
-    let endpoint = CoreEndpoint::for_current_user_profile("development")?;
+    let endpoint = CoreEndpoint::for_development_launch()?;
     desktop_shell::run(endpoint, true);
     Ok(())
 }

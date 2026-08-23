@@ -92,6 +92,11 @@ impl CoreEndpoint {
         Self::for_profile(&format!("{identity}-{profile}"))
     }
 
+    pub fn for_development_launch() -> Result<Self, String> {
+        let nonce = u64::from_le_bytes(random_bytes::<8>()?);
+        Self::for_current_user_profile(&format!("development-{}-{nonce:016x}", std::process::id()))
+    }
+
     pub fn from_argument(argument: String) -> Result<Self, String> {
         let profile = argument
             .strip_prefix("agent-terminal-")
@@ -2874,13 +2879,14 @@ mod tests {
     }
 
     #[test]
-    fn development_profile_is_isolated_from_the_default_core() {
+    fn development_launches_are_isolated_from_default_and_each_other() {
         let default = CoreEndpoint::for_current_user().expect("default endpoint");
-        let development =
-            CoreEndpoint::for_current_user_profile("development").expect("development endpoint");
+        let first = CoreEndpoint::for_development_launch().expect("first development endpoint");
+        let second = CoreEndpoint::for_development_launch().expect("second development endpoint");
 
-        assert_ne!(development, default);
-        assert!(development.argument().ends_with("-development"));
+        assert_ne!(first, default);
+        assert_ne!(first, second);
+        assert!(first.argument().contains("-development-"));
     }
 
     impl std::io::Read for TransientWouldBlock {
