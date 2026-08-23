@@ -14,8 +14,6 @@ use gpui::{
     prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet};
-#[cfg(windows)]
-use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
@@ -63,8 +61,6 @@ pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, Stri
             });
             view.update(cx, |view, cx| {
                 view.start_refresh_task(cx);
-                #[cfg(windows)]
-                view.start_windows_probe(cx);
             });
             view
         })
@@ -239,26 +235,6 @@ fn terminal_font_candidates() -> &'static [&'static str] {
 }
 
 impl MultiplexerView {
-    #[cfg(windows)]
-    fn start_windows_probe(&mut self, cx: &mut Context<Self>) {
-        let timer = cx.background_executor().timer(Duration::from_millis(750));
-        cx.spawn(async move |this, cx| {
-            timer.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |view, _cx| {
-                    if let Some(terminal_session_id) = view.focused_terminal_session_id()
-                        && let Err(error) = view
-                            .driver
-                            .input_to(terminal_session_id, b"echo WINDOWS_CONPTY_LIVE\r".to_vec())
-                    {
-                        view.global_error = Some(error);
-                    }
-                });
-            }
-        })
-        .detach();
-    }
-
     fn start_refresh_task(&mut self, cx: &mut Context<Self>) {
         let updates = self.driver.updates();
         self.refresh_task = cx.spawn(async move |this, cx| {
