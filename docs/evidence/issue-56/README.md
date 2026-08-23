@@ -68,12 +68,25 @@ The automated macOS gate passed:
 
 ## Linux
 
+With `AGENT_TERMINAL_BACKGROUND_OPACITY` unset in a Plasma Wayland session,
+the native material path keeps the desktop visible through the workspace shell
+and default terminal surface:
+
+![Linux Wayland material](linux-wayland-material.png)
+
+With `AGENT_TERMINAL_BACKGROUND_OPACITY=1`, a fresh process resolves the same
+workspace as fully opaque:
+
+![Linux opaque mode](linux-opaque.png)
+
+Interactive validation covered horizontal pane creation and dragging its seam
+from an equal split to approximately 35%. Explicit red, green, blue, and amber
+ANSI backgrounds and the terminal cursor remained opaque in the translucent
+path.
+
 The automated Linux gate passed on the current branch head:
 
 - `cargo fmt --all -- --check`
 - `cargo check --locked`
 - `cargo test --locked --profile test` (77 unit tests and 11 integration tests)
 - `cargo clippy --locked --profile test --all-targets -- -D warnings`
-
-Wayland material and opaque-fallback visual evidence remains pending on a
-graphical Linux session.
