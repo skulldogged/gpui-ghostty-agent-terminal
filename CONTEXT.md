@@ -5,7 +5,7 @@ This context describes a graphical terminal multiplexer that organizes persisten
 ## Language
 
 **Space**:
-A long-lived, directory-rooted work context containing an ordered collection of Tabs. Repository and worktree metadata are optional enrichment rather than identity. It survives UI Client detach while its Resident Core is running; cold layout restoration is not currently supported.
+A directory-rooted work context containing an ordered collection of Tabs. Repository and worktree metadata are optional enrichment rather than identity. It survives native window closure while the application remains running in the tray; cold layout restoration is not currently supported.
 _Avoid_: Workspace, Session
 
 **Tab**:
@@ -17,32 +17,20 @@ A leaf placement in a Tab's split layout that references one Terminal Session. P
 _Avoid_: Panel, Agent Pane
 
 **Terminal Session**:
-A live shell or CLI execution stream with an immutable identity independent of Pane placement. It appears in at most one Pane and has at most one controlling UI Client at a time.
+A live shell or CLI execution stream with an immutable identity independent of Pane placement. It appears in at most one Pane.
 _Avoid_: Agent Session
 
-**Resident Core**:
-The long-lived local process that owns Spaces, Terminal Sessions, and agent-integration state independently of any native application window.
-_Avoid_: Hidden Window, GUI Process
+**Application**:
+The single tray-resident process that owns Spaces, Terminal Sessions, agent-integration state, and zero or more native windows. Closing every window does not stop the application; choosing Quit does.
+_Avoid_: Resident Core, UI Client, Desktop Shell
 
-**UI Client**:
-An attachable GPUI front end whose windows can present any Space without owning that Space or its terminal lifetimes.
-_Avoid_: Main Process, Space Window
-
-**Desktop Shell**:
-An independently restartable presentation host for one OS login and application profile. It may have zero windows and never owns Spaces or Terminal Sessions.
-_Avoid_: Tray Process, Hidden Window
-
-**Detach**:
-Closing a UI view while its Space, Panes, and Terminal Sessions continue running in the Resident Core. Detach never means closing a Pane.
-_Avoid_: Quit, Stop
+**Close Window**:
+Closing a native presentation window while the Application, Spaces, Panes, and Terminal Sessions continue running. Closing a window never means closing a Pane.
+_Avoid_: Quit, Close Pane
 
 **Close Pane**:
-An explicit destructive action that removes a Pane and stops its referenced Terminal Session after confirmation. A shell that exits naturally has already ended its own work and closes the corresponding Pane through the same hierarchy mutation without another confirmation.
-_Avoid_: Detach, Close Window
-
-**Control Lease**:
-The exclusive relationship granting one UI Client authority to send input and set the canonical size of a Terminal Session. Other UI Clients cannot control that Terminal Session while the lease is held.
-_Avoid_: Focus, Ownership
+An explicit action that removes a Pane and stops its referenced Terminal Session. The UI asks for confirmation only when that session has active work worth protecting. A shell that exits naturally has already ended its own work and closes the corresponding Pane through the same hierarchy mutation without confirmation.
+_Avoid_: Close Window
 
 **Agent Integration**:
 Optional capabilities that augment a Terminal Session when an agent program is recognized or cooperates with the application.

@@ -58,20 +58,15 @@ window. Shell and default terminal surfaces use 65% opacity by default; set
 value of `1.0` forces opaque mode. Explicit terminal cell backgrounds and
 cursor fills remain opaque regardless of this setting.
 
-Closing the last window keeps the Desktop Shell available from its native tray
+Closing the last window keeps the Application available from its native tray
 item on macOS and Windows, or from a StatusNotifierItem host on Linux. Linux
-desktops without a status-notifier host instead quit the Desktop Shell with the
-last window so it never becomes an invisible background process. The tray keeps
-session lifetime explicit: **Quit Desktop Shell (Keep Sessions)** leaves the
-Resident Core running, while **Stop Sessions and Quit** also stops the Resident
-Core. Use the latter before rebuilding on Windows so the running Core releases
-`agent-terminal.exe`.
+desktops without a status-notifier host instead quit with the last window so the
+application never becomes an invisible background process. The tray offers one
+explicit **Quit** action, which ends the application and all Terminal Sessions.
 
-The explicit `--development` launch uses an isolated Resident
-Core profile. Interrupting its attached command with `Ctrl+C` stops both the
-development Desktop Shell and that development Core. A normal launch keeps the
-installed application's Resident Core and live sessions available across UI
-Client detach.
+The `--development` launch uses the same single-process architecture as a normal
+launch. It additionally treats `Ctrl+C` in the launching terminal as an explicit
+application quit, which makes local rebuild/test loops predictable.
 
 ## Verdict
 
@@ -85,18 +80,18 @@ Terminal Session interface.
 | macOS arm64 | Native Metal window | Same pinned library and GPUI renderer passed | Native Unix PTY input/output passed | Green |
 | Windows x64 | Native GPUI window | MSVC build plus ANSI/Unicode/resize executable smoke passed | Project-owned ConPTY input/output, resize, and live shell round trip passed | Green |
 
-The Windows implementation validates the planned seam: a resident core owns
-terminals and exposes a narrow byte-stream/resize/lifecycle protocol; platform
-adapters own Unix PTY or ConPTY details. T3 Code uses the same broad split
-(`libghostty-vt` semantics plus an independently owned PTY layer), while
-mightty is the closest native Rust/GPUI precedent.
+The application owns terminals in-process while platform adapters keep Unix PTY
+and ConPTY details behind the project-owned Terminal Session interface. T3 Code
+uses the same broad terminal split (`libghostty-vt` semantics plus an
+independently owned PTY layer), while mightty is the closest native Rust/GPUI
+precedent.
 
 ## Remaining vertical-slice work
 
 - The GPUI renderer uses measured fixed-cell geometry, constant-time cell
   lookup, one shaped draw per row, merged background runs, and live PTY
-  resizing. A bounded background driver coalesces visual refreshes so local IPC
-  and reconnect work never block GPUI's event thread.
+  resizing. A bounded background driver coalesces visual refreshes so terminal
+  work never blocks GPUI's event thread.
 - Keyboard input covers text, control keys, and arrows. Full IME support needs
   a GPUI `InputHandler`, not only key-down events.
 - Agent TUIs remain ordinary PTY clients. Rich agent integration belongs in a
