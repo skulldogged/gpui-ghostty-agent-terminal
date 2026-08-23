@@ -10,8 +10,9 @@ surface opacity. The operator approved that appearance in a live build with
 `AGENT_TERMINAL_BACKGROUND_OPACITY` unset. The explicit value `1` continues to
 select the opaque window and surface path.
 
-The superseded Mica and opaque screenshots were removed. Fresh app-only
-captures can be added when the Windows capture helper is available again.
+| Acrylic | Opaque override |
+| --- | --- |
+| ![Windows Acrylic](windows-acrylic.png) | ![Windows opaque mode](windows-opaque.png) |
 
 ## Interactive validation
 
