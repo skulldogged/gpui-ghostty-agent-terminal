@@ -18,6 +18,7 @@ This document resolves the structural decisions tracked in issue #9. `CONTEXT.md
 - Creating a Space also creates its initial Tab, Pane, and Terminal Session.
 - Closing a native window or disconnecting a UI Client is Detach. It changes no Space, Tab, Pane, or Terminal Session state.
 - Closing a Pane is an explicit destructive command. The UI confirms when work may be active; after acknowledgement the Resident Core stops the referenced Terminal Session and removes the Pane atomically.
+- A shell that exits naturally closes its Pane through the same model command after final PTY/ConPTY output is drained and the process is reaped. Existing split-collapse rules remove empty Tabs and Spaces. Failed startup or transport remains visible as an actionable failure instead of being treated as a normal close.
 - Moving a Pane atomically removes and reinserts the same Pane placement and Terminal Session reference. Launch-time environment hints may become stale and never confer identity or authority.
 - A live Terminal Session is `Running`, `Stopping`, `Exited`, or `Failed`.
 - Tabs and Panes have stable explicit ordering. Reordering does not change IDs. Focus, selected Tab, window geometry, sidebar state, and transient selection belong to each UI Client rather than the Resident Core.

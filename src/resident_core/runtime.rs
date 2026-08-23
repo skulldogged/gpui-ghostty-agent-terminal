@@ -1,6 +1,6 @@
 use super::{TerminalLifecycle, TerminalUpdate};
 use crate::{
-    CoreCommand, CoreEffect, CoreModel, TerminalSessionId,
+    CoreCommand, CoreEffect, CoreModel, PaneId, PaneLayout, TerminalSessionId,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
 use crate::{CoreCommit, CoreModelError, CoreSnapshot};
@@ -21,6 +21,10 @@ pub(super) enum RuntimeEvent {
         terminal_session_id: TerminalSessionId,
         lifecycle: TerminalLifecycle,
         terminal_revision: u64,
+    },
+    PaneClosed {
+        terminal_session_id: TerminalSessionId,
+        revision: u64,
     },
 }
 
@@ -98,6 +102,10 @@ impl CoreRuntime {
                     terminal_session_id.as_u64()
                 )
             })
+    }
+
+    pub(super) fn contains_terminal(&self, terminal_session_id: TerminalSessionId) -> bool {
+        self.terminals.contains_key(&terminal_session_id)
     }
 
     pub(super) fn apply(
@@ -196,23 +204,46 @@ impl CoreRuntime {
 
     pub(super) fn refresh(&mut self) -> Vec<RuntimeEvent> {
         let mut updates = Vec::new();
+        let mut exited = Vec::new();
         for (&terminal_session_id, runtime) in &mut self.terminals {
             let revision_before = runtime.revision;
             let lifecycle_before = runtime.lifecycle.clone();
             runtime.refresh();
+            let exited_naturally = runtime.lifecycle != lifecycle_before
+                && matches!(runtime.lifecycle, TerminalLifecycle::Exited);
             if runtime.lifecycle != lifecycle_before {
-                updates.push(RuntimeEvent::TerminalLifecycleChanged {
-                    terminal_session_id,
-                    lifecycle: runtime.lifecycle.clone(),
-                    terminal_revision: runtime.revision,
-                });
+                if exited_naturally {
+                    exited.push(terminal_session_id);
+                } else {
+                    updates.push(RuntimeEvent::TerminalLifecycleChanged {
+                        terminal_session_id,
+                        lifecycle: runtime.lifecycle.clone(),
+                        terminal_revision: runtime.revision,
+                    });
+                }
             }
-            if runtime.revision != revision_before {
+            if runtime.revision != revision_before && !exited_naturally {
                 updates.push(RuntimeEvent::TerminalChanged {
                     terminal_session_id,
                     terminal_revision: runtime.revision,
                 });
             }
+        }
+        for terminal_session_id in exited {
+            let pane_id = pane_for_terminal(&self.model.snapshot(), terminal_session_id)
+                .expect("a live Terminal Session must belong to one Pane");
+            let commit = self
+                .apply(
+                    self.model.snapshot().revision,
+                    CoreCommand::ClosePane { pane_id },
+                )
+                .expect(
+                    "closing a naturally exited Terminal Session must preserve Core invariants",
+                );
+            updates.push(RuntimeEvent::PaneClosed {
+                terminal_session_id,
+                revision: commit.revision,
+            });
         }
         updates
     }
@@ -300,9 +331,25 @@ impl RuntimeTerminal {
             match event {
                 TerminalEvent::Changed => {}
                 TerminalEvent::Exited => {
-                    self.lifecycle = match session.reap_process() {
-                        Ok(()) => TerminalLifecycle::Exited,
-                        Err(error) => TerminalLifecycle::Failed(error),
+                    let output_error = match session.drain_pending_output() {
+                        Ok(true) => {
+                            self.revision = self.revision.saturating_add(1);
+                            None
+                        }
+                        Ok(false) => None,
+                        Err(error) => Some(error),
+                    };
+                    let reap_error = session.reap_process().err();
+                    self.lifecycle = match (output_error, reap_error) {
+                        (None, None) => TerminalLifecycle::Exited,
+                        (Some(error), None) | (None, Some(error)) => {
+                            TerminalLifecycle::Failed(error)
+                        }
+                        (Some(output_error), Some(reap_error)) => {
+                            TerminalLifecycle::Failed(format!(
+                                "{output_error}; also failed to reap terminal process: {reap_error}"
+                            ))
+                        }
                     };
                     self.revision = self.revision.saturating_add(1);
                 }
@@ -312,6 +359,30 @@ impl RuntimeTerminal {
                 }
             }
         }
+    }
+}
+
+fn pane_for_terminal(
+    snapshot: &CoreSnapshot,
+    terminal_session_id: TerminalSessionId,
+) -> Option<PaneId> {
+    snapshot
+        .spaces
+        .iter()
+        .flat_map(|space| &space.tabs)
+        .find_map(|tab| pane_for_terminal_in_layout(&tab.layout, terminal_session_id))
+}
+
+fn pane_for_terminal_in_layout(
+    layout: &PaneLayout,
+    terminal_session_id: TerminalSessionId,
+) -> Option<PaneId> {
+    match layout {
+        PaneLayout::Pane(pane) => {
+            (pane.terminal_session_id == terminal_session_id).then_some(pane.id)
+        }
+        PaneLayout::Split(split) => pane_for_terminal_in_layout(&split.first, terminal_session_id)
+            .or_else(|| pane_for_terminal_in_layout(&split.second, terminal_session_id)),
     }
 }
 
