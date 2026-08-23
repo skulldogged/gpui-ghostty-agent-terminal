@@ -218,7 +218,7 @@ mod platform {
             let rgba = terminal_icon_rgba();
             assert_eq!(rgba.len(), 32 * 32 * 4);
             assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
-            assert!(rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+            assert!(rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255));
         }
     }
 }
