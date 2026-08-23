@@ -19,6 +19,7 @@ opt-level = 0
 [features]
 default = ["gui"]
 gui = [
+    "dep:ctrlc",
     "dep:directories",
     "dep:flume",
     "dep:gpui",
@@ -34,6 +35,7 @@ gui = [
 ]
 
 [dependencies]
+ctrlc = { version = "3.5", features = ["termination"], optional = true }
 directories = { version = "6", optional = true }
 flume = { version = "0.12", optional = true }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true }

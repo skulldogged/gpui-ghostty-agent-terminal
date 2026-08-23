@@ -19,9 +19,12 @@ const TERMINAL_PADDING_PX: f32 = 10.0;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
-pub(crate) fn open_terminal_window(cx: &mut App) -> Result<AnyWindowHandle, String> {
+pub(crate) fn open_terminal_window(
+    cx: &mut App,
+    endpoint: &crate::CoreEndpoint,
+) -> Result<AnyWindowHandle, String> {
     let terminal_font = TerminalFont::resolve(cx)?;
-    let core = CoreClient::connect_or_spawn()?;
+    let core = CoreClient::connect_or_spawn_at(endpoint)?;
     let (driver, projection) = CoreDriver::start(core)?;
     let shell = WorkspaceShell::from_environment();
     let selection = UiSelection::initial(&projection.hierarchy);

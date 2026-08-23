@@ -35,6 +35,13 @@ fn main() {
             }
             return;
         }
+        if command.as_deref() == Some("--development") {
+            if let Err(error) = agent_terminal::run_development_gui() {
+                eprintln!("Development launch failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
 
         agent_terminal::run_gui();
     }

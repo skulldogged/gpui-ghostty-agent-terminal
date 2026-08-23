@@ -65,6 +65,10 @@ impl CoreEndpoint {
     }
 
     pub fn for_current_user() -> Result<Self, String> {
+        Self::for_current_user_profile("default")
+    }
+
+    pub fn for_current_user_profile(profile: &str) -> Result<Self, String> {
         #[cfg(unix)]
         let identity = unsafe { libc::geteuid() }.to_string();
 
@@ -85,7 +89,12 @@ impl CoreEndpoint {
                 .collect::<String>()
         };
 
-        Self::for_profile(&format!("{identity}-default"))
+        Self::for_profile(&format!("{identity}-{profile}"))
+    }
+
+    pub fn for_development_launch() -> Result<Self, String> {
+        let nonce = u64::from_le_bytes(random_bytes::<8>()?);
+        Self::for_current_user_profile(&format!("development-{}-{nonce:016x}", std::process::id()))
     }
 
     pub fn from_argument(argument: String) -> Result<Self, String> {
@@ -410,6 +419,7 @@ impl std::fmt::Display for CoreCommandError {
 impl std::error::Error for CoreCommandError {}
 
 pub struct CoreClient {
+    endpoint: CoreEndpoint,
     connection: Arc<Mutex<LocalSocketStream>>,
     responses: flume::Receiver<Result<Response, String>>,
     terminal_changes: flume::Receiver<TerminalChange>,
@@ -506,6 +516,7 @@ impl CoreClient {
                             let active_terminal_session_id =
                                 snapshot.terminal_sessions.first().map(|session| session.id);
                             return Ok(Self {
+                                endpoint: endpoint.clone(),
                                 connection: writer,
                                 responses: responses_rx,
                                 terminal_changes: changes_rx,
@@ -545,12 +556,20 @@ impl CoreClient {
 
     pub fn connect_or_spawn() -> Result<Self, String> {
         let endpoint = CoreEndpoint::for_current_user()?;
-        if let Ok(client) = Self::connect(&endpoint, Duration::from_millis(100)) {
+        Self::connect_or_spawn_at(&endpoint)
+    }
+
+    pub fn connect_or_spawn_at(endpoint: &CoreEndpoint) -> Result<Self, String> {
+        if let Ok(client) = Self::connect(endpoint, Duration::from_millis(100)) {
             return Ok(client);
         }
 
-        spawn_resident_core(&endpoint)?;
-        Self::connect(&endpoint, Duration::from_secs(10))
+        spawn_resident_core(endpoint)?;
+        Self::connect(endpoint, Duration::from_secs(10))
+    }
+
+    pub fn endpoint(&self) -> &CoreEndpoint {
+        &self.endpoint
     }
 
     pub fn client_id(&self) -> UiClientId {
@@ -2857,6 +2876,17 @@ mod tests {
     struct TransientWouldBlock {
         bytes: std::io::Cursor<Vec<u8>>,
         would_block_next: bool,
+    }
+
+    #[test]
+    fn development_launches_are_isolated_from_default_and_each_other() {
+        let default = CoreEndpoint::for_current_user().expect("default endpoint");
+        let first = CoreEndpoint::for_development_launch().expect("first development endpoint");
+        let second = CoreEndpoint::for_development_launch().expect("second development endpoint");
+
+        assert_ne!(first, default);
+        assert_ne!(first, second);
+        assert!(first.argument().contains("-development-"));
     }
 
     impl std::io::Read for TransientWouldBlock {

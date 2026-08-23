@@ -251,6 +251,7 @@ enum DriverEvent {
 
 impl CoreDriver {
     pub(crate) fn start(mut core: CoreClient) -> Result<(Self, CoreProjection), String> {
+        let endpoint = core.endpoint().clone();
         let projection = load_projection(&mut core)?;
         let revisions = projection
             .terminals
@@ -277,6 +278,7 @@ impl CoreDriver {
             .spawn(move || {
                 run_driver(
                     core,
+                    endpoint,
                     hierarchy_revision,
                     revisions,
                     commands_rx,
@@ -363,6 +365,7 @@ impl Drop for CoreDriver {
 
 fn run_driver(
     mut core: CoreClient,
+    endpoint: crate::CoreEndpoint,
     mut hierarchy_revision: u64,
     mut revisions: HashMap<TerminalSessionId, u64>,
     commands: flume::Receiver<Command>,
@@ -483,10 +486,11 @@ fn run_driver(
                 if !reconnect {
                     continue;
                 }
-                let recovered = CoreClient::connect_or_spawn().and_then(|mut replacement| {
-                    let projection = load_projection(&mut replacement)?;
-                    Ok((replacement, projection))
-                });
+                let recovered =
+                    CoreClient::connect_or_spawn_at(&endpoint).and_then(|mut replacement| {
+                        let projection = load_projection(&mut replacement)?;
+                        Ok((replacement, projection))
+                    });
                 match recovered {
                     Ok((replacement, projection)) => {
                         terminal_changes = replacement.terminal_changes();
