@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    path::PathBuf,
-};
+use std::{fmt, path::PathBuf};
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -59,23 +55,15 @@ impl SplitRatio {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RestoreDisposition {
-    Relaunch,
-    RemainEnded,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalLaunch {
     pub working_directory: PathBuf,
-    pub restore_disposition: RestoreDisposition,
 }
 
 impl TerminalLaunch {
     pub fn shell(working_directory: impl Into<PathBuf>) -> Self {
         Self {
             working_directory: working_directory.into(),
-            restore_disposition: RestoreDisposition::Relaunch,
         }
     }
 }
@@ -130,59 +118,6 @@ pub struct TerminalSessionSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PersistedCoreLayout {
-    pub next_id: u64,
-    pub spaces: Vec<PersistedSpace>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PersistedSpace {
-    pub id: SpaceId,
-    pub name: String,
-    pub directory: PathBuf,
-    pub tabs: Vec<PersistedTab>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PersistedTab {
-    pub id: TabId,
-    pub name: String,
-    pub layout: PersistedPaneLayout,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PersistedPaneLayout {
-    Pane(PersistedPane),
-    Split(PersistedSplit),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PersistedPane {
-    pub id: PaneId,
-    pub launch: TerminalLaunch,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PersistedSplit {
-    pub id: SplitId,
-    pub axis: SplitAxis,
-    pub ratio: SplitRatio,
-    pub first: Box<PersistedPaneLayout>,
-    pub second: Box<PersistedPaneLayout>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CoreRestoreError(&'static str);
-
-impl fmt::Display for CoreRestoreError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid Core snapshot: {}", self.0)
-    }
-}
-
-impl std::error::Error for CoreRestoreError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoreCommand {
     CreateSpace {
         name: String,
@@ -224,10 +159,6 @@ pub enum CoreCommand {
     ClosePane {
         pane_id: PaneId,
     },
-    SetRestoreDisposition {
-        terminal_session_id: TerminalSessionId,
-        disposition: RestoreDisposition,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,9 +168,6 @@ pub enum CoreEffect {
         launch: TerminalLaunch,
     },
     StopTerminal {
-        terminal_session_id: TerminalSessionId,
-    },
-    RestoreEndedTerminal {
         terminal_session_id: TerminalSessionId,
     },
 }
@@ -348,74 +276,6 @@ impl CoreModel {
 
     pub fn snapshot(&self) -> CoreSnapshot {
         self.snapshot.clone()
-    }
-
-    pub(crate) fn persisted_layout(&self) -> Result<PersistedCoreLayout, CoreRestoreError> {
-        let launches = self
-            .snapshot
-            .terminal_sessions
-            .iter()
-            .map(|session| (session.id, &session.launch))
-            .collect::<HashMap<_, _>>();
-        let spaces = self
-            .snapshot
-            .spaces
-            .iter()
-            .map(|space| {
-                Ok(PersistedSpace {
-                    id: space.id,
-                    name: space.name.clone(),
-                    directory: space.directory.clone(),
-                    tabs: space
-                        .tabs
-                        .iter()
-                        .map(|tab| {
-                            Ok(PersistedTab {
-                                id: tab.id,
-                                name: tab.name.clone(),
-                                layout: persist_pane_layout(&tab.layout, &launches)?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, CoreRestoreError>>()?,
-                })
-            })
-            .collect::<Result<Vec<_>, CoreRestoreError>>()?;
-        Ok(PersistedCoreLayout {
-            next_id: self.next_id,
-            spaces,
-        })
-    }
-
-    pub(crate) fn restore_layout(
-        layout: PersistedCoreLayout,
-    ) -> Result<(Self, Vec<CoreEffect>), CoreRestoreError> {
-        let next_id = validate_persisted_layout(&layout)?;
-        let mut model = Self {
-            snapshot: CoreSnapshot {
-                revision: 0,
-                spaces: Vec::with_capacity(layout.spaces.len()),
-                terminal_sessions: Vec::new(),
-            },
-            next_id,
-        };
-        let mut effects = Vec::new();
-        for space in layout.spaces {
-            let mut tabs = Vec::with_capacity(space.tabs.len());
-            for tab in space.tabs {
-                tabs.push(TabSnapshot {
-                    id: tab.id,
-                    name: tab.name,
-                    layout: model.restore_pane_layout(tab.layout, &mut effects),
-                });
-            }
-            model.snapshot.spaces.push(SpaceSnapshot {
-                id: space.id,
-                name: space.name,
-                directory: space.directory,
-                tabs,
-            });
-        }
-        Ok((model, effects))
     }
 
     pub fn apply(
@@ -672,21 +532,6 @@ impl CoreModel {
                     CreatedResource::None,
                 ))
             }
-            CoreCommand::SetRestoreDisposition {
-                terminal_session_id,
-                disposition,
-            } => {
-                let session = self
-                    .snapshot
-                    .terminal_sessions
-                    .iter_mut()
-                    .find(|session| session.id == terminal_session_id)
-                    .ok_or_else(|| {
-                        not_found(ResourceKind::TerminalSession, terminal_session_id.as_u64())
-                    })?;
-                session.launch.restore_disposition = disposition;
-                Ok((Vec::new(), CreatedResource::None))
-            }
         }
     }
 
@@ -715,135 +560,6 @@ impl CoreModel {
     fn next_terminal_session_id(&mut self) -> TerminalSessionId {
         TerminalSessionId::from_u64(self.next_raw_id())
     }
-
-    fn restore_pane_layout(
-        &mut self,
-        layout: PersistedPaneLayout,
-        effects: &mut Vec<CoreEffect>,
-    ) -> PaneLayout {
-        match layout {
-            PersistedPaneLayout::Pane(pane) => {
-                let terminal_session_id = self.next_terminal_session_id();
-                let effect = match pane.launch.restore_disposition {
-                    RestoreDisposition::Relaunch => CoreEffect::LaunchTerminal {
-                        terminal_session_id,
-                        launch: pane.launch.clone(),
-                    },
-                    RestoreDisposition::RemainEnded => CoreEffect::RestoreEndedTerminal {
-                        terminal_session_id,
-                    },
-                };
-                self.snapshot
-                    .terminal_sessions
-                    .push(TerminalSessionSnapshot {
-                        id: terminal_session_id,
-                        launch: pane.launch,
-                    });
-                effects.push(effect);
-                PaneLayout::Pane(PaneSnapshot {
-                    id: pane.id,
-                    terminal_session_id,
-                })
-            }
-            PersistedPaneLayout::Split(split) => PaneLayout::Split(SplitSnapshot {
-                id: split.id,
-                axis: split.axis,
-                ratio: split.ratio,
-                first: Box::new(self.restore_pane_layout(*split.first, effects)),
-                second: Box::new(self.restore_pane_layout(*split.second, effects)),
-            }),
-        }
-    }
-}
-
-fn persist_pane_layout(
-    layout: &PaneLayout,
-    launches: &HashMap<TerminalSessionId, &TerminalLaunch>,
-) -> Result<PersistedPaneLayout, CoreRestoreError> {
-    match layout {
-        PaneLayout::Pane(pane) => Ok(PersistedPaneLayout::Pane(PersistedPane {
-            id: pane.id,
-            launch: (*launches
-                .get(&pane.terminal_session_id)
-                .ok_or(CoreRestoreError(
-                    "Pane references a missing Terminal Session",
-                ))?)
-            .clone(),
-        })),
-        PaneLayout::Split(split) => Ok(PersistedPaneLayout::Split(PersistedSplit {
-            id: split.id,
-            axis: split.axis,
-            ratio: split.ratio,
-            first: Box::new(persist_pane_layout(&split.first, launches)?),
-            second: Box::new(persist_pane_layout(&split.second, launches)?),
-        })),
-    }
-}
-
-fn validate_persisted_layout(layout: &PersistedCoreLayout) -> Result<u64, CoreRestoreError> {
-    let mut ids = HashSet::new();
-    let mut greatest_id = 0_u64;
-    for space in &layout.spaces {
-        validate_persisted_id(space.id.as_u64(), &mut ids, &mut greatest_id)?;
-        validate_name(&space.name).map_err(|_| CoreRestoreError("Space name is invalid"))?;
-        validate_directory(&space.directory)
-            .map_err(|_| CoreRestoreError("Space directory is empty"))?;
-        if space.tabs.is_empty() {
-            return Err(CoreRestoreError("Space has no Tabs"));
-        }
-        for tab in &space.tabs {
-            validate_persisted_id(tab.id.as_u64(), &mut ids, &mut greatest_id)?;
-            validate_name(&tab.name).map_err(|_| CoreRestoreError("Tab name is invalid"))?;
-            validate_persisted_pane_layout(&tab.layout, &mut ids, &mut greatest_id, 0)?;
-        }
-    }
-    let minimum_next = greatest_id
-        .checked_add(1)
-        .ok_or(CoreRestoreError("Core IDs are exhausted"))?;
-    if layout.next_id < minimum_next {
-        return Err(CoreRestoreError("Core ID allocation watermark is stale"));
-    }
-    Ok(layout.next_id)
-}
-
-fn validate_persisted_pane_layout(
-    layout: &PersistedPaneLayout,
-    ids: &mut HashSet<u64>,
-    greatest_id: &mut u64,
-    depth: usize,
-) -> Result<(), CoreRestoreError> {
-    if depth > 256 {
-        return Err(CoreRestoreError("Pane split nesting exceeds 256 levels"));
-    }
-    match layout {
-        PersistedPaneLayout::Pane(pane) => {
-            validate_persisted_id(pane.id.as_u64(), ids, greatest_id)?;
-            validate_directory(&pane.launch.working_directory)
-                .map_err(|_| CoreRestoreError("Pane launch directory is empty"))
-        }
-        PersistedPaneLayout::Split(split) => {
-            validate_persisted_id(split.id.as_u64(), ids, greatest_id)?;
-            SplitRatio::new(split.ratio.parts_per_thousand())
-                .map_err(|_| CoreRestoreError("split ratio is invalid"))?;
-            validate_persisted_pane_layout(&split.first, ids, greatest_id, depth + 1)?;
-            validate_persisted_pane_layout(&split.second, ids, greatest_id, depth + 1)
-        }
-    }
-}
-
-fn validate_persisted_id(
-    id: u64,
-    ids: &mut HashSet<u64>,
-    greatest_id: &mut u64,
-) -> Result<(), CoreRestoreError> {
-    if id == 0 {
-        return Err(CoreRestoreError("Core ID is zero"));
-    }
-    if !ids.insert(id) {
-        return Err(CoreRestoreError("Core ID is duplicated"));
-    }
-    *greatest_id = (*greatest_id).max(id);
-    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<(), CoreModelError> {
@@ -1348,12 +1064,11 @@ mod tests {
     }
 
     #[test]
-    fn tab_order_names_split_ratio_and_restore_disposition_are_revisioned() {
+    fn tab_order_names_and_split_ratio_are_revisioned() {
         let mut model = model_with_space();
         let space_id = model.snapshot().spaces[0].id;
         let original_tab = model.snapshot().spaces[0].tabs[0].id;
         let original_pane = pane_ids(&model.snapshot())[0];
-        let original_session = session_for_pane(&model.snapshot(), original_pane);
         let second = model
             .apply(
                 1,
@@ -1393,36 +1108,16 @@ mod tests {
             panic!("split must return its ID");
         };
         let ratio = SplitRatio::new(650).expect("valid ratio");
-        model
+        let final_commit = model
             .apply(5, CoreCommand::ResizeSplit { split_id, ratio })
             .expect("resize split");
-        let final_commit = model
-            .apply(
-                6,
-                CoreCommand::SetRestoreDisposition {
-                    terminal_session_id: original_session,
-                    disposition: RestoreDisposition::RemainEnded,
-                },
-            )
-            .expect("change Restore Disposition");
 
-        assert_eq!(final_commit.revision, 7);
+        assert_eq!(final_commit.revision, 6);
         assert_eq!(final_commit.snapshot.spaces[0].tabs[0].id, tab_id);
         assert_eq!(find_tab(&final_commit.snapshot, original_tab).name, "Shell");
         assert_eq!(
             find_split_snapshot(&final_commit.snapshot, split_id).ratio,
             ratio
-        );
-        assert_eq!(
-            final_commit
-                .snapshot
-                .terminal_sessions
-                .iter()
-                .find(|session| session.id == original_session)
-                .expect("session remains present")
-                .launch
-                .restore_disposition,
-            RestoreDisposition::RemainEnded
         );
     }
 
@@ -1451,68 +1146,6 @@ mod tests {
             CoreModelError::CannotMovePaneOntoItself
         );
         assert_eq!(model.snapshot(), before);
-    }
-
-    #[test]
-    fn cold_restore_preserves_structure_but_allocates_new_terminal_sessions() {
-        let mut model = model_with_space();
-        let initial = model.snapshot();
-        let first_terminal = initial.terminal_sessions[0].id;
-        let split = model
-            .apply(
-                initial.revision,
-                CoreCommand::SplitPane {
-                    pane_id: pane_ids(&initial)[0],
-                    axis: SplitAxis::Horizontal,
-                    placement: SplitPlacement::After,
-                    ratio: SplitRatio::new(650).expect("valid ratio"),
-                },
-            )
-            .expect("split Pane");
-        model
-            .apply(
-                split.revision,
-                CoreCommand::SetRestoreDisposition {
-                    terminal_session_id: first_terminal,
-                    disposition: RestoreDisposition::RemainEnded,
-                },
-            )
-            .expect("mark first Terminal Session ended");
-        let persisted = model.persisted_layout().expect("capture layout");
-        let old_terminal_ids = model
-            .snapshot()
-            .terminal_sessions
-            .into_iter()
-            .map(|session| session.id)
-            .collect::<HashSet<_>>();
-
-        let (restored, effects) =
-            CoreModel::restore_layout(persisted.clone()).expect("restore layout");
-        let restored_snapshot = restored.snapshot();
-        let new_terminal_ids = restored_snapshot
-            .terminal_sessions
-            .iter()
-            .map(|session| session.id)
-            .collect::<HashSet<_>>();
-
-        let restored_layout = restored.persisted_layout().unwrap();
-        assert_eq!(restored_layout.spaces, persisted.spaces);
-        assert!(restored_layout.next_id > persisted.next_id);
-        assert!(old_terminal_ids.is_disjoint(&new_terminal_ids));
-        assert_eq!(
-            effects
-                .iter()
-                .filter(|effect| matches!(effect, CoreEffect::LaunchTerminal { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            effects
-                .iter()
-                .filter(|effect| matches!(effect, CoreEffect::RestoreEndedTerminal { .. }))
-                .count(),
-            1
-        );
     }
 
     fn model_with_space() -> CoreModel {

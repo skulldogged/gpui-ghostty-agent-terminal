@@ -1,6 +1,5 @@
 use crate::{
     CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, TerminalSessionId, ghostty,
-    persistence::{SnapshotLoad, SnapshotRecord, SnapshotSaver, SnapshotStore},
     terminal_session::TerminalSize,
 };
 use interprocess::TryClone;
@@ -35,7 +34,10 @@ mod wire;
 use runtime::{CoreRuntime, RuntimeEvent};
 
 // Version 8 adds lease-controlled terminal paste commands whose encoding is
-// resolved inside the Resident Core against its authoritative VT modes.
+// resolved inside the Resident Core against its authoritative VT modes. Layout
+// persistence was later removed without changing the protocol: Terminal launch
+// frames retain and ignore the former Restore Disposition byte so an upgraded
+// Desktop Shell can attach to an already-running v8 Resident Core.
 const PROTOCOL_VERSION: u16 = 8;
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
 const SEMANTIC_EVENT_CAPACITY: usize = 64;
@@ -1806,34 +1808,7 @@ impl Drop for TerminalSubscription {
 }
 
 impl ResidentCore {
-    fn start(endpoint: &CoreEndpoint) -> Result<Self, String> {
-        let store = (endpoint == &CoreEndpoint::for_current_user()?)
-            .then(|| SnapshotStore::for_profile(endpoint.argument()))
-            .transpose()?;
-        Self::start_with_store(store)
-    }
-
-    fn start_with_store(store: Option<SnapshotStore>) -> Result<Self, String> {
-        let persistence = if let Some(store) = store {
-            match store.load() {
-                SnapshotLoad::Ready(record) => {
-                    Some((store, record.generation, Some(record.layout), false))
-                }
-                SnapshotLoad::Absent => Some((store, 0, None, true)),
-                SnapshotLoad::IncompatibleNewer { schema_version } => {
-                    return Err(format!(
-                        "snapshot schema {schema_version} is newer than this application; preserved without overwrite"
-                    ));
-                }
-                SnapshotLoad::Corrupt { reason } => {
-                    return Err(format!(
-                        "snapshot is corrupt and was preserved without overwrite: {reason}"
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+    fn start(_endpoint: &CoreEndpoint) -> Result<Self, String> {
         let (commands_tx, commands_rx) = flume::bounded::<WorkerCommand>(32);
         let (ready_tx, ready_rx) = flume::bounded(1);
         let subscribers = Arc::new(Mutex::new(Vec::new()));
@@ -1847,28 +1822,11 @@ impl ResidentCore {
         thread::Builder::new()
             .name("resident-core-terminal".into())
             .spawn(move || {
-                let started = (|| {
-                    let directory = std::env::current_dir()
-                        .map_err(|error| format!("resolve initial Space directory: {error}"))?;
-                    let (runtime, mut persistence_generation, saver, initial_dirty) =
-                        match persistence {
-                            Some((store, generation, layout, initial_dirty)) => {
-                                let runtime = match layout {
-                                    Some(layout) => CoreRuntime::restore(layout)?,
-                                    None => CoreRuntime::start(&directory)?,
-                                };
-                                let saver = SnapshotSaver::start(store, generation)?;
-                                (runtime, generation, Some(saver), initial_dirty)
-                            }
-                            None => (CoreRuntime::start(&directory)?, 0, None, false),
-                        };
-                    if initial_dirty {
-                        mark_runtime_dirty(&saver, &mut persistence_generation, &runtime)?;
-                    }
-                    Ok::<_, String>((runtime, persistence_generation, saver))
-                })();
-                let (mut runtime, mut persistence_generation, saver) = match started {
-                    Ok(started) => started,
+                let started = std::env::current_dir()
+                    .map_err(|error| format!("resolve initial Space directory: {error}"))
+                    .and_then(|directory| CoreRuntime::start(&directory));
+                let mut runtime = match started {
+                    Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                         return;
@@ -1878,7 +1836,6 @@ impl ResidentCore {
                 let mut event_sequence = 0_u64;
 
                 loop {
-                    let mut hierarchy_dirty = false;
                     for event in runtime.refresh() {
                         match event {
                             RuntimeEvent::TerminalLifecycleChanged {
@@ -1906,20 +1863,7 @@ impl ResidentCore {
                                     terminal_revision,
                                 );
                             }
-                            RuntimeEvent::RestoreIntentUpdated { revision } => {
-                                hierarchy_dirty = true;
-                                publish_semantic_event(
-                                    &worker_semantic,
-                                    SemanticEventKind::HierarchyChanged { revision },
-                                );
-                            }
                         }
-                    }
-                    if hierarchy_dirty
-                        && let Err(error) =
-                            mark_runtime_dirty(&saver, &mut persistence_generation, &runtime)
-                    {
-                        eprintln!("Resident Core could not queue snapshot save: {error}");
                     }
                     match commands_rx.recv_timeout(SESSION_TICK) {
                         Ok(command) => {
@@ -1975,29 +1919,17 @@ impl ResidentCore {
                                     expected_revision,
                                     command,
                                 } => match runtime.apply(expected_revision, command) {
-                                    Ok(commit) => {
-                                        if let Err(error) = mark_runtime_dirty(
-                                            &saver,
-                                            &mut persistence_generation,
-                                            &runtime,
-                                        ) {
-                                            eprintln!(
-                                                "Resident Core could not queue snapshot save: {error}"
-                                            );
-                                        }
-                                        Ok(WorkerResponse::CoreCommandAccepted(CoreCommandOutcome {
+                                    Ok(commit) => Ok(WorkerResponse::CoreCommandAccepted(
+                                        CoreCommandOutcome {
                                             revision: commit.revision,
                                             snapshot: commit.snapshot,
                                             created: commit.created,
                                             control_leases: Vec::new(),
-                                        }))
-                                    }
+                                        },
+                                    )),
                                     Err(error) => Ok(WorkerResponse::CoreCommandRejected(error)),
                                 },
-                                WorkerRequest::Stop => saver
-                                    .as_ref()
-                                    .map_or(Ok(()), SnapshotSaver::flush)
-                                    .map(|()| WorkerResponse::Ack),
+                                WorkerRequest::Stop => Ok(WorkerResponse::Ack),
                             };
                             if let Some((terminal_session_id, revision)) = changed_terminal {
                                 publish_terminal_change(
@@ -2394,23 +2326,6 @@ impl ResidentCore {
             .recv()
             .map_err(|_| "Resident Core terminal thread stopped before responding".to_string())?
     }
-}
-
-fn mark_runtime_dirty(
-    saver: &Option<SnapshotSaver>,
-    generation: &mut u64,
-    runtime: &CoreRuntime,
-) -> Result<(), String> {
-    let Some(saver) = saver else {
-        return Ok(());
-    };
-    *generation = generation
-        .checked_add(1)
-        .ok_or_else(|| "snapshot generation is exhausted".to_string())?;
-    saver.mark_dirty(SnapshotRecord {
-        generation: *generation,
-        layout: runtime.persisted_layout()?,
-    })
 }
 
 fn publish_semantic_event(state: &Arc<Mutex<SemanticState>>, kind: SemanticEventKind) {
@@ -2958,11 +2873,11 @@ const WINDOWS_RESIDENT_CORE_CREATION_FLAGS: u32 =
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreEndpoint, ResidentCore, TerminalCell, TerminalLifecycle, TerminalSnapshot,
-        TerminalUpdate, WorkerRequest, WorkerResponse, protected_endpoint_name,
+        CoreEndpoint, PROTOCOL_VERSION, ResidentCore, TerminalCell, TerminalLifecycle,
+        TerminalSnapshot, TerminalUpdate, WorkerRequest, WorkerResponse, protected_endpoint_name,
         read_response_until, server_proof, verify_server_proof,
     };
-    use crate::{CoreCommand, persistence::SnapshotStore};
+    use crate::CoreCommand;
 
     struct TransientWouldBlock {
         bytes: std::io::Cursor<Vec<u8>>,
@@ -2978,6 +2893,14 @@ mod tests {
         assert_ne!(first, default);
         assert_ne!(first, second);
         assert!(first.argument().contains("-development-"));
+    }
+
+    #[test]
+    fn removing_layout_persistence_preserves_running_v8_core_compatibility() {
+        assert_eq!(
+            PROTOCOL_VERSION, 8,
+            "a Desktop Shell upgrade must still attach to an already-running v8 Resident Core"
+        );
     }
 
     #[cfg(windows)]
@@ -3169,18 +3092,9 @@ mod tests {
     }
 
     #[test]
-    fn resident_core_cold_restart_restores_hierarchy_with_new_terminal_ids() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "agent-terminal-core-restart-{}-{nonce}",
-            std::process::id()
-        ));
-        let first =
-            ResidentCore::start_with_store(Some(SnapshotStore::in_directory(directory.clone())))
-                .expect("start first Resident Core");
+    fn resident_core_cold_restart_starts_with_a_fresh_hierarchy() {
+        let endpoint = CoreEndpoint::for_profile("cold-restart-fresh").expect("test endpoint");
+        let first = ResidentCore::start(&endpoint).expect("start first Resident Core");
         let registration = first.attach_client();
         let (initial, _) = first.hierarchy_snapshot().expect("initial hierarchy");
         let accepted = first.apply_core_command(
@@ -3193,6 +3107,7 @@ mod tests {
         );
         assert!(matches!(accepted, super::Response::CoreCommandAccepted(_)));
         let (before_restart, _) = first.hierarchy_snapshot().expect("mutated hierarchy");
+        assert_eq!(before_restart.spaces.len(), 2);
         assert!(matches!(
             first.call(WorkerRequest::Stop),
             Ok(WorkerResponse::Ack)
@@ -3200,35 +3115,23 @@ mod tests {
         drop(registration);
         drop(first);
 
-        let second =
-            ResidentCore::start_with_store(Some(SnapshotStore::in_directory(directory.clone())))
-                .expect("restart Resident Core");
-        let (after_restart, _) = second.hierarchy_snapshot().expect("restored hierarchy");
-        let old_terminals = before_restart
-            .terminal_sessions
-            .iter()
-            .map(|session| session.id)
-            .collect::<std::collections::HashSet<_>>();
-        let new_terminals = after_restart
-            .terminal_sessions
-            .iter()
-            .map(|session| session.id)
-            .collect::<std::collections::HashSet<_>>();
+        let second = ResidentCore::start(&endpoint).expect("restart Resident Core");
+        let (after_restart, _) = second.hierarchy_snapshot().expect("fresh hierarchy");
 
-        assert_eq!(after_restart.spaces.len(), before_restart.spaces.len());
+        assert_eq!(after_restart.spaces.len(), 1);
+        assert_eq!(after_restart.spaces[0].tabs.len(), 1);
+        assert_eq!(after_restart.terminal_sessions.len(), 1);
         assert!(
             after_restart
                 .spaces
                 .iter()
-                .any(|space| space.name == "Restored Space")
+                .all(|space| space.name != "Restored Space")
         );
-        assert!(old_terminals.is_disjoint(&new_terminals));
         assert!(matches!(
             second.call(WorkerRequest::Stop),
             Ok(WorkerResponse::Ack)
         ));
         drop(second);
-        std::fs::remove_dir_all(directory).expect("remove snapshot test directory");
     }
 
     #[cfg(windows)]

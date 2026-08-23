@@ -1,7 +1,6 @@
 use super::{TerminalLifecycle, TerminalUpdate};
 use crate::{
-    CoreCommand, CoreEffect, CoreModel, RestoreDisposition, TerminalSessionId,
-    core_model::PersistedCoreLayout,
+    CoreCommand, CoreEffect, CoreModel, TerminalSessionId,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
 use crate::{CoreCommit, CoreModelError, CoreSnapshot};
@@ -22,9 +21,6 @@ pub(super) enum RuntimeEvent {
         terminal_session_id: TerminalSessionId,
         lifecycle: TerminalLifecycle,
         terminal_revision: u64,
-    },
-    RestoreIntentUpdated {
-        revision: u64,
     },
 }
 
@@ -75,17 +71,6 @@ impl CoreRuntime {
         Ok(runtime)
     }
 
-    pub(super) fn restore(layout: PersistedCoreLayout) -> Result<Self, String> {
-        let (model, effects) = CoreModel::restore_layout(layout)
-            .map_err(|error| format!("restore Core hierarchy: {error}"))?;
-        let mut runtime = Self {
-            model,
-            terminals: HashMap::new(),
-        };
-        runtime.execute_effects(&effects);
-        Ok(runtime)
-    }
-
     #[cfg(test)]
     pub(super) fn default_terminal(&self) -> TerminalSessionId {
         self.model
@@ -98,12 +83,6 @@ impl CoreRuntime {
 
     pub(super) fn model_snapshot(&self) -> CoreSnapshot {
         self.model.snapshot()
-    }
-
-    pub(super) fn persisted_layout(&self) -> Result<PersistedCoreLayout, String> {
-        self.model
-            .persisted_layout()
-            .map_err(|error| error.to_string())
     }
 
     pub(super) fn terminal_revision(
@@ -217,15 +196,11 @@ impl CoreRuntime {
 
     pub(super) fn refresh(&mut self) -> Vec<RuntimeEvent> {
         let mut updates = Vec::new();
-        let mut ended = Vec::new();
         for (&terminal_session_id, runtime) in &mut self.terminals {
             let revision_before = runtime.revision;
             let lifecycle_before = runtime.lifecycle.clone();
             runtime.refresh();
             if runtime.lifecycle != lifecycle_before {
-                if !matches!(runtime.lifecycle, TerminalLifecycle::Running) {
-                    ended.push(terminal_session_id);
-                }
                 updates.push(RuntimeEvent::TerminalLifecycleChanged {
                     terminal_session_id,
                     lifecycle: runtime.lifecycle.clone(),
@@ -236,30 +211,6 @@ impl CoreRuntime {
                 updates.push(RuntimeEvent::TerminalChanged {
                     terminal_session_id,
                     terminal_revision: runtime.revision,
-                });
-            }
-        }
-        for terminal_session_id in ended {
-            let should_mark_ended = self
-                .model
-                .snapshot()
-                .terminal_sessions
-                .iter()
-                .find(|session| session.id == terminal_session_id)
-                .is_some_and(|session| {
-                    session.launch.restore_disposition == RestoreDisposition::Relaunch
-                });
-            if should_mark_ended
-                && let Ok(commit) = self.model.apply(
-                    self.model.snapshot().revision,
-                    CoreCommand::SetRestoreDisposition {
-                        terminal_session_id,
-                        disposition: RestoreDisposition::RemainEnded,
-                    },
-                )
-            {
-                updates.push(RuntimeEvent::RestoreIntentUpdated {
-                    revision: commit.revision,
                 });
             }
         }
@@ -281,12 +232,6 @@ impl CoreRuntime {
                     terminal_session_id,
                 } => {
                     self.terminals.remove(terminal_session_id);
-                }
-                CoreEffect::RestoreEndedTerminal {
-                    terminal_session_id,
-                } => {
-                    self.terminals
-                        .insert(*terminal_session_id, RuntimeTerminal::ended());
                 }
             }
         }
@@ -339,16 +284,6 @@ impl RuntimeTerminal {
         }
     }
 
-    fn ended() -> Self {
-        Self {
-            session: None,
-            events: None,
-            revision: 0,
-            lifecycle: TerminalLifecycle::Exited,
-            last_snapshot_revision: None,
-        }
-    }
-
     fn refresh(&mut self) {
         let (Some(session), Some(events)) = (&mut self.session, &self.events) else {
             return;
@@ -391,7 +326,6 @@ fn lifecycle_error(lifecycle: &TerminalLifecycle) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_model::PersistedPaneLayout;
     use crate::{CreatedResource, SplitAxis, SplitPlacement, SplitRatio};
     use std::time::{Duration, Instant};
 
@@ -474,68 +408,6 @@ mod tests {
             .input(source_terminal, b"echo MOVED_RUNTIME_SESSION\r")
             .expect("moved Terminal Session remains live");
         wait_for_text(&mut runtime, source_terminal, "MOVED_RUNTIME_SESSION");
-    }
-
-    #[test]
-    fn remain_ended_restores_an_empty_terminal_without_spawning_a_process() {
-        let directory = std::env::current_dir().expect("current directory");
-        let mut runtime = CoreRuntime::start(&directory).expect("start Core runtime");
-        let old_terminal = runtime.default_terminal();
-        let revision = runtime.model_snapshot().revision;
-        runtime
-            .apply(
-                revision,
-                CoreCommand::SetRestoreDisposition {
-                    terminal_session_id: old_terminal,
-                    disposition: RestoreDisposition::RemainEnded,
-                },
-            )
-            .expect("set Restore Disposition");
-        let layout = runtime.persisted_layout().expect("capture layout");
-        let mut restored = CoreRuntime::restore(layout).expect("restore runtime");
-        let new_terminal = restored.default_terminal();
-
-        assert_ne!(new_terminal, old_terminal);
-        let snapshot = restored
-            .snapshot(new_terminal, None)
-            .expect("snapshot ended terminal")
-            .expect("full ended snapshot");
-        assert_eq!(snapshot.lifecycle, TerminalLifecycle::Exited);
-        assert!(
-            restored
-                .input(new_terminal, b"echo SHOULD_NOT_RUN\r")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn natural_exit_changes_the_persisted_restore_disposition() {
-        let directory = std::env::current_dir().expect("current directory");
-        let mut runtime = CoreRuntime::start(&directory).expect("start Core runtime");
-        let terminal = runtime.default_terminal();
-        runtime.input(terminal, b"exit\r").expect("exit shell");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut changed_hierarchy = false;
-        while Instant::now() < deadline && !changed_hierarchy {
-            changed_hierarchy = runtime
-                .refresh()
-                .into_iter()
-                .any(|event| matches!(event, RuntimeEvent::RestoreIntentUpdated { .. }));
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            changed_hierarchy,
-            "natural exit did not change hierarchy intent"
-        );
-
-        let layout = runtime.persisted_layout().expect("capture layout");
-        let PersistedPaneLayout::Pane(pane) = &layout.spaces[0].tabs[0].layout else {
-            panic!("initial Tab must contain one Pane");
-        };
-        assert_eq!(
-            pane.launch.restore_disposition,
-            RestoreDisposition::RemainEnded
-        );
     }
 
     fn wait_for_text(runtime: &mut CoreRuntime, terminal: TerminalSessionId, expected: &str) {
