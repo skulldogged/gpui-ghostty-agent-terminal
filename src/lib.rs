@@ -46,14 +46,13 @@ pub use terminal_session::TerminalSize;
 #[cfg(feature = "gui")]
 pub fn run_gui() {
     let endpoint = CoreEndpoint::for_current_user().expect("resolve default Resident Core profile");
-    desktop_shell::run(endpoint, false);
+    desktop_shell::run(endpoint, false).expect("run Desktop Shell");
 }
 
 #[cfg(feature = "gui")]
 pub fn run_development_gui() -> Result<(), String> {
     let endpoint = CoreEndpoint::for_development_launch()?;
-    desktop_shell::run(endpoint, true);
-    Ok(())
+    desktop_shell::run(endpoint, true)
 }
 
 #[cfg(not(feature = "gui"))]
