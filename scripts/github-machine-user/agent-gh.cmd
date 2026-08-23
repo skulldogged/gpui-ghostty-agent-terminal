@@ -7,5 +7,7 @@ if not defined AGENT_GIT_BASH (
   echo agent-gh: Git for Windows bash.exe was not found 1>&2
   exit /b 1
 )
-"%AGENT_GIT_BASH%" "%~dp0agent-gh" %*
+set "AGENT_WRAPPER=%~dp0agent-gh"
+set "AGENT_WRAPPER=%AGENT_WRAPPER:\=/%"
+"%AGENT_GIT_BASH%" "%AGENT_WRAPPER%" %*
 exit /b %ERRORLEVEL%
