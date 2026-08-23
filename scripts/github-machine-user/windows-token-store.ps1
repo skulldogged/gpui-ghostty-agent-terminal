@@ -8,11 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
-function Clear-PlainText([ref]$Value) {
-    $Value.Value = $null
-    [GC]::Collect()
-}
+$entropy = [Text.Encoding]::UTF8.GetBytes("codex-github-machine-user-v1")
 
 switch ($Command) {
     "store" {
@@ -23,26 +19,41 @@ switch ($Command) {
 
         $directory = Split-Path -Parent $TokenFile
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
-        $secure = ConvertTo-SecureString $plainText -AsPlainText -Force
-        $credential = [PSCredential]::new("github-machine-user", $secure)
-        $credential | Export-Clixml -LiteralPath $TokenFile -Force
-        Clear-PlainText ([ref]$plainText)
+        $plainBytes = [Text.Encoding]::UTF8.GetBytes($plainText)
+        try {
+            $protectedBytes = [Security.Cryptography.ProtectedData]::Protect(
+                $plainBytes,
+                $entropy,
+                [Security.Cryptography.DataProtectionScope]::CurrentUser
+            )
+            [IO.File]::WriteAllBytes($TokenFile, $protectedBytes)
+        }
+        finally {
+            [Array]::Clear($plainBytes, 0, $plainBytes.Length)
+            $plainText = $null
+        }
     }
     "lookup" {
         if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
             throw "token file does not exist: $TokenFile"
         }
 
-        $credential = Import-Clixml -LiteralPath $TokenFile
-        if ($credential -isnot [PSCredential]) {
-            throw "token file does not contain a Windows credential"
+        $protectedBytes = [IO.File]::ReadAllBytes($TokenFile)
+        $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect(
+            $protectedBytes,
+            $entropy,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        try {
+            $plainText = [Text.Encoding]::UTF8.GetString($plainBytes)
+            if ([string]::IsNullOrWhiteSpace($plainText)) {
+                throw "stored token is empty"
+            }
+            [Console]::Out.Write($plainText)
         }
-
-        $plainText = $credential.GetNetworkCredential().Password
-        if ([string]::IsNullOrWhiteSpace($plainText)) {
-            throw "stored token is empty"
+        finally {
+            [Array]::Clear($plainBytes, 0, $plainBytes.Length)
+            $plainText = $null
         }
-        [Console]::Out.Write($plainText)
-        Clear-PlainText ([ref]$plainText)
     }
 }
