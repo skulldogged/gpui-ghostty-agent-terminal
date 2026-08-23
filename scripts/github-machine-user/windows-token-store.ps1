@@ -21,10 +21,10 @@ switch ($Command) {
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
         $plainBytes = [Text.Encoding]::UTF8.GetBytes($plainText)
         try {
-            $protectedBytes = [Security.Cryptography.ProtectedData]::Protect(
+            $protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect(
                 $plainBytes,
                 $entropy,
-                [Security.Cryptography.DataProtectionScope]::CurrentUser
+                [System.Security.Cryptography.DataProtectionScope]::CurrentUser
             )
             [IO.File]::WriteAllBytes($TokenFile, $protectedBytes)
         }
@@ -39,10 +39,10 @@ switch ($Command) {
         }
 
         $protectedBytes = [IO.File]::ReadAllBytes($TokenFile)
-        $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect(
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
             $protectedBytes,
             $entropy,
-            [Security.Cryptography.DataProtectionScope]::CurrentUser
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
         )
         try {
             $plainText = [Text.Encoding]::UTF8.GetString($plainBytes)
