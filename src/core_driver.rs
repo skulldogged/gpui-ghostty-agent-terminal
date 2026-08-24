@@ -1,6 +1,7 @@
 use crate::{
     ApplicationCore, CoreCommand, CoreCommandOutcome, CoreSnapshot, SemanticEvent,
     SemanticEventKind, TerminalChange, TerminalSessionId, TerminalSize, TerminalSnapshot,
+    terminal_theme::TerminalTheme,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -220,6 +221,9 @@ enum Command {
         terminal_session_id: TerminalSessionId,
         size: TerminalSize,
     },
+    SetTerminalTheme {
+        theme: TerminalTheme,
+    },
 }
 
 enum DriverEvent {
@@ -330,6 +334,10 @@ impl CoreDriver {
         })
     }
 
+    pub(crate) fn set_terminal_theme(&self, theme: TerminalTheme) -> Result<(), String> {
+        self.send(Command::SetTerminalTheme { theme })
+    }
+
     pub(crate) fn updates(&self) -> DriverUpdates {
         self.updates.clone()
     }
@@ -419,6 +427,10 @@ fn run_driver(
                 size,
             })) => core
                 .resize_terminal(terminal_session_id, size)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::SetTerminalTheme { theme })) => core
+                .set_terminal_theme(theme)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
             DriverEvent::TerminalChanged(Ok(change)) => {

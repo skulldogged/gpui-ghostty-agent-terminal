@@ -53,6 +53,45 @@ int spike_terminal_resize(SpikeTerminal* spike, uint16_t cols, uint16_t rows,
                                  cell_height_px);
 }
 
+static GhosttyColorRgb color_from_bytes(const uint8_t* color) {
+  return (GhosttyColorRgb){.r = color[0], .g = color[1], .b = color[2]};
+}
+
+int spike_terminal_set_theme(SpikeTerminal* spike, const uint8_t* foreground,
+                             const uint8_t* background, const uint8_t* cursor,
+                             const uint8_t* ansi_palette) {
+  if (spike == NULL || foreground == NULL || background == NULL ||
+      cursor == NULL || ansi_palette == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+
+  GhosttyColorRgb palette[256];
+  GhosttyResult result = ghostty_terminal_get(
+      spike->terminal, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT, palette);
+  if (!success(result)) return result;
+  for (size_t index = 0; index < 16; index++) {
+    palette[index] = color_from_bytes(&ansi_palette[index * 3]);
+  }
+
+  GhosttyColorRgb foreground_color = color_from_bytes(foreground);
+  GhosttyColorRgb background_color = color_from_bytes(background);
+  GhosttyColorRgb cursor_color = color_from_bytes(cursor);
+  result = ghostty_terminal_set(spike->terminal,
+                                GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
+                                &foreground_color);
+  if (!success(result)) return result;
+  result = ghostty_terminal_set(spike->terminal,
+                                GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND,
+                                &background_color);
+  if (!success(result)) return result;
+  result = ghostty_terminal_set(spike->terminal,
+                                GHOSTTY_TERMINAL_OPT_COLOR_CURSOR,
+                                &cursor_color);
+  if (!success(result)) return result;
+  return ghostty_terminal_set(spike->terminal,
+                              GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, palette);
+}
+
 int spike_terminal_encode_paste(SpikeTerminal* spike, uint8_t* data,
                                 size_t data_len, uint8_t* output,
                                 size_t output_len, size_t* output_written) {

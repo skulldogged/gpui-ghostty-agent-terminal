@@ -1,14 +1,16 @@
 use gpui::{
-    AssetSource, Bounds, Pixels, Rgba, SharedString, Svg, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px,
-    rgb, svg,
+    App, Bounds, Pixels, Rgba, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, div, prelude::*, px, rgb,
 };
 use std::borrow::Cow;
+
+use crate::settings::ThemePreset;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkspaceShell {
     appearance: WindowBackgroundAppearance,
     opacity: f32,
+    theme: ThemePreset,
 }
 
 #[derive(Clone, Copy)]
@@ -36,7 +38,28 @@ pub(crate) enum ShellIcon {
     SplitHorizontal,
     SplitVertical,
     Move,
+    Settings,
+    SidebarClose,
+    SidebarOpen,
     Close,
+}
+
+#[derive(Clone, Copy)]
+struct ThemePalette {
+    window: u32,
+    chrome: u32,
+    sidebar: u32,
+    border: u32,
+    text: u32,
+    muted_text: u32,
+    faint_text: u32,
+    hover: u32,
+    selected: u32,
+    selected_border: u32,
+    accent: u32,
+    accent_muted: u32,
+    danger: u32,
+    danger_hover: u32,
 }
 
 impl WorkspaceShell {
@@ -49,9 +72,12 @@ impl WorkspaceShell {
     pub(crate) const TAB_HEIGHT: f32 = 30.;
     pub(crate) const WINDOW_CONTROLS_WIDTH: f32 = if cfg!(target_os = "macos") { 0. } else { 138. };
 
-    pub(crate) fn from_environment() -> Self {
-        let requested_opacity = std::env::var("AGENT_TERMINAL_BACKGROUND_OPACITY").ok();
-        Self::resolve(platform_appearance(), requested_opacity.as_deref())
+    pub(crate) fn from_preferences(theme: ThemePreset, opacity: f32) -> Self {
+        Self::resolve(platform_appearance(), theme, opacity)
+    }
+
+    pub(crate) fn appearance(&self) -> WindowBackgroundAppearance {
+        self.appearance
     }
 
     pub(crate) fn window_options(&self, bounds: Bounds<Pixels>) -> WindowOptions {
@@ -70,14 +96,14 @@ impl WorkspaceShell {
     }
 
     pub(crate) fn color(&self, role: ShellColor) -> Rgba {
-        let color = Self::base_color(role);
+        let color = self.base_color(role);
         if !self.is_translucent() {
             return color;
         }
 
         color.alpha(match role {
             ShellColor::Window | ShellColor::Chrome | ShellColor::Sidebar => self.opacity,
-            ShellColor::Hover => 0.18,
+            ShellColor::Hover => 0.45,
             ShellColor::Selected => 0.28,
             ShellColor::AccentMuted => 0.32,
             ShellColor::DangerHover => 0.3,
@@ -91,11 +117,20 @@ impl WorkspaceShell {
         })
     }
 
-    pub(crate) fn icon(&self, icon: ShellIcon, color: Rgba) -> Svg {
-        svg()
-            .path(icon.path())
-            .size(px(Self::CHROME_ICON_SIZE))
+    pub(crate) fn opaque_color(&self, role: ShellColor) -> Rgba {
+        self.base_color(role)
+    }
+
+    pub(crate) fn icon(&self, icon: ShellIcon, color: Rgba, size: f32) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(size))
+            .font_family("lucide")
+            .text_size(px(size))
             .text_color(color)
+            .child(char::from(icon.lucide()).to_string())
     }
 
     pub(crate) fn terminal_background(&self, color: Rgba) -> Rgba {
@@ -108,16 +143,22 @@ impl WorkspaceShell {
 
     pub(crate) fn root_color(&self) -> Rgba {
         if self.is_translucent() {
-            Self::base_color(ShellColor::Window).alpha(0.)
+            self.base_color(ShellColor::Window).alpha(0.)
         } else {
             self.color(ShellColor::Window)
         }
     }
 
-    fn resolve(appearance: WindowBackgroundAppearance, requested_opacity: Option<&str>) -> Self {
-        let mut opacity = requested_opacity
-            .and_then(Self::parse_opacity)
-            .unwrap_or(Self::DEFAULT_OPACITY);
+    fn resolve(
+        appearance: WindowBackgroundAppearance,
+        theme: ThemePreset,
+        requested_opacity: f32,
+    ) -> Self {
+        let mut opacity = if requested_opacity.is_finite() {
+            requested_opacity.clamp(0.45, 1.)
+        } else {
+            Self::DEFAULT_OPACITY
+        };
         let appearance = if opacity >= 1. {
             WindowBackgroundAppearance::Opaque
         } else {
@@ -129,6 +170,7 @@ impl WorkspaceShell {
         Self {
             appearance,
             opacity,
+            theme,
         }
     }
 
@@ -136,29 +178,62 @@ impl WorkspaceShell {
         self.appearance != WindowBackgroundAppearance::Opaque && self.opacity < 1.
     }
 
-    fn parse_opacity(value: &str) -> Option<f32> {
-        let opacity = value.trim().parse::<f32>().ok()?;
-        opacity.is_finite().then(|| opacity.clamp(0.45, 1.))
+    fn base_color(&self, role: ShellColor) -> Rgba {
+        let palette = theme_palette(self.theme);
+        rgb(match role {
+            ShellColor::Window => palette.window,
+            ShellColor::Chrome => palette.chrome,
+            ShellColor::Sidebar => palette.sidebar,
+            ShellColor::Border => palette.border,
+            ShellColor::Text => palette.text,
+            ShellColor::MutedText => palette.muted_text,
+            ShellColor::FaintText => palette.faint_text,
+            ShellColor::Hover => palette.hover,
+            ShellColor::Selected => palette.selected,
+            ShellColor::SelectedBorder => palette.selected_border,
+            ShellColor::Accent => palette.accent,
+            ShellColor::AccentMuted => palette.accent_muted,
+            ShellColor::Danger => palette.danger,
+            ShellColor::DangerHover => palette.danger_hover,
+        })
     }
+}
 
-    fn base_color(role: ShellColor) -> Rgba {
-        match role {
-            ShellColor::Window => rgb(0x0f0f17),
-            ShellColor::Chrome => rgb(0x15151f),
-            ShellColor::Sidebar => rgb(0x171721),
-            ShellColor::Border => rgb(0x2a2937),
-            ShellColor::Text => rgb(0xe8e7f0),
-            ShellColor::MutedText => rgb(0xa09eaf),
-            ShellColor::FaintText => rgb(0x6f6d7d),
-            ShellColor::Hover => rgb(0x23222f),
-            ShellColor::Selected => rgb(0x302e3d),
-            ShellColor::SelectedBorder => rgb(0x444152),
-            ShellColor::Accent => rgb(0x58d68d),
-            ShellColor::AccentMuted => rgb(0x264c39),
-            ShellColor::Danger => rgb(0xe88c8c),
-            ShellColor::DangerHover => rgb(0x4a292f),
-        }
+fn theme_palette(theme: ThemePreset) -> ThemePalette {
+    let terminal = theme.terminal_theme();
+    let background = packed(terminal.background);
+    let foreground = packed(terminal.foreground);
+    let accent = packed(terminal.palette[4]);
+    let danger = packed(terminal.palette[1]);
+    ThemePalette {
+        window: background,
+        chrome: mix(background, foreground, 0.025),
+        sidebar: mix(background, foreground, 0.04),
+        border: mix(background, foreground, 0.12),
+        text: foreground,
+        muted_text: mix(foreground, background, 0.25),
+        faint_text: mix(foreground, background, 0.5),
+        hover: mix(background, foreground, 0.14),
+        selected: mix(background, accent, 0.13),
+        selected_border: mix(background, accent, 0.35),
+        accent,
+        accent_muted: mix(background, accent, 0.16),
+        danger,
+        danger_hover: mix(background, danger, 0.16),
     }
+}
+
+fn packed(color: [u8; 3]) -> u32 {
+    (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])
+}
+
+fn mix(first: u32, second: u32, second_weight: f32) -> u32 {
+    let channel = |shift: u32| {
+        let first = ((first >> shift) & 0xff_u32) as f32;
+        let second = ((second >> shift) & 0xff_u32) as f32;
+        (first + (second - first) * second_weight).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 #[cfg(windows)]
@@ -199,46 +274,32 @@ fn linux_appearance(has_wayland_display: bool) -> WindowBackgroundAppearance {
 }
 
 impl ShellIcon {
-    fn path(self) -> &'static str {
+    fn lucide(self) -> lucide_icons::Icon {
         match self {
-            Self::AppMark => "icons/app-mark.svg",
-            Self::Plus => "icons/plus.svg",
-            Self::SplitHorizontal => "icons/split-horizontal.svg",
-            Self::SplitVertical => "icons/split-vertical.svg",
-            Self::Move => "icons/move.svg",
-            Self::Close => "icons/close.svg",
+            Self::AppMark => lucide_icons::Icon::SquareTerminal,
+            Self::Plus => lucide_icons::Icon::Plus,
+            Self::SplitHorizontal => lucide_icons::Icon::Columns2,
+            Self::SplitVertical => lucide_icons::Icon::Rows2,
+            Self::Move => lucide_icons::Icon::Move,
+            Self::Settings => lucide_icons::Icon::Settings2,
+            Self::SidebarClose => lucide_icons::Icon::PanelLeftClose,
+            Self::SidebarOpen => lucide_icons::Icon::PanelLeftOpen,
+            Self::Close => lucide_icons::Icon::X,
         }
     }
 }
 
-pub(crate) struct ShellAssets;
-
-impl AssetSource for ShellAssets {
-    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        let bytes: Option<&'static [u8]> = match path {
-            "icons/app-mark.svg" => Some(include_bytes!("../assets/icons/app-mark.svg")),
-            "icons/plus.svg" => Some(include_bytes!("../assets/icons/plus.svg")),
-            "icons/split-horizontal.svg" => {
-                Some(include_bytes!("../assets/icons/split-horizontal.svg"))
-            }
-            "icons/split-vertical.svg" => {
-                Some(include_bytes!("../assets/icons/split-vertical.svg"))
-            }
-            "icons/move.svg" => Some(include_bytes!("../assets/icons/move.svg")),
-            "icons/close.svg" => Some(include_bytes!("../assets/icons/close.svg")),
-            _ => None,
-        };
-        Ok(bytes.map(Cow::Borrowed))
-    }
-
-    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(Vec::new())
-    }
+pub(crate) fn install_icon_font(cx: &App) -> Result<(), String> {
+    cx.text_system()
+        .add_fonts(vec![Cow::Borrowed(lucide_icons::LUCIDE_FONT_BYTES)])
+        .map_err(|error| format!("register Lucide icon font: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use gpui::{WindowBackgroundAppearance, rgb};
+
+    use crate::settings::{ThemePreset, parse_opacity};
 
     use super::{
         ShellColor, ShellIcon, WorkspaceShell, linux_appearance, windows_appearance_for_build,
@@ -246,20 +307,43 @@ mod tests {
 
     #[test]
     fn semantic_colors_and_icons_resolve_without_call_site_literals() {
-        let shell = WorkspaceShell::resolve(WindowBackgroundAppearance::Opaque, Some("1"));
+        let shell = WorkspaceShell::resolve(
+            WindowBackgroundAppearance::Opaque,
+            ThemePreset::TokyoNight,
+            1.,
+        );
         let _ = shell.color(ShellColor::Selected);
-        let _ = shell.icon(ShellIcon::AppMark, shell.color(ShellColor::Accent));
+        let _ = shell.icon(ShellIcon::AppMark, shell.color(ShellColor::Accent), 13.);
+    }
+
+    #[test]
+    fn shell_colors_derive_from_the_official_catppuccin_terminal_values() {
+        for (theme, base, ansi_blue) in [
+            (ThemePreset::CatppuccinLatte, 0xeff1f5, 0x1e66f5),
+            (ThemePreset::CatppuccinFrappe, 0x303446, 0x8caaee),
+            (ThemePreset::CatppuccinMacchiato, 0x24273a, 0x8aadf4),
+            (ThemePreset::CatppuccinMocha, 0x1e1e2e, 0x89b4fa),
+        ] {
+            let shell = WorkspaceShell::resolve(WindowBackgroundAppearance::Opaque, theme, 1.);
+            assert_eq!(shell.color(ShellColor::Window), rgb(base));
+            assert_eq!(shell.color(ShellColor::Accent), rgb(ansi_blue));
+        }
     }
 
     #[test]
     fn opacity_preference_is_bounded_and_rejects_non_numbers() {
-        assert_eq!(WorkspaceShell::parse_opacity("0.82"), Some(0.82));
-        assert_eq!(WorkspaceShell::parse_opacity("0"), Some(0.45));
-        assert_eq!(WorkspaceShell::parse_opacity("4"), Some(1.));
-        assert_eq!(WorkspaceShell::parse_opacity("NaN"), None);
-        assert_eq!(WorkspaceShell::parse_opacity("not-a-number"), None);
+        assert_eq!(parse_opacity("0.82"), Some(0.82));
+        assert_eq!(parse_opacity("0"), Some(0.45));
+        assert_eq!(parse_opacity("4"), Some(1.));
+        assert_eq!(parse_opacity("NaN"), None);
+        assert_eq!(parse_opacity("not-a-number"), None);
         assert_eq!(
-            WorkspaceShell::resolve(WindowBackgroundAppearance::Blurred, None).opacity,
+            WorkspaceShell::resolve(
+                WindowBackgroundAppearance::Blurred,
+                ThemePreset::TokyoNight,
+                f32::NAN,
+            )
+            .opacity,
             0.65
         );
     }
@@ -284,19 +368,27 @@ mod tests {
 
     #[test]
     fn opaque_fallback_does_not_leave_translucent_content() {
-        let shell = WorkspaceShell::resolve(WindowBackgroundAppearance::Opaque, Some("0.7"));
+        let shell = WorkspaceShell::resolve(
+            WindowBackgroundAppearance::Opaque,
+            ThemePreset::TokyoNight,
+            0.7,
+        );
         assert_eq!(shell.opacity, 1.);
         assert_eq!(shell.root_color().a, 1.);
     }
 
     #[test]
     fn only_surface_colors_receive_translucency() {
-        let shell = WorkspaceShell::resolve(WindowBackgroundAppearance::Blurred, Some("0.82"));
+        let shell = WorkspaceShell::resolve(
+            WindowBackgroundAppearance::Blurred,
+            ThemePreset::TokyoNight,
+            0.82,
+        );
         assert_eq!(shell.terminal_background(rgb(0x101010)).a, 0.82);
         assert_eq!(shell.color(ShellColor::Text).a, 1.);
         assert_eq!(shell.root_color().a, 0.);
         assert_eq!(shell.appearance, WindowBackgroundAppearance::Blurred,);
-        assert!(shell.color(ShellColor::Hover).a < shell.color(ShellColor::Selected).a);
-        assert!(shell.color(ShellColor::Selected).a < shell.color(ShellColor::Chrome).a);
+        assert!(shell.color(ShellColor::Selected).a < shell.color(ShellColor::Hover).a);
+        assert!(shell.color(ShellColor::Hover).a < shell.color(ShellColor::Chrome).a);
     }
 }

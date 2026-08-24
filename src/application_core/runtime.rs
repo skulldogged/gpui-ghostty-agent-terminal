@@ -3,6 +3,7 @@ use crate::{
     CoreCommand, CoreEffect, CoreModel, PaneId, PaneLayout, TerminalSessionId,
     pty::ProcessSnapshot,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
+    terminal_theme::TerminalTheme,
 };
 use crate::{CoreCommit, CoreModelError, CoreSnapshot};
 use std::{
@@ -18,6 +19,7 @@ pub(super) struct CoreRuntime {
     terminals: HashMap<TerminalSessionId, RuntimeTerminal>,
     processes: ProcessSnapshot,
     next_process_refresh: Instant,
+    theme: Option<TerminalTheme>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +80,7 @@ impl CoreRuntime {
             terminals: HashMap::new(),
             processes: ProcessSnapshot::new(),
             next_process_refresh: Instant::now() + ACTIVE_WORK_POLL_INTERVAL,
+            theme: None,
         };
         runtime.execute_effects(&commit.effects);
         let terminal = runtime
@@ -121,6 +124,22 @@ impl CoreRuntime {
 
     pub(super) fn contains_terminal(&self, terminal_session_id: TerminalSessionId) -> bool {
         self.terminals.contains_key(&terminal_session_id)
+    }
+
+    pub(super) fn set_theme(
+        &mut self,
+        theme: TerminalTheme,
+    ) -> Result<Vec<(TerminalSessionId, u64)>, String> {
+        let mut changes = Vec::new();
+        for (&terminal_session_id, runtime) in &mut self.terminals {
+            if let Some(session) = runtime.session.as_mut() {
+                session.set_theme(theme)?;
+                runtime.revision = runtime.revision.saturating_add(1);
+                changes.push((terminal_session_id, runtime.revision));
+            }
+        }
+        self.theme = Some(theme);
+        Ok(changes)
     }
 
     pub(super) fn apply(
@@ -302,7 +321,7 @@ impl CoreRuntime {
                     terminal_session_id,
                     launch,
                 } => {
-                    let runtime = RuntimeTerminal::spawn(&launch.working_directory)
+                    let runtime = RuntimeTerminal::spawn(&launch.working_directory, self.theme)
                         .unwrap_or_else(RuntimeTerminal::failed);
                     self.terminals.insert(*terminal_session_id, runtime);
                 }
@@ -340,9 +359,12 @@ impl CoreRuntime {
 }
 
 impl RuntimeTerminal {
-    fn spawn(working_directory: &Path) -> Result<Self, String> {
-        let (session, events) =
+    fn spawn(working_directory: &Path, theme: Option<TerminalTheme>) -> Result<Self, String> {
+        let (mut session, events) =
             TerminalSession::spawn_in(TerminalSize::default(), working_directory)?;
+        if let Some(theme) = theme {
+            session.set_theme(theme)?;
+        }
         Ok(Self {
             session: Some(session),
             events: Some(events),

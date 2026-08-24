@@ -187,6 +187,13 @@ impl TerminalSession {
         self.size
     }
 
+    pub(crate) fn set_theme(
+        &mut self,
+        theme: crate::terminal_theme::TerminalTheme,
+    ) -> Result<(), String> {
+        self.terminal.set_theme(theme)
+    }
+
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), String> {
         let size = size.validate()?;
         if size == self.size {

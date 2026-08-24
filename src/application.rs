@@ -1,6 +1,6 @@
 use crate::{
     ApplicationCore, activation::ActivationListener, desktop_presence::DesktopPresence, gui,
-    ui_shell::ShellAssets,
+    ui_shell::install_icon_font,
 };
 use gpui::{App, Global, QuitMode, Task};
 
@@ -36,11 +36,14 @@ pub(crate) fn run(development: bool) -> Result<(), String> {
     };
     let core = ApplicationCore::start()?;
     let launch_core = core.clone();
-    let application = gpui_platform::application()
-        .with_assets(ShellAssets)
-        .with_quit_mode(QuitMode::Explicit);
+    let application = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
     application.on_reopen(|cx| handle_intent(ApplicationIntent::OpenOrFocus, cx));
     application.run(move |cx| {
+        if let Err(error) = install_icon_font(cx) {
+            eprintln!("Could not load Lucide icons: {error}");
+            cx.quit();
+            return;
+        }
         if let Err(error) = install_desktop_presence(cx, launch_core, activation, development) {
             eprintln!("Could not start application: {error}");
             cx.quit();
