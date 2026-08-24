@@ -4,7 +4,13 @@ use crate::{
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
 use crate::{CoreCommit, CoreModelError, CoreSnapshot};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{Duration, Instant},
+};
+
+const ACTIVE_WORK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(super) struct CoreRuntime {
     model: CoreModel,
@@ -35,6 +41,10 @@ struct RuntimeTerminal {
     lifecycle: TerminalLifecycle,
     last_snapshot_revision: Option<u64>,
     interactive_prompt_seen: bool,
+    bracketed_paste: bool,
+    alternate_screen: bool,
+    active_work: bool,
+    next_active_work_poll: Instant,
 }
 
 impl CoreRuntime {
@@ -194,17 +204,22 @@ impl CoreRuntime {
         let force_full = since.is_none() || since != runtime.last_snapshot_revision;
         let snapshot = session.render_update(force_full)?;
         runtime.interactive_prompt_seen |= snapshot.bracketed_paste;
-        let active_work = close_confirmation_required(
+        runtime.bracketed_paste = snapshot.bracketed_paste;
+        runtime.alternate_screen = snapshot.alternate_screen;
+        let foreground_process = session.has_foreground_process().unwrap_or(true);
+        runtime.next_active_work_poll = Instant::now() + ACTIVE_WORK_POLL_INTERVAL;
+        runtime.active_work = close_confirmation_required(
             runtime.interactive_prompt_seen,
-            snapshot.bracketed_paste,
-            snapshot.alternate_screen,
+            runtime.bracketed_paste,
+            runtime.alternate_screen,
+            foreground_process,
         );
         let update = TerminalUpdate::from_terminal(
             snapshot,
             runtime.last_snapshot_revision,
             runtime.revision,
             runtime.lifecycle.clone(),
-            active_work,
+            runtime.active_work,
         );
         runtime.last_snapshot_revision = Some(runtime.revision);
         Ok(Some(update))
@@ -311,6 +326,10 @@ impl RuntimeTerminal {
             lifecycle: TerminalLifecycle::Running,
             last_snapshot_revision: None,
             interactive_prompt_seen: false,
+            bracketed_paste: false,
+            alternate_screen: false,
+            active_work: false,
+            next_active_work_poll: Instant::now(),
         })
     }
 
@@ -322,6 +341,10 @@ impl RuntimeTerminal {
             lifecycle: TerminalLifecycle::Failed(error),
             last_snapshot_revision: None,
             interactive_prompt_seen: false,
+            bracketed_paste: false,
+            alternate_screen: false,
+            active_work: false,
+            next_active_work_poll: Instant::now(),
         }
     }
 
@@ -369,6 +392,21 @@ impl RuntimeTerminal {
                 }
             }
         }
+        let now = Instant::now();
+        if now >= self.next_active_work_poll {
+            self.next_active_work_poll = now + ACTIVE_WORK_POLL_INTERVAL;
+            let foreground_process = session.has_foreground_process().unwrap_or(true);
+            let active_work = close_confirmation_required(
+                self.interactive_prompt_seen,
+                self.bracketed_paste,
+                self.alternate_screen,
+                foreground_process,
+            );
+            if active_work != self.active_work {
+                self.active_work = active_work;
+                self.revision = self.revision.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -376,8 +414,9 @@ fn close_confirmation_required(
     interactive_prompt_seen: bool,
     bracketed_paste: bool,
     alternate_screen: bool,
+    foreground_process: bool,
 ) -> bool {
-    alternate_screen || (interactive_prompt_seen && !bracketed_paste)
+    foreground_process || alternate_screen || (interactive_prompt_seen && !bracketed_paste)
 }
 
 fn pane_for_terminal(
@@ -420,10 +459,11 @@ mod tests {
 
     #[test]
     fn close_confirmation_tracks_work_after_an_interactive_prompt() {
-        assert!(!close_confirmation_required(false, false, false));
-        assert!(!close_confirmation_required(true, true, false));
-        assert!(close_confirmation_required(true, false, false));
-        assert!(close_confirmation_required(false, true, true));
+        assert!(!close_confirmation_required(false, false, false, false));
+        assert!(!close_confirmation_required(true, true, false, false));
+        assert!(close_confirmation_required(true, false, false, false));
+        assert!(close_confirmation_required(false, true, true, false));
+        assert!(close_confirmation_required(false, false, false, true));
     }
 
     #[test]

@@ -228,8 +228,16 @@ enum DriverEvent {
     Semantic(Result<SemanticEvent, flume::RecvError>),
 }
 
+struct DriverReceivers {
+    commands: flume::Receiver<Command>,
+    terminal_changes: flume::Receiver<TerminalChange>,
+    semantic_events: flume::Receiver<SemanticEvent>,
+}
+
 impl CoreDriver {
     pub(crate) fn start(core: ApplicationCore) -> Result<(Self, CoreProjection), String> {
+        let terminal_changes = core.terminal_changes();
+        let semantic_events = core.semantic_events();
         let projection = load_projection(&core)?;
         let revisions = projection
             .terminals
@@ -251,6 +259,11 @@ impl CoreDriver {
         };
         let counters = Arc::new(DriverCounters::default());
         let worker_counters = Arc::clone(&counters);
+        let receivers = DriverReceivers {
+            commands: commands_rx,
+            terminal_changes,
+            semantic_events,
+        };
         std::thread::Builder::new()
             .name("window-driver".into())
             .spawn(move || {
@@ -258,7 +271,7 @@ impl CoreDriver {
                     core,
                     hierarchy_revision,
                     revisions,
-                    commands_rx,
+                    receivers,
                     publisher,
                     worker_counters,
                 )
@@ -355,17 +368,15 @@ fn run_driver(
     core: ApplicationCore,
     mut hierarchy_revision: u64,
     mut revisions: HashMap<TerminalSessionId, u64>,
-    commands: flume::Receiver<Command>,
+    receivers: DriverReceivers,
     updates: DriverUpdatePublisher,
     counters: Arc<DriverCounters>,
 ) {
-    let terminal_changes = core.terminal_changes();
-    let semantic_events = core.semantic_events();
     loop {
         let event = flume::Selector::new()
-            .recv(&commands, DriverEvent::Command)
-            .recv(&terminal_changes, DriverEvent::TerminalChanged)
-            .recv(&semantic_events, DriverEvent::Semantic)
+            .recv(&receivers.commands, DriverEvent::Command)
+            .recv(&receivers.terminal_changes, DriverEvent::TerminalChanged)
+            .recv(&receivers.semantic_events, DriverEvent::Semantic)
             .wait();
         let result = match event {
             DriverEvent::Command(Err(_)) => break,

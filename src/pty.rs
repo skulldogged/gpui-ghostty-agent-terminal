@@ -73,6 +73,7 @@ mod unix {
         _master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         child: Option<Box<dyn Child + Send>>,
+        shell_process_id: Option<u32>,
         control: flume::Sender<ReaderControl>,
         shutdown: Option<flume::Sender<()>>,
     }
@@ -96,6 +97,7 @@ mod unix {
                 .slave
                 .spawn_command(command)
                 .map_err(|error| format!("spawn shell: {error}"))?;
+            let shell_process_id = child.process_id();
             drop(pair.slave);
 
             let mut reader = pair
@@ -161,6 +163,7 @@ mod unix {
                     _master: pair.master,
                     writer,
                     child: Some(child),
+                    shell_process_id,
                     control: control_tx,
                     shutdown: Some(shutdown_tx),
                 },
@@ -179,6 +182,19 @@ mod unix {
             self._master
                 .resize(size.into())
                 .map_err(|error| format!("resize PTY: {error}"))
+        }
+
+        pub fn has_foreground_process(&self) -> Result<bool, String> {
+            let shell_process_id = self
+                .shell_process_id
+                .ok_or_else(|| "terminal shell does not expose its process ID".to_string())?;
+            let foreground_process_group = self
+                ._master
+                .process_group_leader()
+                .ok_or_else(|| "inspect foreground PTY process group".to_string())?;
+            let foreground_process_group = u32::try_from(foreground_process_group)
+                .map_err(|_| "foreground PTY process group is invalid".to_string())?;
+            Ok(foreground_process_group != shell_process_id)
         }
 
         pub fn pause_reader(&mut self) -> Result<(), String> {
