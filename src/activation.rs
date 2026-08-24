@@ -1,7 +1,7 @@
 use crate::application::ApplicationIntent;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::{
     Listener as LocalSocketListener, ListenerOptions, Stream as LocalSocketStream, prelude::*,
@@ -25,7 +25,7 @@ impl ActivationListener {
                         Err(_) => thread::sleep(std::time::Duration::from_millis(25)),
                     }
                 }
-                #[cfg(all(unix, not(target_os = "linux")))]
+                #[cfg(unix)]
                 if let Ok(listener) = reclaim_stale_listener(name) {
                     return Ok(Some(Self(listener)));
                 }
@@ -51,7 +51,7 @@ impl ActivationListener {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 fn reclaim_stale_listener(
     name: interprocess::local_socket::Name<'static>,
 ) -> io::Result<LocalSocketListener> {
@@ -75,7 +75,7 @@ fn listener(name: interprocess::local_socket::Name<'static>) -> io::Result<Local
     options.create_sync()
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(windows)]
 fn activation_name() -> Result<interprocess::local_socket::Name<'static>, String> {
     let scope = user_scope();
     format!("agent-terminal-{scope}-activation")
@@ -84,13 +84,63 @@ fn activation_name() -> Result<interprocess::local_socket::Name<'static>, String
         .map_err(|error| format!("name application activation endpoint: {error}"))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 fn activation_name() -> Result<interprocess::local_socket::Name<'static>, String> {
-    std::env::temp_dir()
-        .join(format!("agent-terminal-{}-activation.sock", user_scope()))
+    activation_directory()?
+        .join("agent-terminal-activation.sock")
         .to_fs_name::<GenericFilePath>()
         .map(interprocess::local_socket::Name::into_owned)
         .map_err(|error| format!("name application activation endpoint: {error}"))
+}
+
+#[cfg(unix)]
+fn activation_directory() -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    if let Some(directory) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        verify_private_directory(&directory)?;
+        return Ok(directory);
+    }
+
+    let directory = std::env::temp_dir().join(format!("agent-terminal-{}", user_scope()));
+    match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create application activation directory {}: {error}",
+                directory.display()
+            ));
+        }
+    }
+    verify_private_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn verify_private_directory(directory: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+        format!(
+            "inspect application activation directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "application activation directory {} is not owned by the current user",
+            directory.display()
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "application activation directory {} is accessible to other users",
+            directory.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

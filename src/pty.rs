@@ -57,14 +57,31 @@ pub(crate) fn reader_checkpoint(
     }
 }
 
-pub(crate) fn has_child_process(process_id: u32) -> bool {
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
-    let process_id = sysinfo::Pid::from_u32(process_id);
-    system
-        .processes()
-        .values()
-        .any(|process| process.parent() == Some(process_id))
+pub(crate) struct ProcessSnapshot {
+    system: sysinfo::System,
+}
+
+impl ProcessSnapshot {
+    pub(crate) fn new() -> Self {
+        let mut snapshot = Self {
+            system: sysinfo::System::new(),
+        };
+        snapshot.refresh();
+        snapshot
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        self.system
+            .refresh_processes(sysinfo::ProcessesToUpdate::All);
+    }
+
+    pub(crate) fn has_child_process(&self, process_id: u32) -> bool {
+        let process_id = sysinfo::Pid::from_u32(process_id);
+        self.system
+            .processes()
+            .values()
+            .any(|process| process.parent() == Some(process_id))
+    }
 }
 
 #[cfg(windows)]
@@ -73,7 +90,7 @@ pub use crate::windows_pty::PtySession;
 #[cfg(unix)]
 mod unix {
     use super::{
-        PtyOutput, PtySize, ReaderControl, has_child_process, reader_checkpoint, send_or_shutdown,
+        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
     };
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
@@ -196,7 +213,7 @@ mod unix {
                 .map_err(|error| format!("resize PTY: {error}"))
         }
 
-        pub fn has_foreground_process(&self) -> Result<bool, String> {
+        pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
             let shell_process_id = self
                 .shell_process_id
                 .ok_or_else(|| "terminal shell does not expose its process ID".to_string())?;
@@ -206,7 +223,8 @@ mod unix {
                 .ok_or_else(|| "inspect foreground PTY process group".to_string())?;
             let foreground_process_group = u32::try_from(foreground_process_group)
                 .map_err(|_| "foreground PTY process group is invalid".to_string())?;
-            Ok(foreground_process_group != shell_process_id || has_child_process(shell_process_id))
+            Ok(foreground_process_group != shell_process_id
+                || processes.has_child_process(shell_process_id))
         }
 
         pub fn pause_reader(&mut self) -> Result<(), String> {
@@ -378,7 +396,7 @@ pub use unix::PtySession;
 
 #[cfg(test)]
 mod tests {
-    use super::{PtyOutput, ReaderControl, has_child_process, reader_checkpoint};
+    use super::{ProcessSnapshot, PtyOutput, ReaderControl, reader_checkpoint};
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -401,8 +419,10 @@ mod tests {
             .spawn()
             .expect("spawn child process");
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut processes = ProcessSnapshot::new();
         let detected = loop {
-            if has_child_process(std::process::id()) {
+            processes.refresh();
+            if processes.has_child_process(std::process::id()) {
                 break true;
             }
             if Instant::now() >= deadline {

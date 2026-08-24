@@ -1,6 +1,7 @@
 use super::{TerminalLifecycle, TerminalUpdate};
 use crate::{
     CoreCommand, CoreEffect, CoreModel, PaneId, PaneLayout, TerminalSessionId,
+    pty::ProcessSnapshot,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
 };
 use crate::{CoreCommit, CoreModelError, CoreSnapshot};
@@ -15,6 +16,8 @@ const ACTIVE_WORK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) struct CoreRuntime {
     model: CoreModel,
     terminals: HashMap<TerminalSessionId, RuntimeTerminal>,
+    processes: ProcessSnapshot,
+    next_process_refresh: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +47,6 @@ struct RuntimeTerminal {
     bracketed_paste: bool,
     alternate_screen: bool,
     active_work: bool,
-    next_active_work_poll: Instant,
 }
 
 impl CoreRuntime {
@@ -74,6 +76,8 @@ impl CoreRuntime {
         let mut runtime = Self {
             model,
             terminals: HashMap::new(),
+            processes: ProcessSnapshot::new(),
+            next_process_refresh: Instant::now() + ACTIVE_WORK_POLL_INTERVAL,
         };
         runtime.execute_effects(&commit.effects);
         let terminal = runtime
@@ -190,7 +194,16 @@ impl CoreRuntime {
         terminal_session_id: TerminalSessionId,
         since: Option<u64>,
     ) -> Result<Option<TerminalUpdate>, String> {
-        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let processes = &self.processes;
+        let runtime = self
+            .terminals
+            .get_mut(&terminal_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "Terminal Session {} does not exist",
+                    terminal_session_id.as_u64()
+                )
+            })?;
         if since == Some(runtime.revision) {
             return Ok(None);
         }
@@ -206,8 +219,7 @@ impl CoreRuntime {
         runtime.interactive_prompt_seen |= snapshot.bracketed_paste;
         runtime.bracketed_paste = snapshot.bracketed_paste;
         runtime.alternate_screen = snapshot.alternate_screen;
-        let foreground_process = session.has_foreground_process().unwrap_or(true);
-        runtime.next_active_work_poll = Instant::now() + ACTIVE_WORK_POLL_INTERVAL;
+        let foreground_process = session.has_foreground_process(processes).unwrap_or(true);
         runtime.active_work = close_confirmation_required(
             runtime.interactive_prompt_seen,
             runtime.bracketed_paste,
@@ -228,10 +240,12 @@ impl CoreRuntime {
     pub(super) fn refresh(&mut self) -> Vec<RuntimeEvent> {
         let mut updates = Vec::new();
         let mut exited = Vec::new();
+        let poll_active_work = self.refresh_process_snapshot_if_due();
+        let processes = &self.processes;
         for (&terminal_session_id, runtime) in &mut self.terminals {
             let revision_before = runtime.revision;
             let lifecycle_before = runtime.lifecycle.clone();
-            runtime.refresh();
+            runtime.refresh(poll_active_work.then_some(processes));
             let exited_naturally = runtime.lifecycle != lifecycle_before
                 && matches!(runtime.lifecycle, TerminalLifecycle::Exited);
             if runtime.lifecycle != lifecycle_before {
@@ -269,6 +283,16 @@ impl CoreRuntime {
             });
         }
         updates
+    }
+
+    fn refresh_process_snapshot_if_due(&mut self) -> bool {
+        let now = Instant::now();
+        if now < self.next_process_refresh {
+            return false;
+        }
+        self.processes.refresh();
+        self.next_process_refresh = now + ACTIVE_WORK_POLL_INTERVAL;
+        true
     }
 
     fn execute_effects(&mut self, effects: &[CoreEffect]) {
@@ -329,7 +353,6 @@ impl RuntimeTerminal {
             bracketed_paste: false,
             alternate_screen: false,
             active_work: false,
-            next_active_work_poll: Instant::now(),
         })
     }
 
@@ -344,11 +367,10 @@ impl RuntimeTerminal {
             bracketed_paste: false,
             alternate_screen: false,
             active_work: false,
-            next_active_work_poll: Instant::now(),
         }
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self, processes: Option<&ProcessSnapshot>) {
         let (Some(session), Some(events)) = (&mut self.session, &self.events) else {
             return;
         };
@@ -392,10 +414,8 @@ impl RuntimeTerminal {
                 }
             }
         }
-        let now = Instant::now();
-        if now >= self.next_active_work_poll {
-            self.next_active_work_poll = now + ACTIVE_WORK_POLL_INTERVAL;
-            let foreground_process = session.has_foreground_process().unwrap_or(true);
+        if let Some(processes) = processes {
+            let foreground_process = session.has_foreground_process(processes).unwrap_or(true);
             let active_work = close_confirmation_required(
                 self.interactive_prompt_seen,
                 self.bracketed_paste,

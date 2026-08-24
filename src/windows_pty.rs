@@ -1,6 +1,6 @@
 use crate::{
     pty::{
-        PtyOutput, PtySize, ReaderControl, has_child_process, reader_checkpoint, send_or_shutdown,
+        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
     },
     terminal_session::TerminalEvent,
 };
@@ -220,8 +220,8 @@ impl PtySession {
         self.pseudoconsole.resize(size)
     }
 
-    pub fn has_foreground_process(&self) -> Result<bool, String> {
-        Ok(has_child_process(self.process_id))
+    pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
+        Ok(processes.has_child_process(self.process_id))
     }
 
     pub fn pause_reader(&mut self) -> Result<(), String> {
