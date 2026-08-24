@@ -71,8 +71,10 @@ impl ProcessSnapshot {
     }
 
     pub(crate) fn refresh(&mut self) {
-        self.system
-            .refresh_processes(sysinfo::ProcessesToUpdate::All);
+        self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            sysinfo::ProcessRefreshKind::new(),
+        );
     }
 
     pub(crate) fn has_child_process(&self, process_id: u32) -> bool {
