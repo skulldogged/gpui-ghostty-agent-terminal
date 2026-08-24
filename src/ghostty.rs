@@ -51,6 +51,13 @@ unsafe extern "C" {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> i32;
+    fn spike_terminal_set_theme(
+        terminal: *mut c_void,
+        foreground: *const u8,
+        background: *const u8,
+        cursor: *const u8,
+        ansi_palette: *const u8,
+    ) -> i32;
     fn spike_terminal_encode_paste(
         terminal: *mut c_void,
         data: *mut u8,
@@ -127,6 +134,23 @@ impl Terminal {
             spike_terminal_resize(self.raw.as_ptr(), cols, rows, cell_width_px, cell_height_px)
         };
         result_ok(result, "resize")
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn set_theme(
+        &mut self,
+        theme: crate::terminal_theme::TerminalTheme,
+    ) -> Result<(), String> {
+        let result = unsafe {
+            spike_terminal_set_theme(
+                self.raw.as_ptr(),
+                theme.foreground.as_ptr(),
+                theme.background.as_ptr(),
+                theme.cursor.as_ptr(),
+                theme.palette.as_ptr().cast(),
+            )
+        };
+        result_ok(result, "set color theme")
     }
 
     pub fn encode_paste(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -260,6 +284,27 @@ pub fn snapshot_text(snapshot: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::Terminal;
+    #[cfg(feature = "gui")]
+    use crate::terminal_theme::ThemePreset;
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn terminal_theme_updates_ghostty_defaults_and_ansi_palette() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        let theme = ThemePreset::CatppuccinMocha.terminal_theme();
+        terminal.set_theme(theme).expect("apply terminal theme");
+        terminal.feed(b"\x1b[31mred\x1b[0m");
+
+        let snapshot = terminal.snapshot().expect("snapshot terminal");
+        assert_eq!(snapshot.default_fg, theme.foreground);
+        assert_eq!(snapshot.default_bg, theme.background);
+        assert!(
+            snapshot
+                .cells
+                .iter()
+                .any(|cell| cell.fg == theme.palette[1])
+        );
+    }
 
     #[test]
     fn render_updates_consume_only_rows_marked_dirty_by_ghostty() {

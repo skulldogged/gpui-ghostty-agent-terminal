@@ -6,11 +6,15 @@ mod application_core;
 #[cfg(feature = "gui")]
 mod pty;
 #[cfg(feature = "gui")]
+mod settings;
+#[cfg(feature = "gui")]
 mod terminal_frame;
 #[cfg(feature = "gui")]
 mod terminal_grid;
 #[cfg(feature = "gui")]
 mod terminal_session;
+#[cfg(feature = "gui")]
+mod terminal_theme;
 #[cfg(feature = "gui")]
 mod ui_shell;
 #[cfg(all(feature = "gui", windows))]

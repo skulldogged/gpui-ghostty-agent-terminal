@@ -1,6 +1,6 @@
 use crate::{
     CoreCommand, CoreModelError, CoreSnapshot, CreatedResource, TerminalSessionId, ghostty,
-    terminal_session::TerminalSize,
+    terminal_session::TerminalSize, terminal_theme::TerminalTheme,
 };
 use std::{
     collections::HashMap,
@@ -72,6 +72,9 @@ enum WorkerRequest {
     Resize {
         terminal_session_id: TerminalSessionId,
         size: TerminalSize,
+    },
+    SetTerminalTheme {
+        theme: TerminalTheme,
     },
     Snapshot {
         terminal_session_id: TerminalSessionId,
@@ -257,6 +260,10 @@ impl ApplicationCore {
         })
     }
 
+    pub(crate) fn set_terminal_theme(&self, theme: TerminalTheme) -> Result<(), String> {
+        self.expect_ack(WorkerRequest::SetTerminalTheme { theme })
+    }
+
     pub fn terminal_changes(&self) -> flume::Receiver<TerminalChange> {
         let (sender, receiver) = flume::unbounded();
         self.inner
@@ -368,7 +375,7 @@ fn run_terminal_runtime(
                     &semantic_subscribers,
                 );
                 let stop = matches!(command.request, WorkerRequest::Stop);
-                let mut changed_terminal = None;
+                let mut changed_terminals = Vec::new();
                 let result = match command.request {
                     WorkerRequest::Input {
                         terminal_session_id,
@@ -388,11 +395,11 @@ fn run_terminal_runtime(
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
                             runtime.paste(terminal_session_id, &bytes).map(|changed| {
-                                if changed {
-                                    changed_terminal = runtime
-                                        .terminal_revision(terminal_session_id)
-                                        .ok()
-                                        .map(|revision| (terminal_session_id, revision));
+                                if changed
+                                    && let Ok(revision) =
+                                        runtime.terminal_revision(terminal_session_id)
+                                {
+                                    changed_terminals.push((terminal_session_id, revision));
                                 }
                                 WorkerResponse::Ack
                             })
@@ -406,11 +413,11 @@ fn run_terminal_runtime(
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
                             runtime.resize(terminal_session_id, size).map(|changed| {
-                                if changed {
-                                    changed_terminal = runtime
-                                        .terminal_revision(terminal_session_id)
-                                        .ok()
-                                        .map(|revision| (terminal_session_id, revision));
+                                if changed
+                                    && let Ok(revision) =
+                                        runtime.terminal_revision(terminal_session_id)
+                                {
+                                    changed_terminals.push((terminal_session_id, revision));
                                 }
                                 WorkerResponse::Ack
                             })
@@ -434,6 +441,12 @@ fn run_terminal_runtime(
                     WorkerRequest::CoreSnapshot => {
                         Ok(WorkerResponse::CoreSnapshot(runtime.model_snapshot()))
                     }
+                    WorkerRequest::SetTerminalTheme { theme } => {
+                        runtime.set_theme(theme).map(|changes| {
+                            changed_terminals.extend(changes);
+                            WorkerResponse::Ack
+                        })
+                    }
                     WorkerRequest::ApplyCoreCommand {
                         expected_revision,
                         command,
@@ -447,7 +460,7 @@ fn run_terminal_runtime(
                     },
                     WorkerRequest::Stop => Ok(WorkerResponse::Ack),
                 };
-                if let Some((terminal_session_id, terminal_revision)) = changed_terminal {
+                for (terminal_session_id, terminal_revision) in changed_terminals {
                     publish_terminal_change(
                         &terminal_subscribers,
                         terminal_session_id,

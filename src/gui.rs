@@ -3,6 +3,7 @@ use crate::{
     SplitAxis, SplitId, SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId,
     TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
+    settings::{AppSettings, KeybindAction, MAX_FONT_SIZE, MIN_FONT_SIZE, Shortcut, ThemePreset},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
     ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
@@ -17,15 +18,17 @@ use std::collections::{HashMap, HashSet};
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
-const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
 pub(crate) fn open_terminal_window(
     cx: &mut App,
     core: ApplicationCore,
 ) -> Result<AnyWindowHandle, String> {
-    let terminal_font = TerminalFont::resolve(cx)?;
+    let (settings, settings_warning) = AppSettings::load();
+    let terminal_font = TerminalFont::resolve(&settings, cx)?;
+    let available_fonts = installed_monospace_fonts(terminal_font.size, cx);
+    core.set_terminal_theme(settings.theme.terminal_theme())?;
     let (driver, projection) = CoreDriver::start(core)?;
-    let shell = WorkspaceShell::from_environment();
+    let shell = WorkspaceShell::from_preferences(settings.theme, settings.effective_opacity());
     let selection = UiSelection::initial(&projection.hierarchy);
     let terminal_errors = projection
         .terminals
@@ -48,8 +51,13 @@ pub(crate) fn open_terminal_window(
                 focus,
                 refresh_task: Task::ready(()),
                 terminal_errors,
-                global_error: None,
+                global_error: settings_warning,
                 terminal_font,
+                settings,
+                settings_open: false,
+                settings_section: SettingsSection::Appearance,
+                recording_binding: None,
+                available_fonts,
                 requested_sizes: HashMap::new(),
                 move_source: None,
                 selections_after_commands: HashMap::new(),
@@ -60,6 +68,7 @@ pub(crate) fn open_terminal_window(
                 preview_split_ratios: HashMap::new(),
                 pending_split_resizes: HashMap::new(),
                 titlebar_drag_armed: false,
+                sidebar_collapsed: false,
             });
             view.update(cx, |view, cx| {
                 view.start_refresh_task(cx);
@@ -85,6 +94,11 @@ struct MultiplexerView {
     terminal_errors: HashMap<TerminalSessionId, String>,
     global_error: Option<String>,
     terminal_font: TerminalFont,
+    settings: AppSettings,
+    settings_open: bool,
+    settings_section: SettingsSection,
+    recording_binding: Option<KeybindAction>,
+    available_fonts: Vec<String>,
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
     move_source: Option<PaneId>,
     selections_after_commands: HashMap<u64, PaneId>,
@@ -95,6 +109,7 @@ struct MultiplexerView {
     preview_split_ratios: HashMap<SplitId, SplitRatio>,
     pending_split_resizes: HashMap<u64, SplitId>,
     titlebar_drag_armed: bool,
+    sidebar_collapsed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -116,6 +131,34 @@ enum CloseTarget {
     Space(SpaceId),
     Tab(TabId),
     Pane(PaneId),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SettingsSection {
+    #[default]
+    Appearance,
+    Terminal,
+    Keybindings,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 3] = [Self::Appearance, Self::Terminal, Self::Keybindings];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Terminal => "Terminal",
+            Self::Keybindings => "Keybindings",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Appearance => "Theme and window material",
+            Self::Terminal => "Font family and sizing",
+            Self::Keybindings => "Keyboard shortcuts",
+        }
+    }
 }
 
 impl CloseTarget {
@@ -162,20 +205,15 @@ struct TerminalFont {
 }
 
 impl TerminalFont {
-    fn resolve(cx: &App) -> Result<Self, String> {
-        let font_size = std::env::var("AGENT_TERMINAL_FONT_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
-            .filter(|size| (8.0..=48.0).contains(size))
-            .unwrap_or(DEFAULT_FONT_SIZE_PX);
+    fn resolve(settings: &AppSettings, cx: &App) -> Result<Self, String> {
+        let font_size = settings.effective_font_size();
         let size = px(font_size);
-        let requested = std::env::var("AGENT_TERMINAL_FONT")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        let requested = settings.effective_font_family();
         let available = cx.text_system().all_font_names();
         let family: SharedString = requested
             .filter(|candidate| {
-                font_is_available(candidate, &available) && font_is_fixed_pitch(candidate, size, cx)
+                font_is_available(candidate, &available)
+                    && font_is_terminal_candidate(candidate, size, cx)
             })
             .or_else(|| {
                 terminal_font_candidates()
@@ -183,14 +221,14 @@ impl TerminalFont {
                     .copied()
                     .find(|candidate| {
                         font_is_available(candidate, &available)
-                            && font_is_fixed_pitch(candidate, size, cx)
+                            && font_is_terminal_candidate(candidate, size, cx)
                     })
                     .map(str::to_owned)
             })
             .or_else(|| {
                 available
                     .iter()
-                    .find(|candidate| font_is_fixed_pitch(candidate, size, cx))
+                    .find(|candidate| font_is_terminal_candidate(candidate, size, cx))
                     .cloned()
             })
             .ok_or_else(|| {
@@ -217,6 +255,18 @@ impl TerminalFont {
     }
 }
 
+fn installed_monospace_fonts(size: Pixels, cx: &App) -> Vec<String> {
+    let mut fonts = cx
+        .text_system()
+        .all_font_names()
+        .into_iter()
+        .filter(|candidate| font_is_terminal_candidate(candidate, size, cx))
+        .collect::<Vec<_>>();
+    fonts.sort_by_key(|family| family.to_ascii_lowercase());
+    fonts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    fonts
+}
+
 fn font_is_available(candidate: &str, available: &[String]) -> bool {
     available
         .iter()
@@ -236,6 +286,10 @@ fn font_is_fixed_pitch(candidate: &str, size: Pixels, cx: &App) -> bool {
         }
         _ => false,
     }
+}
+
+fn font_is_terminal_candidate(candidate: &str, size: Pixels, cx: &App) -> bool {
+    !candidate.eq_ignore_ascii_case("lucide") && font_is_fixed_pitch(candidate, size, cx)
 }
 
 #[cfg(target_os = "macos")]
@@ -345,11 +399,48 @@ impl MultiplexerView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if pane_close_shortcut(&event.keystroke) {
-            if let Some(pane_id) = self.selection.pane_id {
-                self.close_target(CloseTarget::Pane(pane_id), window, cx);
+        if let Some(action) = self.recording_binding {
+            if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                self.recording_binding = None;
+                cx.notify();
+            } else if event.keystroke.key.eq_ignore_ascii_case("backspace") {
+                self.reset_keybinding(action, cx);
+            } else if let Some(shortcut) = shortcut_from_keystroke(&event.keystroke) {
+                if let Some(conflict) = self.settings.keybindings.conflict_for(action, &shortcut) {
+                    self.global_error = Some(format!(
+                        "{} is already assigned to {}",
+                        shortcut.display(),
+                        conflict.label()
+                    ));
+                    cx.notify();
+                } else {
+                    self.settings.keybindings.set(action, Some(shortcut));
+                    self.recording_binding = None;
+                    self.save_settings(cx);
+                }
             }
             cx.stop_propagation();
+            return;
+        }
+        if self.settings_open && event.keystroke.key.eq_ignore_ascii_case("escape") {
+            self.settings_open = false;
+            self.focus.focus(window, cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(action) = KeybindAction::ALL.into_iter().find(|action| {
+            shortcut_matches(&self.settings.keybindings.get(*action), &event.keystroke)
+        }) {
+            if action == KeybindAction::OpenSettings {
+                self.toggle_settings(window, cx);
+            } else if !self.settings_open {
+                self.perform_keybind_action(action, window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.settings_open {
             return;
         }
         let Some(terminal_session_id) = self.focused_terminal_session_id() else {
@@ -374,10 +465,115 @@ impl MultiplexerView {
         }
     }
 
+    fn reset_keybinding(&mut self, action: KeybindAction, cx: &mut Context<Self>) {
+        let default = crate::settings::default_shortcut(action);
+        if let Some(conflict) = self.settings.keybindings.conflict_for(action, &default) {
+            self.global_error = Some(format!(
+                "{} is already assigned to {}; change that shortcut before resetting {}",
+                default.display(),
+                conflict.label(),
+                action.label()
+            ));
+            cx.notify();
+            return;
+        }
+        self.settings.keybindings.set(action, None);
+        self.recording_binding = None;
+        self.save_settings(cx);
+    }
+
+    fn perform_keybind_action(
+        &mut self,
+        action: KeybindAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            KeybindAction::OpenSettings => unreachable!("settings is handled before dispatch"),
+            KeybindAction::CreateSpace => self.create_space(cx),
+            KeybindAction::CreateTab => self.create_tab(cx),
+            KeybindAction::ClosePane => {
+                if let Some(pane_id) = self.selection.pane_id {
+                    self.close_target(CloseTarget::Pane(pane_id), window, cx);
+                }
+            }
+            KeybindAction::SplitHorizontal => self.split_focused_pane(SplitAxis::Horizontal, cx),
+            KeybindAction::SplitVertical => self.split_focused_pane(SplitAxis::Vertical, cx),
+        }
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        match self.settings.save() {
+            Ok(()) => self.global_error = None,
+            Err(error) => self.global_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        self.recording_binding = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn apply_shell_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell = WorkspaceShell::from_preferences(
+            self.settings.theme,
+            self.settings.effective_opacity(),
+        );
+        window.set_background_appearance(self.shell.appearance());
+        self.save_settings(cx);
+    }
+
+    fn set_theme(&mut self, theme: ThemePreset, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.driver.set_terminal_theme(theme.terminal_theme()) {
+            self.global_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.settings.theme = theme;
+        self.apply_shell_preferences(window, cx);
+    }
+
+    fn set_opacity(&mut self, opacity: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.background_opacity = opacity;
+        self.settings.sanitize();
+        self.apply_shell_preferences(window, cx);
+    }
+
+    fn update_terminal_font(&mut self, family: Option<String>, size: f32, cx: &mut Context<Self>) {
+        let previous_family = self.settings.font_family.clone();
+        let previous_size = self.settings.font_size;
+        self.settings.font_family = family;
+        self.settings.font_size = size;
+        self.settings.sanitize();
+        match TerminalFont::resolve(&self.settings, cx) {
+            Ok(font) => {
+                self.terminal_font = font;
+                self.requested_sizes.clear();
+                self.save_settings(cx);
+            }
+            Err(error) => {
+                self.settings.font_family = previous_family;
+                self.settings.font_size = previous_size;
+                self.global_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
     fn focused_terminal_session_id(&self) -> Option<TerminalSessionId> {
         let pane_id = self.selection.pane_id?;
         self.selected_tab()
             .and_then(|tab| terminal_for_pane(&tab.layout, pane_id))
+    }
+
+    fn selected_terminal_background(&self) -> gpui::Rgba {
+        self.focused_terminal_session_id()
+            .and_then(|terminal_session_id| self.terminals.get(&terminal_session_id))
+            .map(|snapshot| self.shell.terminal_background(color(snapshot.default_bg)))
+            .unwrap_or_else(|| self.shell.terminal_background(rgb(0x0b0e13)))
     }
 
     fn selected_space(&self) -> Option<&crate::SpaceSnapshot> {
@@ -594,14 +790,19 @@ impl MultiplexerView {
         let Some(layout) = self.selected_tab().map(|tab| tab.layout.clone()) else {
             return;
         };
-        let width = (f32::from(viewport.width) - self.sidebar_width).max(1.0);
+        let sidebar_width = if self.sidebar_collapsed {
+            0.
+        } else {
+            self.sidebar_width
+        };
+        let width = (f32::from(viewport.width) - sidebar_width).max(1.0);
         let height = (f32::from(viewport.height) - WorkspaceShell::TITLE_BAR_HEIGHT).max(1.0);
         let mut panes = Vec::new();
         let mut split_geometries = HashMap::new();
         collect_layout_metrics(
             &layout,
             LayoutRect {
-                x: self.sidebar_width,
+                x: sidebar_width,
                 y: WorkspaceShell::TITLE_BAR_HEIGHT,
                 width,
                 height,
@@ -683,9 +884,9 @@ impl MultiplexerView {
             .w(px(self.sidebar_width))
             .h_full()
             .flex_none()
-            .bg(self.shell.color(ShellColor::Sidebar))
+            .bg(self.shell.opaque_color(ShellColor::Sidebar))
             .border_r_1()
-            .border_color(self.shell.color(ShellColor::Border))
+            .border_color(self.shell.opaque_color(ShellColor::Border))
             .px_1()
             .pt_2()
             .gap(px(2.))
@@ -743,11 +944,11 @@ impl MultiplexerView {
                     cx.stop_propagation();
                     view.close_target(CloseTarget::Space(space_id), _window, cx);
                 }))
-                .child(
-                    self.shell
-                        .icon(ShellIcon::Close, self.shell.color(ShellColor::MutedText))
-                        .size(px(10.)),
-                );
+                .child(self.shell.icon(
+                    ShellIcon::Close,
+                    self.shell.color(ShellColor::MutedText),
+                    10.,
+                ));
             sidebar = sidebar.child(
                 div()
                     .id(("space", space_id.as_u64()))
@@ -764,7 +965,7 @@ impl MultiplexerView {
                     .border_color(if selected {
                         self.shell.color(ShellColor::SelectedBorder)
                     } else {
-                        self.shell.color(ShellColor::Sidebar)
+                        self.shell.opaque_color(ShellColor::Sidebar)
                     })
                     .when(selected, |this| {
                         this.bg(self.shell.color(ShellColor::Selected))
@@ -879,7 +1080,59 @@ impl MultiplexerView {
                     ShellColor::Hover
                 }))
             })
-            .child(self.shell.icon(icon, color))
+            .child(
+                self.shell
+                    .icon(icon, color, WorkspaceShell::CHROME_ICON_SIZE),
+            )
+    }
+
+    fn sidebar_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hover_group: SharedString = "sidebar-toggle-hover".into();
+        let icon_size = WorkspaceShell::CHROME_ICON_SIZE;
+        let icon_inset = (WorkspaceShell::CHROME_TILE_SIZE - icon_size) / 2.;
+        let toggle_icon = if self.sidebar_collapsed {
+            ShellIcon::SidebarOpen
+        } else {
+            ShellIcon::SidebarClose
+        };
+
+        div()
+            .id("toggle-sidebar")
+            .group(hover_group.clone())
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(WorkspaceShell::CHROME_TILE_SIZE))
+            .rounded_lg()
+            .cursor_pointer()
+            .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
+            .on_click(cx.listener(|view, _event, _window, cx| {
+                view.sidebar_collapsed = !view.sidebar_collapsed;
+                view.sidebar_dragging = false;
+                view.requested_sizes.clear();
+                cx.notify();
+            }))
+            .child(
+                self.shell
+                    .icon(
+                        ShellIcon::AppMark,
+                        self.shell.color(ShellColor::Accent),
+                        icon_size,
+                    )
+                    .group_hover(hover_group.clone(), |this| this.opacity(0.)),
+            )
+            .child(
+                self.shell
+                    .icon(toggle_icon, self.shell.color(ShellColor::Text), icon_size)
+                    .absolute()
+                    .top(px(icon_inset))
+                    .left(px(icon_inset))
+                    .opacity(0.)
+                    .group_hover(hover_group, |this| this.opacity(1.)),
+            )
+            .into_any_element()
     }
 
     fn render_titlebar_drag_region(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
@@ -1035,34 +1288,34 @@ impl MultiplexerView {
     }
 
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let sidebar_chrome_width = if self.sidebar_collapsed {
+            WorkspaceShell::TITLE_BAR_HEIGHT + if cfg!(target_os = "macos") { 78. } else { 0. }
+        } else {
+            self.sidebar_width
+        };
         let sidebar_chrome = div()
             .flex()
             .items_center()
-            .w(px(self.sidebar_width))
+            .w(px(sidebar_chrome_width))
             .h_full()
             .flex_none()
-            .border_r_1()
-            .border_color(self.shell.color(ShellColor::Border))
+            .when(!self.sidebar_collapsed, |this| {
+                this.border_r_1()
+                    .border_color(self.shell.opaque_color(ShellColor::Border))
+                    .bg(self.shell.opaque_color(ShellColor::Sidebar))
+            })
             .px_2()
             .when(cfg!(target_os = "macos"), |this| this.pl(px(78.)))
-            .when(!cfg!(target_os = "macos"), |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(WorkspaceShell::CHROME_TILE_SIZE))
-                        .child(
-                            self.shell
-                                .icon(ShellIcon::AppMark, self.shell.color(ShellColor::Accent)),
-                        ),
-                )
-            })
-            .child(self.render_titlebar_drag_region("sidebar-titlebar-drag-region", cx))
-            .child(
-                self.chrome_tile("create-space", ShellIcon::Plus, false, false)
-                    .on_click(cx.listener(|view, _event, _window, cx| view.create_space(cx))),
-            );
+            .child(self.sidebar_toggle(cx))
+            .when(!self.sidebar_collapsed, |this| {
+                this.child(self.render_titlebar_drag_region("sidebar-titlebar-drag-region", cx))
+                    .child(
+                        self.chrome_tile("create-space", ShellIcon::Plus, false, false)
+                            .on_click(
+                                cx.listener(|view, _event, _window, cx| view.create_space(cx)),
+                            ),
+                    )
+            });
 
         let mut tabs = div()
             .flex()
@@ -1098,11 +1351,11 @@ impl MultiplexerView {
                         cx.stop_propagation();
                         view.close_target(CloseTarget::Tab(tab_id), _window, cx);
                     }))
-                    .child(
-                        self.shell
-                            .icon(ShellIcon::Close, self.shell.color(ShellColor::MutedText))
-                            .size(px(10.)),
-                    );
+                    .child(self.shell.icon(
+                        ShellIcon::Close,
+                        self.shell.color(ShellColor::MutedText),
+                        10.,
+                    ));
                 tabs = tabs.child(
                     div()
                         .id(("tab", tab_id.as_u64()))
@@ -1119,7 +1372,10 @@ impl MultiplexerView {
                         .border_color(if selected {
                             self.shell.color(ShellColor::SelectedBorder)
                         } else {
-                            self.shell.color(ShellColor::Chrome)
+                            self.shell.color(ShellColor::Border).alpha(0.)
+                        })
+                        .when(selected, |this| {
+                            this.bg(self.shell.color(ShellColor::Selected))
                         })
                         .text_size(px(13.))
                         .text_color(if selected {
@@ -1127,25 +1383,25 @@ impl MultiplexerView {
                         } else {
                             self.shell.color(ShellColor::MutedText)
                         })
-                        .when(selected, |this| {
-                            this.bg(self.shell.color(ShellColor::Selected))
+                        .hover(|this| {
+                            this.bg(self.shell.color(if selected {
+                                ShellColor::Selected
+                            } else {
+                                ShellColor::Hover
+                            }))
                         })
-                        .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
                         .on_click(cx.listener(move |view, _event, window, cx| {
                             view.select_tab(tab_id, window, cx)
                         }))
-                        .child(
-                            self.shell
-                                .icon(
-                                    ShellIcon::AppMark,
-                                    self.shell.color(if selected {
-                                        ShellColor::Accent
-                                    } else {
-                                        ShellColor::FaintText
-                                    }),
-                                )
-                                .size(px(11.)),
-                        )
+                        .child(self.shell.icon(
+                            ShellIcon::AppMark,
+                            self.shell.color(if selected {
+                                ShellColor::Accent
+                            } else {
+                                ShellColor::FaintText
+                            }),
+                            11.,
+                        ))
                         .child(div().flex_1().min_w_0().truncate().child(tab.name.clone()))
                         .child(close_button),
                 );
@@ -1183,9 +1439,88 @@ impl MultiplexerView {
                 .on_click(
                     cx.listener(|view, _event, _window, cx| view.toggle_move_focused_pane(cx)),
                 ),
+            )
+            .child(
+                self.chrome_tile("open-settings", ShellIcon::Settings, false, false)
+                    .on_click(
+                        cx.listener(|view, _event, window, cx| view.toggle_settings(window, cx)),
+                    ),
             );
 
         div()
+            .relative()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(WorkspaceShell::TITLE_BAR_HEIGHT))
+            .w_full()
+            .flex_none()
+            .bg(self.selected_terminal_background())
+            .child(sidebar_chrome)
+            .child(tabs)
+            .child(self.render_titlebar_drag_region("main-titlebar-drag-region", cx))
+            .child(pane_controls)
+            .children(self.render_window_controls(window))
+            .into_any_element()
+    }
+
+    fn render_settings_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let sidebar_chrome = div()
+            .flex()
+            .items_center()
+            .w(px(WorkspaceShell::SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .border_r_1()
+            .border_color(self.shell.color(ShellColor::Border))
+            .bg(self.shell.opaque_color(ShellColor::Sidebar))
+            .px_2()
+            .when(cfg!(target_os = "macos"), |this| this.pl(px(78.)))
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(WorkspaceShell::CHROME_TILE_SIZE))
+                        .child(self.shell.icon(
+                            ShellIcon::Settings,
+                            self.shell.color(ShellColor::Accent),
+                            WorkspaceShell::CHROME_ICON_SIZE,
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .pl_1()
+                    .text_size(px(13.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(self.shell.color(ShellColor::Text))
+                    .child("Settings"),
+            )
+            .child(self.render_titlebar_drag_region("settings-sidebar-titlebar-drag", cx));
+
+        let done = div()
+            .id("settings-done")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.))
+            .px_3()
+            .mr_1()
+            .rounded_lg()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(self.shell.color(ShellColor::Accent))
+            .bg(self.shell.color(ShellColor::AccentMuted))
+            .hover(|this| this.bg(self.shell.color(ShellColor::Selected)))
+            .on_click(cx.listener(|view, _event, window, cx| view.toggle_settings(window, cx)))
+            .child("Done");
+
+        div()
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -1193,14 +1528,622 @@ impl MultiplexerView {
             .w_full()
             .flex_none()
             .bg(self.shell.color(ShellColor::Chrome))
-            .border_b_1()
-            .border_color(self.shell.color(ShellColor::Border))
             .child(sidebar_chrome)
-            .child(tabs)
-            .child(self.render_titlebar_drag_region("main-titlebar-drag-region", cx))
-            .child(pane_controls)
+            .child(self.render_titlebar_drag_region("settings-main-titlebar-drag", cx))
+            .child(done)
             .children(self.render_window_controls(window))
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(1.))
+                    .bg(self.shell.color(ShellColor::Border)),
+            )
             .into_any_element()
+    }
+
+    fn render_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut navigation = div()
+            .flex()
+            .flex_col()
+            .w(px(WorkspaceShell::SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_3()
+            .bg(self.shell.opaque_color(ShellColor::Sidebar))
+            .border_r_1()
+            .border_color(self.shell.opaque_color(ShellColor::Border))
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                    .child("PREFERENCES"),
+            );
+        for (index, section) in SettingsSection::ALL.into_iter().enumerate() {
+            let selected = self.settings_section == section;
+            navigation = navigation.child(
+                div()
+                    .id(("settings-section", index))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if selected {
+                        self.shell.opaque_color(ShellColor::SelectedBorder)
+                    } else {
+                        self.shell.opaque_color(ShellColor::Sidebar)
+                    })
+                    .when(selected, |this| {
+                        this.bg(self.shell.opaque_color(ShellColor::Selected))
+                    })
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::Hover)))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.settings_section = section;
+                        view.recording_binding = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(if selected {
+                                gpui::FontWeight::SEMIBOLD
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .text_color(self.shell.opaque_color(if selected {
+                                ShellColor::Text
+                            } else {
+                                ShellColor::MutedText
+                            }))
+                            .child(section.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                            .child(section.description()),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .min_h_0()
+            .bg(self.shell.opaque_color(ShellColor::Window))
+            .child(navigation)
+            .child(
+                div()
+                    .id("settings-content-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(820.))
+                            .mx_auto()
+                            .px(px(36.))
+                            .py(px(30.))
+                            .child(match self.settings_section {
+                                SettingsSection::Appearance => self.render_appearance_settings(cx),
+                                SettingsSection::Terminal => self.render_terminal_settings(cx),
+                                SettingsSection::Keybindings => self.render_keybinding_settings(cx),
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_settings_heading(
+        &self,
+        title: &'static str,
+        description: &'static str,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pb_4()
+            .child(
+                div()
+                    .text_size(px(24.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(self.shell.opaque_color(ShellColor::Text))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(self.shell.opaque_color(ShellColor::MutedText))
+                    .child(description),
+            )
+            .into_any_element()
+    }
+
+    fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut themes = div().flex().flex_row().flex_wrap().gap_2();
+        for (index, theme) in ThemePreset::ALL.into_iter().enumerate() {
+            let selected = self.settings.theme == theme;
+            let preview = WorkspaceShell::from_preferences(theme, 1.);
+            themes = themes.child(
+                div()
+                    .id(("theme-preset", index))
+                    .flex()
+                    .flex_col()
+                    .w(px(220.))
+                    .min_h(px(116.))
+                    .p_3()
+                    .gap_2()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(self.shell.opaque_color(if selected {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::Border
+                    }))
+                    .bg(self.shell.opaque_color(if selected {
+                        ShellColor::Selected
+                    } else {
+                        ShellColor::Chrome
+                    }))
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::Hover)))
+                    .on_click(cx.listener(move |view, _event, window, cx| {
+                        view.set_theme(theme, window, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .size(px(18.))
+                                    .rounded_md()
+                                    .bg(preview.opaque_color(ShellColor::Window)),
+                            )
+                            .child(
+                                div()
+                                    .size(px(18.))
+                                    .rounded_md()
+                                    .bg(preview.opaque_color(ShellColor::Sidebar)),
+                            )
+                            .child(
+                                div()
+                                    .size(px(18.))
+                                    .rounded_md()
+                                    .bg(preview.opaque_color(ShellColor::Accent)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(self.shell.opaque_color(ShellColor::Text))
+                            .child(theme.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                            .child(theme.description()),
+                    ),
+            );
+        }
+
+        let mut opacity_choices = div().flex().flex_row().flex_wrap().gap_2();
+        for (index, opacity) in [0.55_f32, 0.65, 0.75, 0.85, 1.].into_iter().enumerate() {
+            let selected = (self.settings.background_opacity - opacity).abs() < 0.001;
+            opacity_choices = opacity_choices.child(
+                div()
+                    .id(("opacity-choice", index))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(34.))
+                    .min_w(px(60.))
+                    .px_3()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(self.shell.opaque_color(if selected {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::Border
+                    }))
+                    .bg(self.shell.opaque_color(if selected {
+                        ShellColor::AccentMuted
+                    } else {
+                        ShellColor::Chrome
+                    }))
+                    .text_size(px(12.))
+                    .font_weight(if selected {
+                        gpui::FontWeight::SEMIBOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .text_color(self.shell.opaque_color(if selected {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::MutedText
+                    }))
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::Hover)))
+                    .on_click(cx.listener(move |view, _event, window, cx| {
+                        view.set_opacity(opacity, window, cx)
+                    }))
+                    .child(format!("{}%", (opacity * 100.).round() as u32)),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.render_settings_heading(
+                "Appearance",
+                "Choose the atmosphere of the shell without changing terminal colors.",
+            ))
+            .child(self.settings_group("Theme", "Applied immediately across the window", themes))
+            .child(self.settings_group(
+                "Background material",
+                "Lower values show more of the desktop material through the shell",
+                opacity_choices,
+            ))
+            .into_any_element()
+    }
+
+    fn render_terminal_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current_family = self.terminal_font.family.to_string();
+        let font_size = self.settings.font_size;
+        let size_control =
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(self.shell.opaque_color(ShellColor::Text))
+                                .child("Font size"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                                .child("Terminal cells resize with the rendered viewport"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.settings_step_button("font-size-down", "−").on_click(
+                            cx.listener(|view, _event, _window, cx| {
+                                let size = (view.settings.font_size - 1.).max(MIN_FONT_SIZE);
+                                view.update_terminal_font(
+                                    view.settings.font_family.clone(),
+                                    size,
+                                    cx,
+                                );
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(54.))
+                                .h(px(32.))
+                                .rounded_lg()
+                                .bg(self.shell.opaque_color(ShellColor::Selected))
+                                .text_size(px(12.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(self.shell.opaque_color(ShellColor::Text))
+                                .child(format!("{} px", font_size.round() as u32)),
+                        )
+                        .child(self.settings_step_button("font-size-up", "+").on_click(
+                            cx.listener(|view, _event, _window, cx| {
+                                let size = (view.settings.font_size + 1.).min(MAX_FONT_SIZE);
+                                view.update_terminal_font(
+                                    view.settings.font_family.clone(),
+                                    size,
+                                    cx,
+                                );
+                            }),
+                        )),
+                );
+
+        let mut font_choices = div().flex().flex_row().flex_wrap().gap_2();
+        for (index, family) in self.available_fonts.iter().cloned().enumerate() {
+            let selected = family.eq_ignore_ascii_case(&current_family);
+            let displayed_family = family.clone();
+            font_choices = font_choices.child(
+                div()
+                    .id(("terminal-font", index))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .w(px(220.))
+                    .h(px(46.))
+                    .px_3()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(self.shell.opaque_color(if selected {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::Border
+                    }))
+                    .bg(self.shell.opaque_color(if selected {
+                        ShellColor::Selected
+                    } else {
+                        ShellColor::Chrome
+                    }))
+                    .text_color(self.shell.opaque_color(if selected {
+                        ShellColor::Text
+                    } else {
+                        ShellColor::MutedText
+                    }))
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::Hover)))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.update_terminal_font(
+                            Some(displayed_family.clone()),
+                            view.settings.font_size,
+                            cx,
+                        );
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .child(family.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(family)
+                            .text_size(px(13.))
+                            .child("Aa 01"),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.render_settings_heading(
+                "Terminal",
+                "Use any installed fixed-pitch font; terminal content remains the source of its own colors.",
+            ))
+            .child(self.settings_group("Text", "Changes apply to every visible pane", size_control))
+            .child(self.settings_group(
+                "Font family",
+                "Only fonts that measure as fixed-pitch are shown",
+                font_choices,
+            ))
+            .into_any_element()
+    }
+
+    fn render_keybinding_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.shell.opaque_color(ShellColor::Border))
+            .overflow_hidden();
+        for (index, action) in KeybindAction::ALL.into_iter().enumerate() {
+            let recording = self.recording_binding == Some(action);
+            let custom = self.settings.keybindings.custom(action).is_some();
+            let shortcut = self.settings.keybindings.get(action);
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .min_h(px(64.))
+                    .px_4()
+                    .py_2()
+                    .bg(self.shell.opaque_color(ShellColor::Chrome))
+                    .when(index > 0, |this| {
+                        this.border_t_1()
+                            .border_color(self.shell.opaque_color(ShellColor::Border))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(self.shell.opaque_color(ShellColor::Text))
+                                    .child(action.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                                    .child(action.description()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(custom, |this| {
+                                this.child(
+                                    div()
+                                        .id(("reset-keybind", index))
+                                        .cursor_pointer()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_size(px(11.))
+                                        .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                                        .hover(|this| {
+                                            this.bg(self.shell.opaque_color(ShellColor::Hover))
+                                                .text_color(
+                                                    self.shell.opaque_color(ShellColor::Text),
+                                                )
+                                        })
+                                        .on_click(cx.listener(move |view, _event, _window, cx| {
+                                            view.reset_keybinding(action, cx);
+                                        }))
+                                        .child("Reset"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("record-keybind", index))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .min_w(px(126.))
+                                    .h(px(32.))
+                                    .px_3()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(self.shell.opaque_color(if recording {
+                                        ShellColor::Accent
+                                    } else {
+                                        ShellColor::SelectedBorder
+                                    }))
+                                    .bg(self.shell.opaque_color(if recording {
+                                        ShellColor::AccentMuted
+                                    } else {
+                                        ShellColor::Selected
+                                    }))
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(self.shell.opaque_color(if recording {
+                                        ShellColor::Accent
+                                    } else {
+                                        ShellColor::Text
+                                    }))
+                                    .hover(|this| {
+                                        this.bg(self.shell.opaque_color(ShellColor::Hover))
+                                    })
+                                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                                        view.recording_binding = Some(action);
+                                        view.global_error = None;
+                                        cx.notify();
+                                    }))
+                                    .child(if recording {
+                                        "Press shortcut…".to_owned()
+                                    } else {
+                                        shortcut.display()
+                                    }),
+                            ),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.render_settings_heading(
+                "Keybindings",
+                "Click a shortcut, then press the replacement chord.",
+            ))
+            .child(rows)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                    .child("Escape cancels recording. Backspace restores the default shortcut."),
+            )
+            .into_any_element()
+    }
+
+    fn settings_group(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        content: impl IntoElement,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.shell.opaque_color(ShellColor::Border))
+            .bg(self.shell.opaque_color(ShellColor::Chrome))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(self.shell.opaque_color(ShellColor::Text))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                            .child(description),
+                    ),
+            )
+            .child(content)
+            .into_any_element()
+    }
+
+    fn settings_step_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(32.))
+            .rounded_lg()
+            .cursor_pointer()
+            .border_1()
+            .border_color(self.shell.opaque_color(ShellColor::Border))
+            .bg(self.shell.opaque_color(ShellColor::Chrome))
+            .text_size(px(16.))
+            .text_color(self.shell.opaque_color(ShellColor::MutedText))
+            .hover(|this| {
+                this.bg(self.shell.opaque_color(ShellColor::Hover))
+                    .text_color(self.shell.opaque_color(ShellColor::Text))
+            })
+            .child(label)
     }
 
     fn render_selected_layout(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1317,7 +2260,10 @@ impl MultiplexerView {
     ) -> AnyElement {
         let pane_id = pane.id;
         let terminal_session_id = pane.terminal_session_id;
-        let focused = self.selection.pane_id == Some(pane_id);
+        let focused = self.selection.pane_id == Some(pane_id)
+            && self
+                .selected_tab()
+                .is_some_and(|tab| matches!(&tab.layout, PaneLayout::Split(_)));
         let Some(snapshot) = self.terminals.get(&terminal_session_id) else {
             return div()
                 .id(("pane", pane_id.as_u64()))
@@ -1428,11 +2374,9 @@ impl MultiplexerView {
             .min_h_0()
             .overflow_hidden()
             .bg(default_bg)
-            .border_1()
-            .border_color(if focused {
-                self.shell.color(ShellColor::Accent)
-            } else {
-                default_bg
+            .when(focused, |this| {
+                this.border_1()
+                    .border_color(self.shell.color(ShellColor::Accent))
             })
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
@@ -1482,7 +2426,9 @@ fn accept_terminal_snapshot(
 
 impl Render for MultiplexerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.resize_visible_terminals(window.viewport_size());
+        if !self.settings_open {
+            self.resize_visible_terminals(window.viewport_size());
+        }
         div()
             .id("multiplexer")
             .track_focus(&self.focus)
@@ -1527,15 +2473,23 @@ impl Render for MultiplexerView {
             .size_full()
             .overflow_hidden()
             .bg(self.shell.root_color())
-            .child(self.render_title_bar(window, cx))
-            .child(
+            .child(if self.settings_open {
+                self.render_settings_title_bar(window, cx)
+            } else {
+                self.render_title_bar(window, cx)
+            })
+            .child(if self.settings_open {
+                self.render_settings_page(cx)
+            } else {
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.render_sidebar(cx))
+                    .when(!self.sidebar_collapsed, |this| {
+                        this.child(self.render_sidebar(cx))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -1543,8 +2497,9 @@ impl Render for MultiplexerView {
                             .min_w_0()
                             .w_full()
                             .child(self.render_selected_layout(cx)),
-                    ),
-            )
+                    )
+                    .into_any_element()
+            })
             .when_some(self.global_error.clone(), |this, error| {
                 this.child(
                     div()
@@ -1819,17 +2774,7 @@ fn terminal_paste_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform)
     }
 }
 
-fn pane_close_shortcut(key: &Keystroke) -> bool {
-    #[cfg(target_os = "macos")]
-    let platform = PasteShortcutPlatform::MacOs;
-    #[cfg(target_os = "linux")]
-    let platform = PasteShortcutPlatform::Linux;
-    #[cfg(target_os = "windows")]
-    let platform = PasteShortcutPlatform::Windows;
-
-    pane_close_shortcut_for(key, platform)
-}
-
+#[cfg(test)]
 fn pane_close_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> bool {
     if !key.key.eq_ignore_ascii_case("w") || key.modifiers.alt || key.modifiers.function {
         return false;
@@ -1843,6 +2788,29 @@ fn pane_close_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> 
             key.modifiers.control && key.modifiers.shift && !key.modifiers.platform
         }
     }
+}
+
+fn shortcut_matches(shortcut: &Shortcut, key: &Keystroke) -> bool {
+    shortcut.key.eq_ignore_ascii_case(&key.key)
+        && shortcut.control == key.modifiers.control
+        && shortcut.alt == key.modifiers.alt
+        && shortcut.shift == key.modifiers.shift
+        && shortcut.platform == key.modifiers.platform
+        && !key.modifiers.function
+}
+
+fn shortcut_from_keystroke(key: &Keystroke) -> Option<Shortcut> {
+    if key.modifiers.function {
+        return None;
+    }
+    let shortcut = Shortcut {
+        key: key.key.to_string(),
+        control: key.modifiers.control,
+        alt: key.modifiers.alt,
+        shift: key.modifiers.shift,
+        platform: key.modifiers.platform,
+    };
+    shortcut.is_usable().then_some(shortcut)
 }
 
 fn terminal_sessions_for_target(
