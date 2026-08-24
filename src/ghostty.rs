@@ -284,8 +284,10 @@ pub fn snapshot_text(snapshot: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::Terminal;
+    #[cfg(feature = "gui")]
     use crate::terminal_theme::ThemePreset;
 
+    #[cfg(feature = "gui")]
     #[test]
     fn terminal_theme_updates_ghostty_defaults_and_ansi_palette() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");

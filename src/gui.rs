@@ -2800,22 +2800,17 @@ fn shortcut_matches(shortcut: &Shortcut, key: &Keystroke) -> bool {
 }
 
 fn shortcut_from_keystroke(key: &Keystroke) -> Option<Shortcut> {
-    if key.key.trim().is_empty()
-        || key.modifiers.function
-        || matches!(
-            key.key.to_ascii_lowercase().as_str(),
-            "control" | "shift" | "alt" | "command" | "super" | "fn"
-        )
-    {
+    if key.modifiers.function {
         return None;
     }
-    Some(Shortcut {
+    let shortcut = Shortcut {
         key: key.key.to_string(),
         control: key.modifiers.control,
         alt: key.modifiers.alt,
         shift: key.modifiers.shift,
         platform: key.modifiers.platform,
-    })
+    };
+    shortcut.is_usable().then_some(shortcut)
 }
 
 fn terminal_sessions_for_target(

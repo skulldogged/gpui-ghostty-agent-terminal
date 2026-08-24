@@ -70,6 +70,14 @@ pub(crate) struct Shortcut {
 }
 
 impl Shortcut {
+    pub(crate) fn is_usable(&self) -> bool {
+        !self.key.trim().is_empty()
+            && !matches!(
+                self.key.to_ascii_lowercase().as_str(),
+                "control" | "shift" | "alt" | "command" | "super" | "fn"
+            )
+    }
+
     pub(crate) fn display(&self) -> String {
         let mut parts = Vec::with_capacity(5);
         if self.control {
@@ -279,6 +287,15 @@ impl AppSettings {
         {
             self.font_family = None;
         }
+        for action in KeybindAction::ALL {
+            if self
+                .keybindings
+                .custom(action)
+                .is_some_and(|shortcut| !shortcut.is_usable())
+            {
+                self.keybindings.set(action, None);
+            }
+        }
     }
 }
 
@@ -413,6 +430,37 @@ mod tests {
         assert_eq!(settings.font_size, MAX_FONT_SIZE);
         assert_eq!(parse_opacity("0"), Some(MIN_OPACITY));
         assert_eq!(parse_opacity("NaN"), None);
+    }
+
+    #[test]
+    fn unusable_persisted_shortcuts_are_reset_to_defaults() {
+        let mut settings: AppSettings = serde_json::from_str(
+            r#"{"keybindings":{"open_settings":{"key":""},"create_tab":{"key":"control"}}}"#,
+        )
+        .unwrap();
+
+        settings.sanitize();
+
+        assert_eq!(
+            settings.keybindings.get(KeybindAction::OpenSettings),
+            default_shortcut(KeybindAction::OpenSettings)
+        );
+        assert_eq!(
+            settings.keybindings.get(KeybindAction::CreateTab),
+            default_shortcut(KeybindAction::CreateTab)
+        );
+        assert!(
+            settings
+                .keybindings
+                .custom(KeybindAction::OpenSettings)
+                .is_none()
+        );
+        assert!(
+            settings
+                .keybindings
+                .custom(KeybindAction::CreateTab)
+                .is_none()
+        );
     }
 
     #[test]
