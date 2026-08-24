@@ -404,14 +404,9 @@ impl MultiplexerView {
                 self.recording_binding = None;
                 cx.notify();
             } else if event.keystroke.key.eq_ignore_ascii_case("backspace") {
-                self.settings.keybindings.set(action, None);
-                self.recording_binding = None;
-                self.save_settings(cx);
+                self.reset_keybinding(action, cx);
             } else if let Some(shortcut) = shortcut_from_keystroke(&event.keystroke) {
-                let conflict = KeybindAction::ALL.into_iter().find(|candidate| {
-                    *candidate != action && self.settings.keybindings.get(*candidate) == shortcut
-                });
-                if let Some(conflict) = conflict {
+                if let Some(conflict) = self.settings.keybindings.conflict_for(action, &shortcut) {
                     self.global_error = Some(format!(
                         "{} is already assigned to {}",
                         shortcut.display(),
@@ -468,6 +463,23 @@ impl MultiplexerView {
             }
             cx.stop_propagation();
         }
+    }
+
+    fn reset_keybinding(&mut self, action: KeybindAction, cx: &mut Context<Self>) {
+        let default = crate::settings::default_shortcut(action);
+        if let Some(conflict) = self.settings.keybindings.conflict_for(action, &default) {
+            self.global_error = Some(format!(
+                "{} is already assigned to {}; change that shortcut before resetting {}",
+                default.display(),
+                conflict.label(),
+                action.label()
+            ));
+            cx.notify();
+            return;
+        }
+        self.settings.keybindings.set(action, None);
+        self.recording_binding = None;
+        self.save_settings(cx);
     }
 
     fn perform_keybind_action(
@@ -2001,9 +2013,7 @@ impl MultiplexerView {
                                                 )
                                         })
                                         .on_click(cx.listener(move |view, _event, _window, cx| {
-                                            view.settings.keybindings.set(action, None);
-                                            view.recording_binding = None;
-                                            view.save_settings(cx);
+                                            view.reset_keybinding(action, cx);
                                         }))
                                         .child("Reset"),
                                 )

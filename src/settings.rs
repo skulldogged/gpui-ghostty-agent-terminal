@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 pub(crate) use crate::terminal_theme::ThemePreset;
 
@@ -147,6 +151,16 @@ impl KeybindingSettings {
             KeybindAction::SplitHorizontal => &mut self.split_horizontal,
             KeybindAction::SplitVertical => &mut self.split_vertical,
         } = shortcut;
+    }
+
+    pub(crate) fn conflict_for(
+        &self,
+        action: KeybindAction,
+        shortcut: &Shortcut,
+    ) -> Option<KeybindAction> {
+        KeybindAction::ALL
+            .into_iter()
+            .find(|candidate| *candidate != action && self.get(*candidate) == *shortcut)
     }
 }
 
@@ -330,15 +344,45 @@ fn settings_path() -> Option<PathBuf> {
     }
 }
 
-fn replace_file(temporary: &PathBuf, destination: &PathBuf) -> std::io::Result<()> {
-    match fs::rename(temporary, destination) {
-        Ok(()) => Ok(()),
-        Err(first_error) if destination.exists() => {
-            fs::remove_file(destination)?;
-            fs::rename(temporary, destination).map_err(|_| first_error)
-        }
-        Err(error) => Err(error),
+#[cfg(windows)]
+fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+
+    if !destination.exists() {
+        return fs::rename(temporary, destination);
     }
+
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            temporary.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
 }
 
 #[cfg(test)]
@@ -388,5 +432,47 @@ mod tests {
             keybindings.get(KeybindAction::CreateTab),
             default_shortcut(KeybindAction::CreateTab)
         );
+    }
+
+    #[test]
+    fn resetting_reports_a_conflict_with_the_default_shortcut() {
+        let mut keybindings = KeybindingSettings::default();
+        let create_tab_default = default_shortcut(KeybindAction::CreateTab);
+        keybindings.set(
+            KeybindAction::CreateTab,
+            Some(Shortcut {
+                key: "k".to_owned(),
+                ..create_tab_default.clone()
+            }),
+        );
+        keybindings.set(
+            KeybindAction::OpenSettings,
+            Some(create_tab_default.clone()),
+        );
+
+        assert_eq!(
+            keybindings.conflict_for(KeybindAction::CreateTab, &create_tab_default),
+            Some(KeybindAction::OpenSettings)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacing_an_existing_settings_file_installs_the_complete_new_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-terminal-settings-replace-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("settings.json");
+        let temporary = directory.join("settings.json.tmp");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&temporary, b"new").unwrap();
+
+        replace_file(&temporary, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }
