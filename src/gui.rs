@@ -1,17 +1,17 @@
 use crate::{
-    CoreClient, CoreCommand, CoreSnapshot, CreatedResource, PaneId, PaneLayout, SpaceId, SplitAxis,
-    SplitId, SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId, TerminalSize,
-    TerminalSnapshot,
-    core_driver::{CoreDriver, CoreProjection, DriverUpdate},
+    ApplicationCore, CoreCommand, CoreSnapshot, CreatedResource, PaneId, PaneLayout, SpaceId,
+    SplitAxis, SplitId, SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId,
+    TerminalSize, TerminalSnapshot,
+    core_driver::{CoreDriver, DriverUpdate},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
     ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations, FocusHandle, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, Render, ShapedLine,
-    SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill, font, point,
-    prelude::*, px, rgb, size,
+    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel,
+    Render, ShapedLine, SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill,
+    font, point, prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -21,10 +21,9 @@ const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
 pub(crate) fn open_terminal_window(
     cx: &mut App,
-    endpoint: &crate::CoreEndpoint,
+    core: ApplicationCore,
 ) -> Result<AnyWindowHandle, String> {
     let terminal_font = TerminalFont::resolve(cx)?;
-    let core = CoreClient::connect_or_spawn_at(endpoint)?;
     let (driver, projection) = CoreDriver::start(core)?;
     let shell = WorkspaceShell::from_environment();
     let selection = UiSelection::initial(&projection.hierarchy);
@@ -110,6 +109,23 @@ struct SplitGeometry {
     axis: SplitAxis,
     start: f32,
     length: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTarget {
+    Space(SpaceId),
+    Tab(TabId),
+    Pane(PaneId),
+}
+
+impl CloseTarget {
+    fn command(self) -> CoreCommand {
+        match self {
+            Self::Space(space_id) => CoreCommand::CloseSpace { space_id },
+            Self::Tab(tab_id) => CoreCommand::CloseTab { tab_id },
+            Self::Pane(pane_id) => CoreCommand::ClosePane { pane_id },
+        }
+    }
 }
 
 impl UiSelection {
@@ -255,7 +271,6 @@ impl MultiplexerView {
 
     fn accept_driver_update(&mut self, update: DriverUpdate) {
         match update {
-            DriverUpdate::Projection(projection) => self.replace_projection(projection),
             DriverUpdate::Hierarchy(hierarchy) => {
                 self.hierarchy = hierarchy;
                 self.retain_live_terminals();
@@ -314,26 +329,6 @@ impl MultiplexerView {
         }
     }
 
-    fn replace_projection(&mut self, projection: CoreProjection) {
-        self.hierarchy = projection.hierarchy;
-        self.terminals = projection.terminals;
-        self.terminal_errors = self
-            .terminals
-            .iter()
-            .filter_map(|(&terminal_session_id, snapshot)| {
-                lifecycle_message(&snapshot.lifecycle).map(|message| (terminal_session_id, message))
-            })
-            .collect();
-        self.requested_sizes.clear();
-        self.selection = self.selection.normalized(&self.hierarchy);
-        self.move_source = None;
-        self.selections_after_commands.clear();
-        self.split_geometries.clear();
-        self.split_dragging = None;
-        self.preview_split_ratios.clear();
-        self.pending_split_resizes.clear();
-    }
-
     fn retain_live_terminals(&mut self) {
         let terminal_ids = self
             .hierarchy
@@ -349,7 +344,14 @@ impl MultiplexerView {
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if pane_close_shortcut(&event.keystroke) {
+            if let Some(pane_id) = self.selection.pane_id {
+                self.close_target(CloseTarget::Pane(pane_id), window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         let Some(terminal_session_id) = self.focused_terminal_session_id() else {
             return;
         };
@@ -514,6 +516,80 @@ impl MultiplexerView {
         self.move_source = None;
     }
 
+    fn close_target(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.close_target_exists(target) {
+            return;
+        }
+        let active_sessions = self.active_session_count(target);
+        if active_sessions > 0 {
+            let noun = if active_sessions == 1 {
+                "session"
+            } else {
+                "sessions"
+            };
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "Close active terminal work?",
+                Some(&format!(
+                    "{active_sessions} terminal {noun} appear to be busy. Closing will stop the running work."
+                )),
+                &[
+                    PromptButton::ok("Close anyway"),
+                    PromptButton::cancel("Keep open"),
+                ],
+                cx,
+            );
+            cx.spawn(async move |this, cx| {
+                if answer.await.ok() == Some(0)
+                    && let Some(this) = this.upgrade()
+                {
+                    this.update(cx, move |view, cx| {
+                        if view.close_target_exists(target) {
+                            view.cancel_move();
+                            view.submit_core_command(target.command(), cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
+        self.cancel_move();
+        self.submit_core_command(target.command(), cx);
+    }
+
+    fn active_session_count(&self, target: CloseTarget) -> usize {
+        terminal_sessions_for_target(&self.hierarchy, target)
+            .into_iter()
+            .filter(|terminal_session_id| {
+                self.terminals
+                    .get(terminal_session_id)
+                    .is_none_or(|snapshot| snapshot.active_work)
+            })
+            .count()
+    }
+
+    fn close_target_exists(&self, target: CloseTarget) -> bool {
+        match target {
+            CloseTarget::Space(space_id) => self
+                .hierarchy
+                .spaces
+                .iter()
+                .any(|space| space.id == space_id),
+            CloseTarget::Tab(tab_id) => self
+                .hierarchy
+                .spaces
+                .iter()
+                .any(|space| space.tabs.iter().any(|tab| tab.id == tab_id)),
+            CloseTarget::Pane(pane_id) => self
+                .hierarchy
+                .spaces
+                .iter()
+                .flat_map(|space| &space.tabs)
+                .any(|tab| layout_contains_pane(&tab.layout, pane_id)),
+        }
+    }
+
     fn resize_visible_terminals(&mut self, viewport: gpui::Size<Pixels>) {
         let Some(layout) = self.selected_tab().map(|tab| tab.layout.clone()) else {
             return;
@@ -634,6 +710,7 @@ impl MultiplexerView {
         for space in &self.hierarchy.spaces {
             let space_id = space.id;
             let selected = self.selection.space_id == Some(space_id);
+            let hover_group: SharedString = format!("space-hover-{}", space_id.as_u64()).into();
             let initial = space
                 .name
                 .chars()
@@ -646,9 +723,35 @@ impl MultiplexerView {
                 "{tab_count} {tab_label}  ·  {}",
                 space.directory.to_string_lossy()
             );
+            let close_button = div()
+                .id(("close-space", space_id.as_u64()))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(18.))
+                .rounded_md()
+                .cursor_pointer()
+                .opacity(0.)
+                .group_hover(hover_group.clone(), |this| this.opacity(1.))
+                .hover(|this| this.bg(self.shell.color(ShellColor::DangerHover)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(move |view, _event, _window, cx| {
+                    cx.stop_propagation();
+                    view.close_target(CloseTarget::Space(space_id), _window, cx);
+                }))
+                .child(
+                    self.shell
+                        .icon(ShellIcon::Close, self.shell.color(ShellColor::MutedText))
+                        .size(px(10.)),
+                );
             sidebar = sidebar.child(
                 div()
                     .id(("space", space_id.as_u64()))
+                    .group(hover_group)
                     .cursor_pointer()
                     .flex()
                     .items_center()
@@ -718,7 +821,8 @@ impl MultiplexerView {
                                     .text_color(self.shell.color(ShellColor::FaintText))
                                     .child(metadata),
                             ),
-                    ),
+                    )
+                    .child(close_button),
             );
         }
         sidebar
@@ -973,16 +1077,43 @@ impl MultiplexerView {
             for tab in &space.tabs {
                 let tab_id = tab.id;
                 let selected = self.selection.tab_id == Some(tab_id);
+                let hover_group: SharedString = format!("tab-hover-{}", tab_id.as_u64()).into();
+                let close_button = div()
+                    .id(("close-tab", tab_id.as_u64()))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(18.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .opacity(0.)
+                    .group_hover(hover_group.clone(), |this| this.opacity(1.))
+                    .hover(|this| this.bg(self.shell.color(ShellColor::DangerHover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
+                    )
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        cx.stop_propagation();
+                        view.close_target(CloseTarget::Tab(tab_id), _window, cx);
+                    }))
+                    .child(
+                        self.shell
+                            .icon(ShellIcon::Close, self.shell.color(ShellColor::MutedText))
+                            .size(px(10.)),
+                    );
                 tabs = tabs.child(
                     div()
                         .id(("tab", tab_id.as_u64()))
+                        .group(hover_group)
                         .cursor_pointer()
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .h(px(WorkspaceShell::TAB_HEIGHT))
                         .max_w(px(180.))
-                        .px_3()
+                        .px_2()
                         .rounded_lg()
                         .border_1()
                         .border_color(if selected {
@@ -1015,7 +1146,8 @@ impl MultiplexerView {
                                 )
                                 .size(px(11.)),
                         )
-                        .child(div().truncate().child(tab.name.clone())),
+                        .child(div().flex_1().min_w_0().truncate().child(tab.name.clone()))
+                        .child(close_button),
                 );
             }
             tabs = tabs.child(
@@ -1354,7 +1486,7 @@ impl Render for MultiplexerView {
         div()
             .id("multiplexer")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|view, event, _window, cx| view.on_key_down(event, cx)))
+            .on_key_down(cx.listener(|view, event, window, cx| view.on_key_down(event, window, cx)))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 if view.sidebar_dragging {
                     let viewport = window.viewport_size().width.as_f32();
@@ -1687,6 +1819,71 @@ fn terminal_paste_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform)
     }
 }
 
+fn pane_close_shortcut(key: &Keystroke) -> bool {
+    #[cfg(target_os = "macos")]
+    let platform = PasteShortcutPlatform::MacOs;
+    #[cfg(target_os = "linux")]
+    let platform = PasteShortcutPlatform::Linux;
+    #[cfg(target_os = "windows")]
+    let platform = PasteShortcutPlatform::Windows;
+
+    pane_close_shortcut_for(key, platform)
+}
+
+fn pane_close_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> bool {
+    if !key.key.eq_ignore_ascii_case("w") || key.modifiers.alt || key.modifiers.function {
+        return false;
+    }
+
+    match platform {
+        PasteShortcutPlatform::MacOs => {
+            key.modifiers.platform && key.modifiers.shift && !key.modifiers.control
+        }
+        PasteShortcutPlatform::Linux | PasteShortcutPlatform::Windows => {
+            key.modifiers.control && key.modifiers.shift && !key.modifiers.platform
+        }
+    }
+}
+
+fn terminal_sessions_for_target(
+    hierarchy: &CoreSnapshot,
+    target: CloseTarget,
+) -> Vec<TerminalSessionId> {
+    let layouts = hierarchy.spaces.iter().flat_map(|space| {
+        space
+            .tabs
+            .iter()
+            .filter(move |tab| match target {
+                CloseTarget::Space(space_id) => space.id == space_id,
+                CloseTarget::Tab(tab_id) => tab.id == tab_id,
+                CloseTarget::Pane(_) => true,
+            })
+            .map(|tab| &tab.layout)
+    });
+    match target {
+        CloseTarget::Pane(pane_id) => layouts
+            .filter_map(|layout| terminal_for_pane(layout, pane_id))
+            .collect(),
+        CloseTarget::Space(_) | CloseTarget::Tab(_) => {
+            let mut terminal_sessions = Vec::new();
+            for layout in layouts {
+                collect_terminal_sessions(layout, &mut terminal_sessions);
+            }
+            terminal_sessions
+        }
+    }
+}
+
+fn collect_terminal_sessions(layout: &PaneLayout, output: &mut Vec<TerminalSessionId>) {
+    match layout {
+        PaneLayout::Pane(pane) => output.push(pane.terminal_session_id),
+        PaneLayout::Split(split) => {
+            collect_terminal_sessions(&split.first, output);
+            collect_terminal_sessions(&split.second, output);
+        }
+    }
+}
+
 fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
     if key.modifiers.control && key.key.len() == 1 {
         let byte = key.key.as_bytes()[0].to_ascii_uppercase();
@@ -1794,8 +1991,9 @@ fn windows_caption_font() -> &'static str {
 mod tests {
     use super::{
         PasteShortcutPlatform, SplitGeometry, UiSelection, accept_terminal_snapshot, first_pane_id,
-        pane_extents, selection_for_created, selection_for_pane, split_ratio_at,
-        terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
+        pane_close_shortcut_for, pane_extents, selection_for_created, selection_for_pane,
+        split_ratio_at, terminal_input_bytes, terminal_paste_shortcut_for,
+        windows_caption_font_for_build,
     };
     use crate::{
         CoreCommand, CoreModel, CreatedResource, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
@@ -1855,6 +2053,46 @@ mod tests {
         assert!(!terminal_paste_shortcut_for(
             &control_v,
             PasteShortcutPlatform::Linux
+        ));
+    }
+
+    #[test]
+    fn pane_close_shortcut_is_deliberate_on_every_desktop() {
+        let key = |modifiers| Keystroke {
+            key: "w".into(),
+            key_char: None,
+            modifiers,
+        };
+        let command_shift_w = key(Modifiers {
+            platform: true,
+            shift: true,
+            ..Default::default()
+        });
+        let control_shift_w = key(Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        });
+        let control_w = key(Modifiers {
+            control: true,
+            ..Default::default()
+        });
+
+        assert!(pane_close_shortcut_for(
+            &command_shift_w,
+            PasteShortcutPlatform::MacOs
+        ));
+        assert!(pane_close_shortcut_for(
+            &control_shift_w,
+            PasteShortcutPlatform::Linux
+        ));
+        assert!(pane_close_shortcut_for(
+            &control_shift_w,
+            PasteShortcutPlatform::Windows
+        ));
+        assert!(!pane_close_shortcut_for(
+            &control_w,
+            PasteShortcutPlatform::Windows
         ));
     }
 
@@ -1982,6 +2220,7 @@ mod tests {
             TerminalSnapshot {
                 revision: 1,
                 lifecycle: TerminalLifecycle::Running,
+                active_work: false,
                 cols: 1,
                 rows: 1,
                 cursor: None,

@@ -36,6 +36,7 @@ pub(crate) enum ShellIcon {
     SplitHorizontal,
     SplitVertical,
     Move,
+    Close,
 }
 
 impl WorkspaceShell {
@@ -76,9 +77,12 @@ impl WorkspaceShell {
 
         color.alpha(match role {
             ShellColor::Window | ShellColor::Chrome | ShellColor::Sidebar => self.opacity,
-            ShellColor::Hover => 0.48,
-            ShellColor::Selected | ShellColor::AccentMuted | ShellColor::DangerHover => 0.72,
-            ShellColor::Border | ShellColor::SelectedBorder => 0.8,
+            ShellColor::Hover => 0.18,
+            ShellColor::Selected => 0.28,
+            ShellColor::AccentMuted => 0.32,
+            ShellColor::DangerHover => 0.3,
+            ShellColor::Border => 0.5,
+            ShellColor::SelectedBorder => 0.58,
             ShellColor::Text
             | ShellColor::MutedText
             | ShellColor::FaintText
@@ -202,6 +206,7 @@ impl ShellIcon {
             Self::SplitHorizontal => "icons/split-horizontal.svg",
             Self::SplitVertical => "icons/split-vertical.svg",
             Self::Move => "icons/move.svg",
+            Self::Close => "icons/close.svg",
         }
     }
 }
@@ -220,6 +225,7 @@ impl AssetSource for ShellAssets {
                 Some(include_bytes!("../assets/icons/split-vertical.svg"))
             }
             "icons/move.svg" => Some(include_bytes!("../assets/icons/move.svg")),
+            "icons/close.svg" => Some(include_bytes!("../assets/icons/close.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -290,5 +296,7 @@ mod tests {
         assert_eq!(shell.color(ShellColor::Text).a, 1.);
         assert_eq!(shell.root_color().a, 0.);
         assert_eq!(shell.appearance, WindowBackgroundAppearance::Blurred,);
+        assert!(shell.color(ShellColor::Hover).a < shell.color(ShellColor::Selected).a);
+        assert!(shell.color(ShellColor::Selected).a < shell.color(ShellColor::Chrome).a);
     }
 }

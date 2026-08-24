@@ -1,4 +1,4 @@
-use crate::desktop_shell::DesktopIntent;
+use crate::application::ApplicationIntent;
 use flume::Sender;
 
 pub(crate) struct DesktopPresence {
@@ -6,7 +6,7 @@ pub(crate) struct DesktopPresence {
 }
 
 impl DesktopPresence {
-    pub(crate) fn start(sender: Sender<DesktopIntent>) -> Result<Self, String> {
+    pub(crate) fn start(sender: Sender<ApplicationIntent>) -> Result<Self, String> {
         platform::DesktopPresence::start(sender).map(|platform| Self {
             _platform: platform,
         })
@@ -23,11 +23,11 @@ mod platform {
     };
 
     struct LinuxStatusNotifier {
-        sender: Sender<DesktopIntent>,
+        sender: Sender<ApplicationIntent>,
     }
 
     impl LinuxStatusNotifier {
-        fn send(&self, intent: DesktopIntent) {
+        fn send(&self, intent: ApplicationIntent) {
             let _ = self.sender.send(intent);
         }
     }
@@ -46,7 +46,7 @@ mod platform {
         }
 
         fn activate(&mut self, _x: i32, _y: i32) {
-            self.send(DesktopIntent::OpenOrFocus);
+            self.send(ApplicationIntent::OpenOrFocus);
         }
 
         fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -54,24 +54,16 @@ mod platform {
                 StandardItem {
                     label: "Open Terminal".into(),
                     activate: Box::new(|tray: &mut Self| {
-                        tray.send(DesktopIntent::OpenOrFocus);
+                        tray.send(ApplicationIntent::OpenOrFocus);
                     }),
                     ..Default::default()
                 }
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
-                    label: "Quit Desktop Shell (Keep Sessions)".into(),
+                    label: "Quit".into(),
                     activate: Box::new(|tray: &mut Self| {
-                        tray.send(DesktopIntent::QuitDesktopShell);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-                StandardItem {
-                    label: "Stop Sessions and Quit".into(),
-                    activate: Box::new(|tray: &mut Self| {
-                        tray.send(DesktopIntent::StopResidentCoreAndQuit);
+                        tray.send(ApplicationIntent::Quit);
                     }),
                     ..Default::default()
                 }
@@ -85,7 +77,7 @@ mod platform {
     }
 
     impl DesktopPresence {
-        pub(super) fn start(sender: Sender<DesktopIntent>) -> Result<Self, String> {
+        pub(super) fn start(sender: Sender<ApplicationIntent>) -> Result<Self, String> {
             LinuxStatusNotifier { sender }
                 .spawn()
                 .map(|handle| Self { handle })
@@ -111,31 +103,26 @@ mod platform {
     const TRAY_ID: &str = "agent-terminal";
     const OPEN_ID: &str = "agent-terminal.open";
     const QUIT_ID: &str = "agent-terminal.quit";
-    const FULL_EXIT_ID: &str = "agent-terminal.full-exit";
 
     pub(super) struct DesktopPresence {
         _tray_icon: TrayIcon,
     }
 
     impl DesktopPresence {
-        pub(super) fn start(sender: Sender<DesktopIntent>) -> Result<Self, String> {
+        pub(super) fn start(sender: Sender<ApplicationIntent>) -> Result<Self, String> {
             let open = MenuItem::with_id(OPEN_ID, "Open Terminal", true, None);
             let separator = PredefinedMenuItem::separator();
-            let quit = MenuItem::with_id(QUIT_ID, "Quit Desktop Shell (Keep Sessions)", true, None);
-            let full_exit = MenuItem::with_id(FULL_EXIT_ID, "Stop Sessions and Quit", true, None);
-            let menu = Menu::with_items(&[&open, &separator, &quit, &full_exit])
+            let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
+            let menu = Menu::with_items(&[&open, &separator, &quit])
                 .map_err(|error| format!("create desktop tray menu: {error}"))?;
 
             let menu_sender = sender.clone();
             MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.as_ref() {
                 OPEN_ID => {
-                    let _ = menu_sender.send(DesktopIntent::OpenOrFocus);
+                    let _ = menu_sender.send(ApplicationIntent::OpenOrFocus);
                 }
                 QUIT_ID => {
-                    let _ = menu_sender.send(DesktopIntent::QuitDesktopShell);
-                }
-                FULL_EXIT_ID => {
-                    let _ = menu_sender.send(DesktopIntent::StopResidentCoreAndQuit);
+                    let _ = menu_sender.send(ApplicationIntent::Quit);
                 }
                 _ => {}
             }));
@@ -150,7 +137,7 @@ mod platform {
                 } = event
                     && id == TRAY_ID
                 {
-                    let _ = click_sender.send(DesktopIntent::OpenOrFocus);
+                    let _ = click_sender.send(ApplicationIntent::OpenOrFocus);
                 }
             }));
 

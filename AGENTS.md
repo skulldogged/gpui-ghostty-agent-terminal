@@ -20,7 +20,8 @@ This is a single-context repository. See `docs/agents/domain.md`.
 
 ### Domain invariants
 
-- Use the terms and ownership boundaries defined in `CONTEXT.md`. Flag changes that make a Pane own a Terminal Session's identity or lifetime, or that make a UI Client own Spaces or terminal processes instead of the Resident Core.
+- Use the terms and ownership boundaries defined in `CONTEXT.md`. Flag changes that make a Pane own a Terminal Session's identity or lifetime, or that make a native window own Spaces or terminal processes instead of the tray-resident Application.
+- Closing every native window must leave the Application and its Terminal Sessions running when desktop presence is available. Explicit Quit ends the Application and its Terminal Sessions; process-restart survival is not a requirement.
 - Agent Integration must remain optional. A recognized agent program must still work as a normal interactive Terminal Session when richer integration is absent, incompatible, or fails.
 
 ### Terminal correctness
@@ -33,4 +34,4 @@ This is a single-context repository. See `docs/agents/domain.md`.
 ### Review signal
 
 - Report correctness, process-lifetime, resource-safety, security, and supported-platform regressions introduced by the change. Do not report style preferences, naming opinions, or speculative abstractions without a concrete failure mode.
-- Request one `@codex review` from the operator's GitHub session only after a PR is a merge candidate. Request another only after a material review finding required changes.
+- Run one local `codex review` after a PR is a merge candidate. Do not request a GitHub `@codex review` unless the operator explicitly asks for one. Run another local review only after a material finding required changes.

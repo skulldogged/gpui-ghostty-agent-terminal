@@ -156,6 +156,12 @@ pub enum CoreCommand {
         split_id: SplitId,
         ratio: SplitRatio,
     },
+    CloseTab {
+        tab_id: TabId,
+    },
+    CloseSpace {
+        space_id: SpaceId,
+    },
     ClosePane {
         pane_id: PaneId,
     },
@@ -520,6 +526,48 @@ impl CoreModel {
                 split.ratio = ratio;
                 Ok((Vec::new(), CreatedResource::None))
             }
+            CoreCommand::CloseTab { tab_id } => {
+                let (space_index, tab_index) = find_tab_location(&self.snapshot.spaces, tab_id)?;
+                let tab = self.snapshot.spaces[space_index].tabs.remove(tab_index);
+                let mut terminal_session_ids = Vec::new();
+                collect_terminal_session_ids(&tab.layout, &mut terminal_session_ids);
+                if self.snapshot.spaces[space_index].tabs.is_empty() {
+                    self.snapshot.spaces.remove(space_index);
+                }
+                self.snapshot
+                    .terminal_sessions
+                    .retain(|session| !terminal_session_ids.contains(&session.id));
+                let effects = terminal_session_ids
+                    .into_iter()
+                    .map(|terminal_session_id| CoreEffect::StopTerminal {
+                        terminal_session_id,
+                    })
+                    .collect();
+                Ok((effects, CreatedResource::None))
+            }
+            CoreCommand::CloseSpace { space_id } => {
+                let space_index = self
+                    .snapshot
+                    .spaces
+                    .iter()
+                    .position(|space| space.id == space_id)
+                    .ok_or_else(|| not_found(ResourceKind::Space, space_id.as_u64()))?;
+                let space = self.snapshot.spaces.remove(space_index);
+                let mut terminal_session_ids = Vec::new();
+                for tab in &space.tabs {
+                    collect_terminal_session_ids(&tab.layout, &mut terminal_session_ids);
+                }
+                self.snapshot
+                    .terminal_sessions
+                    .retain(|session| !terminal_session_ids.contains(&session.id));
+                let effects = terminal_session_ids
+                    .into_iter()
+                    .map(|terminal_session_id| CoreEffect::StopTerminal {
+                        terminal_session_id,
+                    })
+                    .collect();
+                Ok((effects, CreatedResource::None))
+            }
             CoreCommand::ClosePane { pane_id } => {
                 let (_, tab_id) = find_pane_location(&self.snapshot.spaces, pane_id)?;
                 let (pane, tab_empty) =
@@ -642,6 +690,19 @@ fn layout_contains_pane(layout: &PaneLayout, pane_id: PaneId) -> bool {
         PaneLayout::Split(split) => {
             layout_contains_pane(&split.first, pane_id)
                 || layout_contains_pane(&split.second, pane_id)
+        }
+    }
+}
+
+fn collect_terminal_session_ids(
+    layout: &PaneLayout,
+    terminal_session_ids: &mut Vec<TerminalSessionId>,
+) {
+    match layout {
+        PaneLayout::Pane(pane) => terminal_session_ids.push(pane.terminal_session_id),
+        PaneLayout::Split(split) => {
+            collect_terminal_session_ids(&split.first, terminal_session_ids);
+            collect_terminal_session_ids(&split.second, terminal_session_ids);
         }
     }
 }
@@ -1006,6 +1067,190 @@ mod tests {
                 terminal_session_id,
             }]
         );
+    }
+
+    #[test]
+    fn closing_a_tab_stops_its_terminals_once_and_preserves_unrelated_resources() {
+        let mut model = model_with_space();
+        let source_space_id = model.snapshot().spaces[0].id;
+        let tab_id = model.snapshot().spaces[0].tabs[0].id;
+        let first_pane_id = pane_ids(&model.snapshot())[0];
+        let first_terminal_session_id = session_for_pane(&model.snapshot(), first_pane_id);
+        let split = model
+            .apply(
+                1,
+                CoreCommand::SplitPane {
+                    pane_id: first_pane_id,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("split Tab before closing it");
+        let CreatedResource::Pane {
+            terminal_session_id: second_terminal_session_id,
+            ..
+        } = split.created
+        else {
+            panic!("split must identify its Terminal Session");
+        };
+        let sibling = model
+            .apply(
+                2,
+                CoreCommand::CreateTab {
+                    space_id: source_space_id,
+                    name: "Sibling".into(),
+                },
+            )
+            .expect("create sibling Tab");
+        let CreatedResource::Tab {
+            tab_id: sibling_tab_id,
+            terminal_session_id: sibling_terminal_session_id,
+            ..
+        } = sibling.created
+        else {
+            panic!("Tab creation must identify its resources");
+        };
+        let unrelated = model
+            .apply(
+                3,
+                CoreCommand::CreateSpace {
+                    name: "Unrelated".into(),
+                    directory: "/work/unrelated".into(),
+                },
+            )
+            .expect("create unrelated Space");
+        let CreatedResource::Space {
+            space_id: unrelated_space_id,
+            terminal_session_id: unrelated_terminal_session_id,
+            ..
+        } = unrelated.created
+        else {
+            panic!("Space creation must identify its resources");
+        };
+
+        let closed = model
+            .apply(4, CoreCommand::CloseTab { tab_id })
+            .expect("close Tab");
+
+        assert_eq!(closed.revision, 5);
+        assert_eq!(closed.snapshot.spaces.len(), 2);
+        assert_eq!(closed.snapshot.spaces[0].id, source_space_id);
+        assert_eq!(closed.snapshot.spaces[0].tabs.len(), 1);
+        assert_eq!(closed.snapshot.spaces[0].tabs[0].id, sibling_tab_id);
+        assert_eq!(closed.snapshot.spaces[1].id, unrelated_space_id);
+        assert_eq!(
+            closed
+                .snapshot
+                .terminal_sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![sibling_terminal_session_id, unrelated_terminal_session_id]
+        );
+        assert_eq!(
+            closed.effects,
+            vec![
+                CoreEffect::StopTerminal {
+                    terminal_session_id: first_terminal_session_id,
+                },
+                CoreEffect::StopTerminal {
+                    terminal_session_id: second_terminal_session_id,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn closing_an_unknown_tab_is_rejected_without_changing_the_hierarchy() {
+        let mut model = model_with_space();
+        let before = model.snapshot();
+
+        assert_eq!(
+            model
+                .apply(
+                    before.revision,
+                    CoreCommand::CloseTab {
+                        tab_id: TabId::from_u64(u64::MAX),
+                    },
+                )
+                .expect_err("unknown Tab must be rejected"),
+            CoreModelError::NotFound {
+                kind: ResourceKind::Tab,
+                id: u64::MAX,
+            }
+        );
+        assert_eq!(model.snapshot(), before);
+    }
+
+    #[test]
+    fn closing_a_space_stops_its_terminals_and_preserves_other_spaces() {
+        let mut model = model_with_space();
+        let closed_space_id = model.snapshot().spaces[0].id;
+        let closed_terminal_session_id = model.snapshot().terminal_sessions[0].id;
+        let unrelated = model
+            .apply(
+                1,
+                CoreCommand::CreateSpace {
+                    name: "Unrelated".into(),
+                    directory: "/work/unrelated".into(),
+                },
+            )
+            .expect("create unrelated Space");
+        let CreatedResource::Space {
+            space_id: unrelated_space_id,
+            terminal_session_id: unrelated_terminal_session_id,
+            ..
+        } = unrelated.created
+        else {
+            panic!("Space creation must identify its resources");
+        };
+
+        let closed = model
+            .apply(
+                2,
+                CoreCommand::CloseSpace {
+                    space_id: closed_space_id,
+                },
+            )
+            .expect("close Space");
+
+        assert_eq!(closed.revision, 3);
+        assert_eq!(closed.snapshot.spaces.len(), 1);
+        assert_eq!(closed.snapshot.spaces[0].id, unrelated_space_id);
+        assert_eq!(closed.snapshot.terminal_sessions.len(), 1);
+        assert_eq!(
+            closed.snapshot.terminal_sessions[0].id,
+            unrelated_terminal_session_id
+        );
+        assert_eq!(
+            closed.effects,
+            vec![CoreEffect::StopTerminal {
+                terminal_session_id: closed_terminal_session_id,
+            }]
+        );
+    }
+
+    #[test]
+    fn closing_an_unknown_space_is_rejected_without_changing_the_hierarchy() {
+        let mut model = model_with_space();
+        let before = model.snapshot();
+
+        assert_eq!(
+            model
+                .apply(
+                    before.revision,
+                    CoreCommand::CloseSpace {
+                        space_id: SpaceId::from_u64(u64::MAX),
+                    },
+                )
+                .expect_err("unknown Space must be rejected"),
+            CoreModelError::NotFound {
+                kind: ResourceKind::Space,
+                id: u64::MAX,
+            }
+        );
+        assert_eq!(model.snapshot(), before);
     }
 
     #[test]

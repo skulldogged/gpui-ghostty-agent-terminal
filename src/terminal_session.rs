@@ -1,6 +1,6 @@
 use crate::{
     ghostty,
-    pty::{PtyOutput, PtySession, PtySize},
+    pty::{ProcessSnapshot, PtyOutput, PtySession, PtySize},
 };
 /// The complete geometry shared by the VT engine and the platform PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +75,7 @@ pub enum TerminalEvent {
 
 trait TerminalTransport: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String>;
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
@@ -90,6 +91,10 @@ trait TerminalTransport: Send {
 impl TerminalTransport for PtySession {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         PtySession::write(self, bytes)
+    }
+
+    fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
+        PtySession::has_foreground_process(self, processes)
     }
 
     fn pause_reader(&mut self) -> Result<(), String> {
@@ -246,6 +251,13 @@ impl TerminalSession {
         self.process.reap()
     }
 
+    pub(crate) fn has_foreground_process(
+        &self,
+        processes: &ProcessSnapshot,
+    ) -> Result<bool, String> {
+        self.process.has_foreground_process(processes)
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     fn process_id(&self) -> Option<u32> {
         self.process.process_id()
@@ -313,7 +325,7 @@ mod tests {
     use crate::ghostty::snapshot_text;
     use crate::{
         ghostty,
-        pty::{PtyOutput, PtySize},
+        pty::{ProcessSnapshot, PtyOutput, PtySize},
     };
     use std::{
         sync::{Arc, Mutex},
@@ -345,6 +357,10 @@ mod tests {
             Ok(())
         }
 
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
+        }
+
         fn pause_reader(&mut self) -> Result<(), String> {
             self.output
                 .send(PtyOutput::Paused)
@@ -363,6 +379,10 @@ mod tests {
     impl TerminalTransport for OutputDuringResize {
         fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
             Ok(())
+        }
+
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
         }
 
         fn pause_reader(&mut self) -> Result<(), String> {
@@ -391,6 +411,10 @@ mod tests {
                 .expect("recording transport mutex poisoned")
                 .extend_from_slice(bytes);
             Ok(())
+        }
+
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
         }
 
         fn pause_reader(&mut self) -> Result<(), String> {

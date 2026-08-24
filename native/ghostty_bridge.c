@@ -115,6 +115,20 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
                              &snapshot->cursor_y);
   }
 
+  result = ghostty_terminal_mode_get(
+      spike->terminal, GHOSTTY_MODE_BRACKETED_PASTE,
+      &snapshot->bracketed_paste);
+  if (!success(result)) return result;
+  bool alternate_screen = false;
+  result = ghostty_terminal_mode_get(spike->terminal, GHOSTTY_MODE_ALT_SCREEN,
+                                     &alternate_screen);
+  if (!success(result)) return result;
+  bool alternate_screen_save = false;
+  result = ghostty_terminal_mode_get(
+      spike->terminal, GHOSTTY_MODE_ALT_SCREEN_SAVE, &alternate_screen_save);
+  if (!success(result)) return result;
+  snapshot->alternate_screen = alternate_screen || alternate_screen_save;
+
   GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
   result = ghostty_render_state_colors_get(spike->render, &colors);
   if (!success(result)) return result;

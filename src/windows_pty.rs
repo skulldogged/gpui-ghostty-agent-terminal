@@ -1,5 +1,7 @@
 use crate::{
-    pty::{PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown},
+    pty::{
+        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
+    },
     terminal_session::TerminalEvent,
 };
 use std::{
@@ -55,6 +57,7 @@ pub struct PtySession {
     input: OwnedHandle,
     pseudoconsole: Arc<SharedPseudoConsole>,
     process: OwnedHandle,
+    process_id: u32,
     control: flume::Sender<ReaderControl>,
     shutdown: Option<flume::Sender<()>>,
 }
@@ -99,7 +102,9 @@ impl PtySession {
         }
 
         let pseudoconsole = Arc::new(SharedPseudoConsole::new(pseudoconsole));
-        let process = spawn_shell(pseudoconsole.raw()?, working_directory)?;
+        let spawned_process = spawn_shell(pseudoconsole.raw()?, working_directory)?;
+        let process_id = spawned_process.id;
+        let process = spawned_process.handle;
 
         // ConPTY duplicated the host-facing ends. Keeping only the application
         // input/output ends avoids retaining an accidental EOF reference.
@@ -199,6 +204,7 @@ impl PtySession {
                 input: input.write,
                 pseudoconsole,
                 process,
+                process_id,
                 control: control_tx,
                 shutdown: Some(shutdown_tx),
             },
@@ -212,6 +218,10 @@ impl PtySession {
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
         self.pseudoconsole.resize(size)
+    }
+
+    pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
+        Ok(processes.has_child_process(self.process_id))
     }
 
     pub fn pause_reader(&mut self) -> Result<(), String> {
@@ -438,7 +448,7 @@ impl Drop for SharedPseudoConsole {
 fn spawn_shell(
     pseudoconsole: HPCON,
     working_directory: &std::path::Path,
-) -> Result<OwnedHandle, String> {
+) -> Result<SpawnedProcess, String> {
     let shell = shell();
     let mut arguments = Vec::new();
     if shell
@@ -524,9 +534,18 @@ fn spawn_shell(
     }
 
     let thread = OwnedHandle(process.hThread);
+    let id = process.dwProcessId;
     let process = OwnedHandle(process.hProcess);
     drop(thread);
-    Ok(process)
+    Ok(SpawnedProcess {
+        handle: process,
+        id,
+    })
+}
+
+struct SpawnedProcess {
+    handle: OwnedHandle,
+    id: u32,
 }
 
 fn shell() -> std::path::PathBuf {

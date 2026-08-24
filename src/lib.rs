@@ -2,9 +2,9 @@ mod core_model;
 mod ghostty;
 
 #[cfg(feature = "gui")]
-mod pty;
+mod application_core;
 #[cfg(feature = "gui")]
-mod resident_core;
+mod pty;
 #[cfg(feature = "gui")]
 mod terminal_frame;
 #[cfg(feature = "gui")]
@@ -17,14 +17,21 @@ mod ui_shell;
 mod windows_pty;
 
 #[cfg(feature = "gui")]
+mod activation;
+#[cfg(feature = "gui")]
+mod application;
+#[cfg(feature = "gui")]
 mod core_driver;
 #[cfg(feature = "gui")]
 mod desktop_presence;
 #[cfg(feature = "gui")]
-mod desktop_shell;
-#[cfg(feature = "gui")]
 mod gui;
 
+#[cfg(feature = "gui")]
+pub use application_core::{
+    ApplicationCore, CoreCommandOutcome, SemanticEvent, SemanticEventKind, TerminalCell,
+    TerminalChange, TerminalLifecycle, TerminalSnapshot,
+};
 pub use core_model::{
     CoreCommand, CoreCommit, CoreEffect, CoreModel, CoreModelError, CoreSnapshot, CreatedResource,
     PaneId, PaneLayout, PaneSnapshot, ResourceKind, SpaceId, SpaceSnapshot, SplitAxis, SplitId,
@@ -32,25 +39,16 @@ pub use core_model::{
     TerminalSessionId, TerminalSessionSnapshot,
 };
 #[cfg(feature = "gui")]
-pub use resident_core::{
-    ControlLease, ControlLeaseDenial, CoreClient, CoreCommandError, CoreCommandOutcome,
-    CoreEndpoint, SemanticEvent, SemanticEventKind, TerminalCell, TerminalChange,
-    TerminalLifecycle, TerminalSnapshot, UiClientId, run_resident_core,
-    stop_resident_core_after_parent,
-};
-#[cfg(feature = "gui")]
 pub use terminal_session::TerminalSize;
 
 #[cfg(feature = "gui")]
 pub fn run_gui() {
-    let endpoint = CoreEndpoint::for_current_user().expect("resolve default Resident Core profile");
-    desktop_shell::run(endpoint, false).expect("run Desktop Shell");
+    application::run(false).expect("run application");
 }
 
 #[cfg(feature = "gui")]
 pub fn run_development_gui() -> Result<(), String> {
-    let endpoint = CoreEndpoint::for_development_launch()?;
-    desktop_shell::run(endpoint, true)
+    application::run(true)
 }
 
 #[cfg(not(feature = "gui"))]

@@ -57,12 +57,43 @@ pub(crate) fn reader_checkpoint(
     }
 }
 
+pub(crate) struct ProcessSnapshot {
+    system: sysinfo::System,
+}
+
+impl ProcessSnapshot {
+    pub(crate) fn new() -> Self {
+        let mut snapshot = Self {
+            system: sysinfo::System::new(),
+        };
+        snapshot.refresh();
+        snapshot
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            sysinfo::ProcessRefreshKind::new(),
+        );
+    }
+
+    pub(crate) fn has_child_process(&self, process_id: u32) -> bool {
+        let process_id = sysinfo::Pid::from_u32(process_id);
+        self.system
+            .processes()
+            .values()
+            .any(|process| process.parent() == Some(process_id))
+    }
+}
+
 #[cfg(windows)]
 pub use crate::windows_pty::PtySession;
 
 #[cfg(unix)]
 mod unix {
-    use super::{PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown};
+    use super::{
+        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
+    };
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
         Child, CommandBuilder, MasterPty, PtySize as PortablePtySize, native_pty_system,
@@ -73,6 +104,7 @@ mod unix {
         _master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         child: Option<Box<dyn Child + Send>>,
+        shell_process_id: Option<u32>,
         control: flume::Sender<ReaderControl>,
         shutdown: Option<flume::Sender<()>>,
     }
@@ -96,6 +128,7 @@ mod unix {
                 .slave
                 .spawn_command(command)
                 .map_err(|error| format!("spawn shell: {error}"))?;
+            let shell_process_id = child.process_id();
             drop(pair.slave);
 
             let mut reader = pair
@@ -161,6 +194,7 @@ mod unix {
                     _master: pair.master,
                     writer,
                     child: Some(child),
+                    shell_process_id,
                     control: control_tx,
                     shutdown: Some(shutdown_tx),
                 },
@@ -179,6 +213,20 @@ mod unix {
             self._master
                 .resize(size.into())
                 .map_err(|error| format!("resize PTY: {error}"))
+        }
+
+        pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
+            let shell_process_id = self
+                .shell_process_id
+                .ok_or_else(|| "terminal shell does not expose its process ID".to_string())?;
+            let foreground_process_group = self
+                ._master
+                .process_group_leader()
+                .ok_or_else(|| "inspect foreground PTY process group".to_string())?;
+            let foreground_process_group = u32::try_from(foreground_process_group)
+                .map_err(|_| "foreground PTY process group is invalid".to_string())?;
+            Ok(foreground_process_group != shell_process_id
+                || processes.has_child_process(shell_process_id))
         }
 
         pub fn pause_reader(&mut self) -> Result<(), String> {
@@ -350,7 +398,45 @@ pub use unix::PtySession;
 
 #[cfg(test)]
 mod tests {
-    use super::{PtyOutput, ReaderControl, reader_checkpoint};
+    use super::{ProcessSnapshot, PtyOutput, ReaderControl, reader_checkpoint};
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn process_snapshot_detects_a_running_child() {
+        #[cfg(windows)]
+        let mut child = Command::new("ping.exe")
+            .args(["127.0.0.1", "-n", "10"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child process");
+        #[cfg(unix)]
+        let mut child = Command::new("sleep")
+            .arg("10")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child process");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut processes = ProcessSnapshot::new();
+        let detected = loop {
+            processes.refresh();
+            if processes.has_child_process(std::process::id()) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(detected);
+    }
 
     #[test]
     fn shutdown_cancels_a_blocked_worker_send() {
