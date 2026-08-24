@@ -17,6 +17,8 @@ mod ui_shell;
 mod windows_pty;
 
 #[cfg(feature = "gui")]
+mod activation;
+#[cfg(feature = "gui")]
 mod application;
 #[cfg(feature = "gui")]
 mod core_driver;

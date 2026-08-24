@@ -1,5 +1,7 @@
 use crate::{
-    pty::{PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown},
+    pty::{
+        PtyOutput, PtySize, ReaderControl, has_child_process, reader_checkpoint, send_or_shutdown,
+    },
     terminal_session::TerminalEvent,
 };
 use std::{
@@ -12,18 +14,14 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, HANDLE,
-        INVALID_HANDLE_VALUE, S_OK, WAIT_FAILED, WAIT_OBJECT_0,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK,
+        WAIT_FAILED, WAIT_OBJECT_0,
     },
     Security::SECURITY_ATTRIBUTES,
     System::{
         Console::{
             COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
             SetConsoleCtrlHandler,
-        },
-        Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-            TH32CS_SNAPPROCESS,
         },
         Pipes::{CreatePipe, PeekNamedPipe},
         Threading::{
@@ -223,7 +221,7 @@ impl PtySession {
     }
 
     pub fn has_foreground_process(&self) -> Result<bool, String> {
-        has_child_process(self.process_id)
+        Ok(has_child_process(self.process_id))
     }
 
     pub fn pause_reader(&mut self) -> Result<(), String> {
@@ -550,33 +548,6 @@ struct SpawnedProcess {
     id: u32,
 }
 
-fn has_child_process(process_id: u32) -> Result<bool, String> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(last_error("snapshot Windows processes"));
-    }
-    let _snapshot = OwnedHandle(snapshot);
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-        return Err(last_error("read first Windows process"));
-    }
-    loop {
-        if entry.th32ParentProcessID == process_id {
-            return Ok(true);
-        }
-        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                return Ok(false);
-            }
-            return Err(format!("read next Windows process: {error}"));
-        }
-    }
-}
-
 fn shell() -> std::path::PathBuf {
     for candidate in [
         std::env::var_os("PROGRAMFILES")
@@ -753,37 +724,4 @@ fn last_error(operation: &str) -> String {
 
 fn hresult_error(operation: &str, result: i32) -> String {
     format!("{operation}: HRESULT 0x{:08X}", result as u32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::has_child_process;
-    use std::{
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-
-    #[test]
-    fn process_snapshot_detects_a_running_child() {
-        let mut child = Command::new("ping.exe")
-            .args(["127.0.0.1", "-n", "10"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn child process");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let detected = loop {
-            match has_child_process(std::process::id()) {
-                Ok(true) => break Ok(true),
-                Ok(false) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                result => break result,
-            }
-        };
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(detected.expect("inspect child processes"));
-    }
 }

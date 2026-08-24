@@ -1,4 +1,7 @@
-use crate::{ApplicationCore, desktop_presence::DesktopPresence, gui, ui_shell::ShellAssets};
+use crate::{
+    ApplicationCore, activation::ActivationListener, desktop_presence::DesktopPresence, gui,
+    ui_shell::ShellAssets,
+};
 use gpui::{App, Global, QuitMode, Task};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +26,14 @@ struct ApplicationRuntime {
 impl Global for ApplicationRuntime {}
 
 pub(crate) fn run(development: bool) -> Result<(), String> {
+    let activation = if development {
+        None
+    } else {
+        let Some(listener) = ActivationListener::claim_or_forward()? else {
+            return Ok(());
+        };
+        Some(listener)
+    };
     let core = ApplicationCore::start()?;
     let launch_core = core.clone();
     let application = gpui_platform::application()
@@ -30,7 +41,7 @@ pub(crate) fn run(development: bool) -> Result<(), String> {
         .with_quit_mode(QuitMode::Explicit);
     application.on_reopen(|cx| handle_intent(ApplicationIntent::OpenOrFocus, cx));
     application.run(move |cx| {
-        if let Err(error) = install_desktop_presence(cx, launch_core, development) {
+        if let Err(error) = install_desktop_presence(cx, launch_core, activation, development) {
             eprintln!("Could not start application: {error}");
             cx.quit();
             return;
@@ -44,9 +55,13 @@ pub(crate) fn run(development: bool) -> Result<(), String> {
 fn install_desktop_presence(
     cx: &mut App,
     core: ApplicationCore,
+    activation: Option<ActivationListener>,
     development: bool,
 ) -> Result<(), String> {
     let (intent_sender, intent_receiver) = flume::unbounded();
+    if let Some(listener) = activation {
+        listener.start(intent_sender.clone())?;
+    }
     if development {
         let interrupt_sender = intent_sender.clone();
         ctrlc::set_handler(move || {

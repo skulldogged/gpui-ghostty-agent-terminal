@@ -23,9 +23,11 @@ gui = [
     "dep:flume",
     "dep:gpui",
     "dep:gpui_platform",
+    "dep:interprocess",
     "dep:ksni",
     "dep:libc",
     "dep:portable-pty",
+    "dep:sysinfo",
     "dep:tray-icon",
     "dep:windows-version",
     "dep:windows-sys",
@@ -36,6 +38,8 @@ ctrlc = { version = "3.5", features = ["termination"], optional = true }
 flume = { version = "0.12", optional = true }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fa00dccc42311f8dc71c533105488b0dbd518138", optional = true, features = ["font-kit", "wayland", "x11"] }
+interprocess = { version = "2.4.2", optional = true }
+sysinfo = { version = "0.31.4", default-features = false, features = ["system"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
@@ -52,7 +56,6 @@ windows-version = { version = "0.1.7", optional = true }
 windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
     "Win32_System_Console",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
