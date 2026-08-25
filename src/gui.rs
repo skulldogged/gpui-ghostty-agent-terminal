@@ -3261,10 +3261,7 @@ fn transitioning_agent_icon(
     animate: bool,
 ) -> AnyElement {
     let program = entry.agent.program;
-    let horizontal_travel = 15. + index as f32 * 20.;
-    let vertical_travel = 37. + index as f32 * 42.;
-    let resting_diameter = if expanding { 30. } else { 22. };
-    let resting_top = if expanding { -1. } else { 0. };
+    let (resting_diameter, resting_top) = agent_icon_resting_geometry(expanding);
     let icon = div()
         .relative()
         .flex()
@@ -3286,26 +3283,36 @@ fn transitioning_agent_icon(
         (animation_id, entry.terminal_session_id.as_u64()),
         Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
         move |this, delta| {
-            let inverse = 1. - delta;
-            let (left, top, diameter) = if expanding {
-                (
-                    horizontal_travel * inverse,
-                    -vertical_travel * inverse - delta,
-                    22. + 8. * delta,
-                )
-            } else {
-                (
-                    -horizontal_travel * inverse,
-                    (vertical_travel - 1.) * inverse,
-                    30. - 8. * delta,
-                )
-            };
+            let (left, top, diameter) = agent_icon_transition_geometry(index, expanding, delta);
             this.left(px(left))
                 .top(px(top))
                 .child(agent_icon(program, diameter))
         },
     )
     .into_any_element()
+}
+
+fn agent_icon_resting_geometry(expanded: bool) -> (f32, f32) {
+    if expanded { (30., 0.) } else { (22., 0.) }
+}
+
+fn agent_icon_transition_geometry(index: usize, expanding: bool, delta: f32) -> (f32, f32, f32) {
+    let horizontal_travel = 15. + index as f32 * 20.;
+    let vertical_travel = 37. + index as f32 * 42.;
+    let inverse = 1. - delta;
+    if expanding {
+        (
+            horizontal_travel * inverse,
+            -vertical_travel * inverse,
+            22. + 8. * delta,
+        )
+    } else {
+        (
+            -horizontal_travel * inverse,
+            vertical_travel * inverse,
+            30. - 8. * delta,
+        )
+    }
 }
 
 fn agent_icon(program: AgentProgram, diameter: f32) -> AnyElement {
@@ -3323,7 +3330,7 @@ fn agent_icon(program: AgentProgram, diameter: f32) -> AnyElement {
 }
 
 fn agent_badge(data: &'static [u8], background: gpui::Rgba, diameter: f32) -> AnyElement {
-    let mark_size = (diameter * 0.55).round();
+    let mark_size = agent_badge_mark_size(diameter);
     div()
         .flex()
         .items_center()
@@ -3340,6 +3347,11 @@ fn agent_badge(data: &'static [u8], background: gpui::Rgba, diameter: f32) -> An
                 .child(svg().data(data).size_full().text_color(rgb(0xffffff))),
         )
         .into_any_element()
+}
+
+fn agent_badge_mark_size(diameter: f32) -> f32 {
+    let rounded = (diameter * 0.55).round() as u32;
+    (rounded + rounded % 2) as f32
 }
 
 fn gemini_image() -> Arc<Image> {
@@ -3455,8 +3467,9 @@ fn windows_caption_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, UiSelection,
-        accept_terminal_snapshot, first_pane_id, pane_close_shortcut_for, pane_extents,
+        OPENAI_ICON, PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, UiSelection,
+        accept_terminal_snapshot, agent_badge_mark_size, agent_icon_resting_geometry,
+        agent_icon_transition_geometry, first_pane_id, pane_close_shortcut_for, pane_extents,
         prioritized_agent_summary, selection_for_created, selection_for_pane, split_ratio_at,
         terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
     };
@@ -3467,6 +3480,27 @@ mod tests {
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn expanded_agent_icons_rest_on_the_row_centerline() {
+        assert_eq!(agent_icon_resting_geometry(true), (30., 0.));
+        assert_eq!(agent_icon_transition_geometry(0, true, 1.), (0., 0., 30.));
+        assert_eq!(agent_icon_transition_geometry(1, false, 1.), (0., 0., 22.));
+    }
+
+    #[test]
+    fn agent_badge_marks_use_even_resting_dimensions() {
+        assert_eq!(agent_badge_mark_size(30.), 18.);
+        assert_eq!(agent_badge_mark_size(22.), 12.);
+    }
+
+    #[test]
+    fn openai_icon_keeps_the_complete_svgl_canvas() {
+        let svg = std::str::from_utf8(OPENAI_ICON).expect("OpenAI icon is UTF-8 SVG");
+
+        assert!(svg.contains("viewBox=\"0 0 256 260\""));
+        assert!(!svg.contains("viewBox=\"-4.5 10.5 256 260\""));
+    }
 
     #[test]
     fn compact_agent_summary_keeps_count_and_shows_top_three_by_priority() {
