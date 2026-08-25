@@ -2,6 +2,8 @@ mod core_model;
 mod ghostty;
 
 #[cfg(feature = "gui")]
+mod agent_integration;
+#[cfg(feature = "gui")]
 mod application_core;
 #[cfg(feature = "gui")]
 mod pty;
@@ -31,6 +33,8 @@ mod desktop_presence;
 #[cfg(feature = "gui")]
 mod gui;
 
+#[cfg(feature = "gui")]
+pub use agent_integration::{AgentProgram, AgentSnapshot, AgentState};
 #[cfg(feature = "gui")]
 pub use application_core::{
     ApplicationCore, CoreCommandOutcome, SemanticEvent, SemanticEventKind, TerminalCell,

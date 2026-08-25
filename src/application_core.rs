@@ -544,6 +544,8 @@ pub struct TerminalSnapshot {
     pub revision: u64,
     pub lifecycle: TerminalLifecycle,
     pub active_work: bool,
+    pub title: Option<String>,
+    pub agent: Option<crate::AgentSnapshot>,
     pub cols: u16,
     pub rows: u16,
     pub cursor: Option<(u16, u16)>,
@@ -554,12 +556,36 @@ pub struct TerminalSnapshot {
 
 impl TerminalSnapshot {
     pub fn text(&self) -> String {
+        self.text_from_row(0)
+    }
+
+    fn text_from_row(&self, first_row: u16) -> String {
         let mut output = String::new();
-        for y in 0..self.rows {
+        let mut cell_index = self
+            .cells
+            .partition_point(|cell| cell.y < first_row.min(self.rows));
+        for y in first_row.min(self.rows)..self.rows {
             for x in 0..self.cols {
-                match self.cells.iter().find(|cell| cell.x == x && cell.y == y) {
-                    Some(cell) if !cell.text.is_empty() => output.push_str(&cell.text),
-                    _ => output.push(' '),
+                while self
+                    .cells
+                    .get(cell_index)
+                    .is_some_and(|cell| (cell.y, cell.x) < (y, x))
+                {
+                    cell_index += 1;
+                }
+                if let Some(cell) = self
+                    .cells
+                    .get(cell_index)
+                    .filter(|cell| (cell.y, cell.x) == (y, x))
+                {
+                    if cell.text.is_empty() {
+                        output.push(' ');
+                    } else {
+                        output.push_str(&cell.text);
+                    }
+                    cell_index += 1;
+                } else {
+                    output.push(' ');
                 }
             }
             output.push('\n');
@@ -576,13 +602,16 @@ impl TerminalSnapshot {
             revision: update.revision,
             lifecycle: update.lifecycle,
             active_work: update.active_work,
+            title: update.title,
+            agent: None,
             cols: update.cols,
             rows: update.rows,
             cursor: update.cursor,
             default_fg: update.default_fg,
             default_bg: update.default_bg,
             cells: update.cells,
-        })
+        }
+        .with_refreshed_agent(update.agent_program))
     }
 
     fn apply_update(&mut self, update: TerminalUpdate) -> Result<(), String> {
@@ -606,10 +635,24 @@ impl TerminalSnapshot {
         self.revision = update.revision;
         self.lifecycle = update.lifecycle;
         self.active_work = update.active_work;
+        self.title = update.title;
         self.cursor = update.cursor;
         self.default_fg = update.default_fg;
         self.default_bg = update.default_bg;
+        self.refresh_agent(update.agent_program);
         Ok(())
+    }
+
+    fn with_refreshed_agent(mut self, program: Option<crate::AgentProgram>) -> Self {
+        self.refresh_agent(program);
+        self
+    }
+
+    fn refresh_agent(&mut self, program: Option<crate::AgentProgram>) {
+        self.agent = program.map(|program| {
+            let screen = self.text_from_row(self.rows.saturating_sub(24));
+            crate::AgentSnapshot::from_screen(program, self.title.as_deref(), &screen)
+        });
     }
 }
 
@@ -619,6 +662,8 @@ struct TerminalUpdate {
     revision: u64,
     lifecycle: TerminalLifecycle,
     active_work: bool,
+    title: Option<String>,
+    agent_program: Option<crate::AgentProgram>,
     cols: u16,
     rows: u16,
     cursor: Option<(u16, u16)>,
@@ -635,12 +680,15 @@ impl TerminalUpdate {
         revision: u64,
         lifecycle: TerminalLifecycle,
         active_work: bool,
+        agent_program: Option<crate::AgentProgram>,
     ) -> Self {
         Self {
             base_revision: if snapshot.full { None } else { base_revision },
             revision,
             lifecycle,
             active_work,
+            title: snapshot.title,
+            agent_program,
             cols: snapshot.cols,
             rows: snapshot.rows,
             cursor: snapshot.cursor,
@@ -659,6 +707,8 @@ impl TerminalUpdate {
             revision,
             lifecycle,
             active_work: false,
+            title: None,
+            agent_program: None,
             cols: COLS,
             rows: ROWS,
             cursor: None,

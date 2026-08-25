@@ -79,7 +79,6 @@ trait TerminalTransport: Send {
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
-    #[cfg(all(test, target_os = "linux"))]
     fn process_id(&self) -> Option<u32> {
         None
     }
@@ -109,7 +108,6 @@ impl TerminalTransport for PtySession {
         PtySession::resume_reader(self)
     }
 
-    #[cfg(all(test, target_os = "linux"))]
     fn process_id(&self) -> Option<u32> {
         PtySession::process_id(self)
     }
@@ -265,8 +263,7 @@ impl TerminalSession {
         self.process.has_foreground_process(processes)
     }
 
-    #[cfg(all(test, target_os = "linux"))]
-    fn process_id(&self) -> Option<u32> {
+    pub(crate) fn process_id(&self) -> Option<u32> {
         self.process.process_id()
     }
 

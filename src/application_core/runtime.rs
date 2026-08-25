@@ -1,6 +1,7 @@
 use super::{TerminalLifecycle, TerminalUpdate};
 use crate::{
-    CoreCommand, CoreEffect, CoreModel, PaneId, PaneLayout, TerminalSessionId,
+    AgentProgram, CoreCommand, CoreEffect, CoreModel, PaneId, PaneLayout, TerminalSessionId,
+    core_model::default_space_name,
     pty::ProcessSnapshot,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
     terminal_theme::TerminalTheme,
@@ -49,17 +50,13 @@ struct RuntimeTerminal {
     bracketed_paste: bool,
     alternate_screen: bool,
     active_work: bool,
+    agent_program: Option<AgentProgram>,
 }
 
 impl CoreRuntime {
     pub(super) fn start(working_directory: &Path, first_resource_id: u64) -> Result<Self, String> {
         let mut model = CoreModel::with_id_namespace(first_resource_id);
-        let space_name = working_directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("Terminal")
-            .to_owned();
+        let space_name = default_space_name(working_directory);
         let commit = model
             .apply(
                 0,
@@ -239,6 +236,9 @@ impl CoreRuntime {
         runtime.bracketed_paste = snapshot.bracketed_paste;
         runtime.alternate_screen = snapshot.alternate_screen;
         let foreground_process = session.has_foreground_process(processes).unwrap_or(true);
+        runtime.agent_program = session
+            .process_id()
+            .and_then(|process_id| processes.agent_program(process_id));
         runtime.active_work = close_confirmation_required(
             runtime.interactive_prompt_seen,
             runtime.bracketed_paste,
@@ -251,6 +251,7 @@ impl CoreRuntime {
             runtime.revision,
             runtime.lifecycle.clone(),
             runtime.active_work,
+            runtime.agent_program,
         );
         runtime.last_snapshot_revision = Some(runtime.revision);
         Ok(Some(update))
@@ -375,6 +376,7 @@ impl RuntimeTerminal {
             bracketed_paste: false,
             alternate_screen: false,
             active_work: false,
+            agent_program: None,
         })
     }
 
@@ -389,6 +391,7 @@ impl RuntimeTerminal {
             bracketed_paste: false,
             alternate_screen: false,
             active_work: false,
+            agent_program: None,
         }
     }
 
@@ -438,6 +441,9 @@ impl RuntimeTerminal {
         }
         if let Some(processes) = processes {
             let foreground_process = session.has_foreground_process(processes).unwrap_or(true);
+            let agent_program = session
+                .process_id()
+                .and_then(|process_id| processes.agent_program(process_id));
             let active_work = close_confirmation_required(
                 self.interactive_prompt_seen,
                 self.bracketed_paste,
@@ -446,6 +452,10 @@ impl RuntimeTerminal {
             );
             if active_work != self.active_work {
                 self.active_work = active_work;
+                self.revision = self.revision.saturating_add(1);
+            }
+            if agent_program != self.agent_program {
+                self.agent_program = agent_program;
                 self.revision = self.revision.saturating_add(1);
             }
         }

@@ -21,12 +21,13 @@ struct RawCell {
 }
 
 #[repr(C)]
-#[derive(Default)]
 struct RawSnapshot {
     cols: u16,
     rows: u16,
     cursor_x: u16,
     cursor_y: u16,
+    title: [u8; 512],
+    title_len: u16,
     cursor_visible: bool,
     bracketed_paste: bool,
     alternate_screen: bool,
@@ -38,6 +39,30 @@ struct RawSnapshot {
     default_bg_b: u8,
     full: bool,
     cell_count: usize,
+}
+
+impl Default for RawSnapshot {
+    fn default() -> Self {
+        Self {
+            cols: 0,
+            rows: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            title: [0; 512],
+            title_len: 0,
+            cursor_visible: false,
+            bracketed_paste: false,
+            alternate_screen: false,
+            default_fg_r: 0,
+            default_fg_g: 0,
+            default_fg_b: 0,
+            default_bg_r: 0,
+            default_bg_g: 0,
+            default_bg_b: 0,
+            full: false,
+            cell_count: 0,
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -88,6 +113,7 @@ pub struct Snapshot {
     pub dirty_rows: Vec<u16>,
     pub cols: u16,
     pub rows: u16,
+    pub title: Option<String>,
     pub cursor: Option<(u16, u16)>,
     pub bracketed_paste: bool,
     pub alternate_screen: bool,
@@ -222,12 +248,25 @@ impl Terminal {
             .collect();
         let mut dirty_rows = cells.iter().map(|cell| cell.y).collect::<Vec<_>>();
         dirty_rows.dedup();
+        let title =
+            String::from_utf8_lossy(&raw_snapshot.title[..usize::from(raw_snapshot.title_len)])
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+        let title = (!title.trim().is_empty()).then(|| title.trim().to_owned());
 
         Ok(Snapshot {
             full: raw_snapshot.full,
             dirty_rows,
             cols: raw_snapshot.cols,
             rows: raw_snapshot.rows,
+            title,
             cursor: raw_snapshot
                 .cursor_visible
                 .then_some((raw_snapshot.cursor_x, raw_snapshot.cursor_y)),
@@ -330,6 +369,15 @@ mod tests {
         assert!(forced.full);
         assert_eq!(forced.dirty_rows, vec![0, 1, 2]);
         assert_eq!(forced.cells.len(), 24);
+    }
+
+    #[test]
+    fn snapshots_report_terminal_titles_from_ghostty() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal.feed(b"\x1b]0;Codex Settings\x07");
+
+        let snapshot = terminal.snapshot().expect("snapshot terminal title");
+        assert_eq!(snapshot.title.as_deref(), Some("Codex Settings"));
     }
 
     #[test]

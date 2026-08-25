@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -79,6 +82,7 @@ pub struct CoreSnapshot {
 pub struct SpaceSnapshot {
     pub id: SpaceId,
     pub name: String,
+    pub name_is_custom: bool,
     pub directory: PathBuf,
     pub tabs: Vec<TabSnapshot>,
 }
@@ -87,7 +91,20 @@ pub struct SpaceSnapshot {
 pub struct TabSnapshot {
     pub id: TabId,
     pub name: String,
+    pub name_is_custom: bool,
     pub layout: PaneLayout,
+}
+
+pub(crate) fn default_space_name(directory: &Path) -> String {
+    directory
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .unwrap_or(directory)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Terminal")
+        .to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,10 +354,12 @@ impl CoreModel {
                 self.snapshot.spaces.push(SpaceSnapshot {
                     id: space_id,
                     name,
+                    name_is_custom: false,
                     directory,
                     tabs: vec![TabSnapshot {
                         id: tab_id,
                         name: "Terminal".into(),
+                        name_is_custom: false,
                         layout: PaneLayout::Pane(PaneSnapshot {
                             id: pane_id,
                             terminal_session_id,
@@ -375,6 +394,7 @@ impl CoreModel {
                     .find(|space| space.id == space_id)
                     .ok_or_else(|| not_found(ResourceKind::Space, space_id.as_u64()))?;
                 space.name = name;
+                space.name_is_custom = true;
                 Ok((Vec::new(), CreatedResource::None))
             }
             CoreCommand::CreateTab { space_id, name } => {
@@ -399,6 +419,7 @@ impl CoreModel {
                     .push(TabSnapshot {
                         id: tab_id,
                         name,
+                        name_is_custom: false,
                         layout: PaneLayout::Pane(PaneSnapshot {
                             id: pane_id,
                             terminal_session_id,
@@ -424,7 +445,9 @@ impl CoreModel {
             }
             CoreCommand::RenameTab { tab_id, name } => {
                 validate_name(&name)?;
-                find_tab_mut(&mut self.snapshot.spaces, tab_id)?.name = name;
+                let tab = find_tab_mut(&mut self.snapshot.spaces, tab_id)?;
+                tab.name = name;
+                tab.name_is_custom = true;
                 Ok((Vec::new(), CreatedResource::None))
             }
             CoreCommand::ReorderTab { tab_id, index } => {
@@ -895,7 +918,9 @@ mod tests {
         };
         assert_eq!(commit.revision, 1);
         assert_eq!(commit.snapshot.spaces[0].id, space_id);
+        assert!(!commit.snapshot.spaces[0].name_is_custom);
         assert_eq!(commit.snapshot.spaces[0].tabs[0].id, tab_id);
+        assert!(!commit.snapshot.spaces[0].tabs[0].name_is_custom);
         assert_eq!(
             commit.snapshot.spaces[0].tabs[0].layout,
             PaneLayout::Pane(PaneSnapshot {
@@ -1364,7 +1389,9 @@ mod tests {
 
         assert_eq!(final_commit.revision, 6);
         assert_eq!(final_commit.snapshot.spaces[0].tabs[0].id, tab_id);
-        assert_eq!(find_tab(&final_commit.snapshot, original_tab).name, "Shell");
+        let renamed_tab = find_tab(&final_commit.snapshot, original_tab);
+        assert_eq!(renamed_tab.name, "Shell");
+        assert!(renamed_tab.name_is_custom);
         assert_eq!(
             find_split_snapshot(&final_commit.snapshot, split_id).ratio,
             ratio

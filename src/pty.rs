@@ -73,7 +73,9 @@ impl ProcessSnapshot {
     pub(crate) fn refresh(&mut self) {
         self.system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
-            sysinfo::ProcessRefreshKind::new(),
+            sysinfo::ProcessRefreshKind::new()
+                .with_cmd(sysinfo::UpdateKind::Always)
+                .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
         );
     }
 
@@ -83,6 +85,45 @@ impl ProcessSnapshot {
             .processes()
             .values()
             .any(|process| process.parent() == Some(process_id))
+    }
+
+    pub(crate) fn agent_program(
+        &self,
+        shell_process_id: u32,
+    ) -> Option<crate::agent_integration::AgentProgram> {
+        let shell_process_id = sysinfo::Pid::from_u32(shell_process_id);
+        let mut frontier = vec![shell_process_id];
+        let mut visited = std::collections::HashSet::from([shell_process_id]);
+
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for parent in frontier {
+                for (&pid, process) in self
+                    .system
+                    .processes()
+                    .iter()
+                    .filter(|(_, process)| process.parent() == Some(parent))
+                {
+                    if !visited.insert(pid) {
+                        continue;
+                    }
+                    let command = process
+                        .cmd()
+                        .iter()
+                        .map(|argument| argument.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    if let Some(agent) = crate::agent_integration::AgentProgram::from_process(
+                        &process.name().to_string_lossy(),
+                        &command,
+                    ) {
+                        return Some(agent);
+                    }
+                    next.push(pid);
+                }
+            }
+            frontier = next;
+        }
+        None
     }
 }
 
@@ -241,7 +282,6 @@ mod unix {
                 .map_err(|_| "resume PTY reader: reader stopped".to_string())
         }
 
-        #[cfg(all(test, target_os = "linux"))]
         pub fn process_id(&self) -> Option<u32> {
             self.child.as_ref().and_then(|child| child.process_id())
         }

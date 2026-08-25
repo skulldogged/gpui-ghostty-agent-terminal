@@ -31,6 +31,8 @@ typedef struct {
   uint16_t rows;
   uint16_t cursor_x;
   uint16_t cursor_y;
+  uint8_t title[512];
+  uint16_t title_len;
   bool cursor_visible;
   bool bracketed_paste;
   bool alternate_screen;
