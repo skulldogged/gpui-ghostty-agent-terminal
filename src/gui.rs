@@ -1,23 +1,31 @@
 use crate::{
-    ApplicationCore, CoreCommand, CoreSnapshot, CreatedResource, PaneId, PaneLayout, SpaceId,
-    SplitAxis, SplitId, SplitPlacement, SplitRatio, TabId, TerminalLifecycle, TerminalSessionId,
-    TerminalSize, TerminalSnapshot,
+    AgentProgram, AgentSnapshot, AgentState, ApplicationCore, CoreCommand, CoreSnapshot,
+    CreatedResource, PaneId, PaneLayout, SpaceId, SplitAxis, SplitId, SplitPlacement, SplitRatio,
+    TabId, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
+    core_model::default_space_name,
     settings::{AppSettings, KeybindAction, MAX_FONT_SIZE, MIN_FONT_SIZE, Shortcut, ThemePreset},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
     ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations, FocusHandle, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel,
-    Render, ShapedLine, SharedString, Task, TextRun, Window, WindowControlArea, canvas, div, fill,
-    font, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations,
+    FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, Keystroke, MouseButton,
+    MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel, Render, ShapedLine, SharedString,
+    Task, TextRun, Window, WindowControlArea, canvas, div, ease_out_quint, fill, font, img, point,
+    prelude::*, px, rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
+const INACTIVE_PANE_CONTRAST: f32 = 0.62;
+const OPENAI_ICON: &[u8] = include_bytes!("../assets/svgl/openai.svg");
+const CLAUDE_ICON: &[u8] = include_bytes!("../assets/svgl/claude.svg");
+const GEMINI_ICON: &[u8] = include_bytes!("../assets/svgl/gemini.svg");
 
 pub(crate) fn open_terminal_window(
     cx: &mut App,
@@ -69,6 +77,8 @@ pub(crate) fn open_terminal_window(
                 pending_split_resizes: HashMap::new(),
                 titlebar_drag_armed: false,
                 sidebar_collapsed: false,
+                expanded_agent_spaces: HashSet::new(),
+                agent_layout_transitions: HashMap::new(),
             });
             view.update(cx, |view, cx| {
                 view.start_refresh_task(cx);
@@ -110,6 +120,8 @@ struct MultiplexerView {
     pending_split_resizes: HashMap<u64, SplitId>,
     titlebar_drag_armed: bool,
     sidebar_collapsed: bool,
+    expanded_agent_spaces: HashSet<SpaceId>,
+    agent_layout_transitions: HashMap<SpaceId, AgentLayoutTransition>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -131,6 +143,12 @@ enum CloseTarget {
     Space(SpaceId),
     Tab(TabId),
     Pane(PaneId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentLayoutTransition {
+    Expanding,
+    Collapsing,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -328,6 +346,18 @@ impl MultiplexerView {
             DriverUpdate::Hierarchy(hierarchy) => {
                 self.hierarchy = hierarchy;
                 self.retain_live_terminals();
+                self.expanded_agent_spaces.retain(|space_id| {
+                    self.hierarchy
+                        .spaces
+                        .iter()
+                        .any(|space| space.id == *space_id)
+                });
+                self.agent_layout_transitions.retain(|space_id, _| {
+                    self.hierarchy
+                        .spaces
+                        .iter()
+                        .any(|space| space.id == *space_id)
+                });
                 self.selection = self.selection.normalized(&self.hierarchy);
                 if self.move_source.is_some_and(|pane_id| {
                     !self
@@ -592,6 +622,41 @@ impl MultiplexerView {
             .find(|tab| tab.id == tab_id)
     }
 
+    fn tab_display_name(&self, tab: &crate::TabSnapshot) -> String {
+        if tab.name_is_custom {
+            return tab.name.clone();
+        }
+        let pane_id = (self.selection.tab_id == Some(tab.id))
+            .then_some(self.selection.pane_id)
+            .flatten()
+            .filter(|pane_id| layout_contains_pane(&tab.layout, *pane_id))
+            .or_else(|| first_pane_id(&tab.layout));
+        let terminal_session_id =
+            pane_id.and_then(|pane_id| terminal_for_pane(&tab.layout, pane_id));
+        if let Some(title) = terminal_session_id
+            .and_then(|terminal_session_id| self.terminals.get(&terminal_session_id))
+            .and_then(|snapshot| snapshot.title.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            return title.to_owned();
+        }
+        if let Some(directory_name) = terminal_session_id
+            .and_then(|terminal_session_id| {
+                self.hierarchy
+                    .terminal_sessions
+                    .iter()
+                    .find(|session| session.id == terminal_session_id)
+            })
+            .and_then(|session| session.launch.working_directory.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+        {
+            return directory_name.to_owned();
+        }
+        tab.name.clone()
+    }
+
     fn select_space(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
         self.selection.space_id = Some(space_id);
         self.selection.tab_id = None;
@@ -657,7 +722,7 @@ impl MultiplexerView {
             Ok(directory) => {
                 self.submit_core_command(
                     CoreCommand::CreateSpace {
-                        name: format!("Space {}", self.hierarchy.spaces.len() + 1),
+                        name: default_space_name(&directory),
                         directory,
                     },
                     cx,
@@ -678,7 +743,7 @@ impl MultiplexerView {
         self.submit_core_command(
             CoreCommand::CreateTab {
                 space_id: space.id,
-                name: format!("Terminal {}", space.tabs.len() + 1),
+                name: "Terminal".into(),
             },
             cx,
         );
@@ -889,53 +954,45 @@ impl MultiplexerView {
             .border_color(self.shell.opaque_color(ShellColor::Border))
             .px_1()
             .pt_2()
-            .gap(px(2.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(28.))
-                    .px_3()
-                    .text_size(px(11.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(self.shell.color(ShellColor::FaintText))
-                    .child("SPACES")
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(self.shell.color(ShellColor::FaintText))
-                            .child(self.hierarchy.spaces.len().to_string()),
-                    ),
-            );
+            .gap(px(2.));
         for space in &self.hierarchy.spaces {
             let space_id = space.id;
             let selected = self.selection.space_id == Some(space_id);
             let hover_group: SharedString = format!("space-hover-{}", space_id.as_u64()).into();
-            let initial = space
-                .name
-                .chars()
-                .next()
-                .map(|character| character.to_uppercase().to_string())
-                .unwrap_or_else(|| "·".into());
-            let tab_count = space.tabs.len();
-            let tab_label = if tab_count == 1 { "tab" } else { "tabs" };
-            let metadata = format!(
-                "{tab_count} {tab_label}  ·  {}",
-                space.directory.to_string_lossy()
-            );
+            let agents = agent_summary_for_space(space, &self.terminals);
+            let has_agents = agents.is_some();
+            let agents_expanded = self.expanded_agent_spaces.contains(&space_id);
+            let agent_layout_transition = self.agent_layout_transitions.get(&space_id).copied();
+            let terminal_summary = (!has_agents).then(|| {
+                let tab = self
+                    .selection
+                    .tab_id
+                    .filter(|_| selected)
+                    .and_then(|tab_id| space.tabs.iter().find(|tab| tab.id == tab_id))
+                    .or_else(|| space.tabs.first());
+                tab.map(|tab| {
+                    (
+                        self.tab_display_name(tab),
+                        space.tabs.len().saturating_sub(1),
+                    )
+                })
+            });
             let close_button = div()
                 .id(("close-space", space_id.as_u64()))
-                .flex_none()
+                .absolute()
+                .top(px(10.))
+                .right(px(7.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .size(px(18.))
                 .rounded_md()
                 .cursor_pointer()
-                .opacity(0.)
-                .group_hover(hover_group.clone(), |this| this.opacity(1.))
-                .hover(|this| this.bg(self.shell.color(ShellColor::DangerHover)))
+                .opacity(if selected { 1. } else { 0. })
+                .when(!selected, |this| {
+                    this.group_hover(hover_group.clone(), |this| this.opacity(1.))
+                })
+                .hover(|this| this.bg(self.shell.control_hover()))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -949,82 +1006,86 @@ impl MultiplexerView {
                     self.shell.color(ShellColor::MutedText),
                     10.,
                 ));
-            sidebar = sidebar.child(
-                div()
-                    .id(("space", space_id.as_u64()))
-                    .group(hover_group)
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_h(px(52.))
-                    .mx_1()
-                    .px_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(if selected {
-                        self.shell.color(ShellColor::SelectedBorder)
-                    } else {
-                        self.shell.opaque_color(ShellColor::Sidebar)
-                    })
-                    .when(selected, |this| {
-                        this.bg(self.shell.color(ShellColor::Selected))
-                    })
-                    .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
-                    .on_click(cx.listener(move |view, _event, window, cx| {
-                        view.select_space(space_id, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(24.))
-                            .rounded_full()
-                            .bg(if selected {
-                                self.shell.color(ShellColor::AccentMuted)
+            sidebar =
+                sidebar.child(
+                    div()
+                        .id(("space", space_id.as_u64()))
+                        .group(hover_group.clone())
+                        .relative()
+                        .cursor_pointer()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .mx_1()
+                        .px_2()
+                        .py_2()
+                        .rounded_lg()
+                        .when(selected, |this| {
+                            this.bg(self.shell.opaque_color(ShellColor::Selected))
+                        })
+                        .hover(move |this| {
+                            this.bg(self.shell.opaque_color(if selected {
+                                ShellColor::Selected
                             } else {
-                                self.shell.color(ShellColor::Hover)
-                            })
-                            .text_size(px(11.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if selected {
-                                self.shell.color(ShellColor::Accent)
-                            } else {
-                                self.shell.color(ShellColor::MutedText)
-                            })
-                            .child(initial),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .font_weight(if selected {
-                                        gpui::FontWeight::SEMIBOLD
-                                    } else {
-                                        gpui::FontWeight::NORMAL
-                                    })
-                                    .text_color(self.shell.color(ShellColor::Text))
-                                    .child(space.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .text_color(self.shell.color(ShellColor::FaintText))
-                                    .child(metadata),
-                            ),
-                    )
-                    .child(close_button),
-            );
+                                ShellColor::Hover
+                            }))
+                        })
+                        .on_click(cx.listener(move |view, _event, window, cx| {
+                            view.select_space(space_id, window, cx)
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .h(px(22.))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .font_weight(gpui::FontWeight::NORMAL)
+                                                .text_color(self.shell.color(ShellColor::Text))
+                                                .child(space.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(if selected { 24. } else { 0. }))
+                                                .when(!selected, |this| {
+                                                    this.group_hover(hover_group.clone(), |this| {
+                                                        this.w(px(24.))
+                                                    })
+                                                }),
+                                        ),
+                                )
+                                .when_some(agents, |this, agents| {
+                                    this.child(self.render_agent_summary(
+                                        space_id,
+                                        agents,
+                                        agents_expanded,
+                                        agent_layout_transition,
+                                        cx,
+                                    ))
+                                })
+                                .when_some(
+                                    terminal_summary.flatten(),
+                                    |this, (title, additional_tabs)| {
+                                        this.child(self.render_compact_terminal_summary(
+                                            title,
+                                            additional_tabs,
+                                        ))
+                                    },
+                                ),
+                        )
+                        .child(close_button),
+                );
         }
         sidebar
             .child(
@@ -1044,6 +1105,202 @@ impl MultiplexerView {
                         }),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn render_agent_summary(
+        &self,
+        space_id: SpaceId,
+        summary: SpaceAgentSummary,
+        expanded: bool,
+        transition: Option<AgentLayoutTransition>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let transitioning = transition.is_some();
+        let visible_count = summary.visible.len();
+        let mut icons = div().flex().items_center().h(px(26.));
+        if !expanded {
+            for (index, entry) in summary.visible.iter().enumerate() {
+                icons = icons.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(index > 0, |this| this.ml(px(-2.)))
+                        .child(transitioning_agent_icon(entry, index, false, transitioning)),
+                );
+            }
+        }
+        let noun = if summary.count == 1 {
+            "agent"
+        } else {
+            "agents"
+        };
+        let count_label = transitioning_agent_count_label(
+            format!("{} {noun}", summary.count),
+            space_id,
+            visible_count,
+            expanded,
+            transitioning,
+        );
+        let toggle = div()
+            .id(("toggle-space-agents", space_id.as_u64()))
+            .flex()
+            .items_center()
+            .h(px(28.))
+            .mt(px(4.))
+            .gap(px(7.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(self.shell.color(ShellColor::MutedText))
+            .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
+            )
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                cx.stop_propagation();
+                let transition = if view.expanded_agent_spaces.insert(space_id) {
+                    AgentLayoutTransition::Expanding
+                } else {
+                    view.expanded_agent_spaces.remove(&space_id);
+                    AgentLayoutTransition::Collapsing
+                };
+                view.agent_layout_transitions.insert(space_id, transition);
+                let timer = cx.background_executor().timer(Duration::from_millis(220));
+                cx.spawn(async move |this, cx| {
+                    timer.await;
+                    let Some(this) = this.upgrade() else {
+                        return;
+                    };
+                    this.update(cx, move |view, cx| {
+                        if view.agent_layout_transitions.get(&space_id) == Some(&transition) {
+                            view.agent_layout_transitions.remove(&space_id);
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                cx.notify();
+            }))
+            .child(self.shell.icon(
+                if expanded {
+                    ShellIcon::ChevronDown
+                } else {
+                    ShellIcon::ChevronRight
+                },
+                self.shell.color(ShellColor::FaintText),
+                12.,
+            ))
+            .when(!expanded, |this| this.child(icons))
+            .child(count_label);
+
+        let mut section = div().flex().flex_col().child(toggle);
+        if expanded {
+            let mut rows = div().flex().flex_col().mt(px(3.)).gap(px(2.));
+            for (index, entry) in summary.visible.into_iter().enumerate() {
+                let tab_id = entry.tab_id;
+                let pane_id = entry.pane_id;
+                let active = self.selection.space_id == Some(space_id)
+                    && self.selection.tab_id == Some(tab_id)
+                    && self.selection.pane_id == Some(pane_id);
+                let text = div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(self.shell.color(ShellColor::Text))
+                            .child(format!(
+                                "{} · {}",
+                                entry.agent.program.label(),
+                                agent_state_label(entry.agent.state)
+                            )),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(self.shell.color(ShellColor::FaintText))
+                            .child(agent_status_detail(entry.agent.state)),
+                    );
+                let text: AnyElement = if transition == Some(AgentLayoutTransition::Expanding) {
+                    text.with_animation(
+                        ("expand-agent-text", entry.terminal_session_id.as_u64()),
+                        Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                        |this, delta| this.relative().left(px(6. * (1. - delta))).opacity(delta),
+                    )
+                    .into_any_element()
+                } else {
+                    text.into_any_element()
+                };
+                rows = rows.child(
+                    div()
+                        .id(("space-agent", entry.terminal_session_id.as_u64()))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px_1()
+                        .py(px(5.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(active, |this| {
+                            this.bg(self.shell.color(ShellColor::Selected))
+                        })
+                        .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |view, _event, window, cx| {
+                            cx.stop_propagation();
+                            view.selection = UiSelection {
+                                space_id: Some(space_id),
+                                tab_id: Some(tab_id),
+                                pane_id: Some(pane_id),
+                            }
+                            .normalized(&view.hierarchy);
+                            view.focus.focus(window, cx);
+                            cx.notify();
+                        }))
+                        .child(transitioning_agent_icon(
+                            &entry,
+                            index,
+                            true,
+                            transition == Some(AgentLayoutTransition::Expanding),
+                        ))
+                        .child(text),
+                );
+            }
+            section = section.child(rows);
+        }
+        transitioning_agent_section(section, space_id, visible_count, expanded, transition)
+    }
+
+    fn render_compact_terminal_summary(&self, title: String, additional_tabs: usize) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(20.))
+            .gap(px(6.))
+            .text_size(px(12.))
+            .text_color(self.shell.color(ShellColor::MutedText))
+            .child(div().min_w_0().truncate().child(title))
+            .when(additional_tabs > 0, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_color(self.shell.color(ShellColor::FaintText))
+                        .child(format!("+{additional_tabs}")),
+                )
+            })
             .into_any_element()
     }
 
@@ -1329,6 +1586,7 @@ impl MultiplexerView {
         if let Some(space) = self.selected_space() {
             for tab in &space.tabs {
                 let tab_id = tab.id;
+                let tab_name = self.tab_display_name(tab);
                 let selected = self.selection.tab_id == Some(tab_id);
                 let hover_group: SharedString = format!("tab-hover-{}", tab_id.as_u64()).into();
                 let close_button = div()
@@ -1402,7 +1660,7 @@ impl MultiplexerView {
                             }),
                             11.,
                         ))
-                        .child(div().flex_1().min_w_0().truncate().child(tab.name.clone()))
+                        .child(div().flex_1().min_w_0().truncate().child(tab_name))
                         .child(close_button),
                 );
             }
@@ -2180,10 +2438,7 @@ impl MultiplexerView {
             .when(axis == SplitAxis::Vertical, |this| {
                 this.h(px(SPLIT_DIVIDER_PX)).w_full().cursor_row_resize()
             })
-            .when(active, |this| {
-                this.bg(self.shell.color(ShellColor::AccentMuted))
-            })
-            .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
+            .bg(self.selected_terminal_background())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, _event, _window, cx| {
@@ -2260,10 +2515,10 @@ impl MultiplexerView {
     ) -> AnyElement {
         let pane_id = pane.id;
         let terminal_session_id = pane.terminal_session_id;
-        let focused = self.selection.pane_id == Some(pane_id)
-            && self
-                .selected_tab()
-                .is_some_and(|tab| matches!(&tab.layout, PaneLayout::Split(_)));
+        let tab_is_split = self
+            .selected_tab()
+            .is_some_and(|tab| matches!(&tab.layout, PaneLayout::Split(_)));
+        let inactive = tab_is_split && self.selection.pane_id != Some(pane_id);
         let Some(snapshot) = self.terminals.get(&terminal_session_id) else {
             return div()
                 .id(("pane", pane_id.as_u64()))
@@ -2276,7 +2531,12 @@ impl MultiplexerView {
                 .child("Starting terminal…")
                 .into_any_element();
         };
-        let frame = TerminalFrame::from_snapshot(snapshot);
+        let frame = if inactive {
+            TerminalFrame::from_snapshot_with_cursor(snapshot, false)
+                .dimmed_toward(snapshot.default_bg, INACTIVE_PANE_CONTRAST)
+        } else {
+            TerminalFrame::from_snapshot(snapshot)
+        };
         let default_bg = self.shell.terminal_background(color(snapshot.default_bg));
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
@@ -2374,10 +2634,6 @@ impl MultiplexerView {
             .min_h_0()
             .overflow_hidden()
             .bg(default_bg)
-            .when(focused, |this| {
-                this.border_1()
-                    .border_color(self.shell.color(ShellColor::Accent))
-            })
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
@@ -2852,6 +3108,247 @@ fn collect_terminal_sessions(layout: &PaneLayout, output: &mut Vec<TerminalSessi
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpaceAgentSummary {
+    count: usize,
+    visible: Vec<SpaceAgentEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpaceAgentEntry {
+    agent: AgentSnapshot,
+    tab_id: TabId,
+    pane_id: PaneId,
+    terminal_session_id: TerminalSessionId,
+}
+
+fn agent_summary_for_space(
+    space: &crate::SpaceSnapshot,
+    terminals: &HashMap<TerminalSessionId, TerminalSnapshot>,
+) -> Option<SpaceAgentSummary> {
+    let mut agents = Vec::new();
+    for tab in &space.tabs {
+        let mut panes = Vec::new();
+        collect_pane_terminals(&tab.layout, &mut panes);
+        agents.extend(
+            panes
+                .into_iter()
+                .filter_map(|(pane_id, terminal_session_id)| {
+                    let agent = terminals.get(&terminal_session_id)?.agent?;
+                    Some(SpaceAgentEntry {
+                        agent,
+                        tab_id: tab.id,
+                        pane_id,
+                        terminal_session_id,
+                    })
+                }),
+        );
+    }
+    prioritized_agent_summary(agents)
+}
+
+fn prioritized_agent_summary(agents: Vec<SpaceAgentEntry>) -> Option<SpaceAgentSummary> {
+    let count = agents.len();
+    let mut agents = agents.into_iter().enumerate().collect::<Vec<_>>();
+    agents.sort_by_key(|(position, entry)| (std::cmp::Reverse(entry.agent.priority()), *position));
+    (count > 0).then(|| SpaceAgentSummary {
+        count,
+        visible: agents.into_iter().take(3).map(|(_, entry)| entry).collect(),
+    })
+}
+
+fn collect_pane_terminals(layout: &PaneLayout, output: &mut Vec<(PaneId, TerminalSessionId)>) {
+    match layout {
+        PaneLayout::Pane(pane) => output.push((pane.id, pane.terminal_session_id)),
+        PaneLayout::Split(split) => {
+            collect_pane_terminals(&split.first, output);
+            collect_pane_terminals(&split.second, output);
+        }
+    }
+}
+
+fn agent_state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "Waiting",
+        AgentState::Working => "Working",
+        AgentState::Blocked => "Needs attention",
+        AgentState::Unknown => "Detected",
+    }
+}
+
+fn agent_status_detail(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "Ready for input",
+        AgentState::Working => "Agent is active",
+        AgentState::Blocked => "Waiting for your input",
+        AgentState::Unknown => "Status unavailable",
+    }
+}
+
+fn transitioning_agent_count_label(
+    label: String,
+    space_id: SpaceId,
+    visible_count: usize,
+    expanded: bool,
+    animate: bool,
+) -> AnyElement {
+    let label = div().flex_none().child(label);
+    if !animate {
+        return label.into_any_element();
+    }
+    let icons_width = if visible_count == 0 {
+        0.
+    } else {
+        22. + visible_count.saturating_sub(1) as f32 * 20.
+    };
+    let travel = icons_width + 7.;
+    let animation_id = if expanded {
+        "expand-agent-count"
+    } else {
+        "collapse-agent-count"
+    };
+    label
+        .with_animation(
+            (animation_id, space_id.as_u64()),
+            Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
+            move |this, delta| {
+                let start = if expanded { travel } else { -travel };
+                this.relative().left(px(start * (1. - delta)))
+            },
+        )
+        .into_any_element()
+}
+
+fn transitioning_agent_section(
+    section: gpui::Div,
+    space_id: SpaceId,
+    visible_count: usize,
+    expanded: bool,
+    transition: Option<AgentLayoutTransition>,
+) -> AnyElement {
+    let collapsed_height = 32.;
+    let expanded_height = 33. + visible_count as f32 * 42.;
+    let target_height = if expanded {
+        expanded_height
+    } else {
+        collapsed_height
+    };
+    let section = section.overflow_hidden().h(px(target_height));
+    let Some(transition) = transition else {
+        return section.into_any_element();
+    };
+    let (start, end, animation_id) = match transition {
+        AgentLayoutTransition::Expanding => {
+            (collapsed_height, expanded_height, "expand-agent-section")
+        }
+        AgentLayoutTransition::Collapsing => {
+            (expanded_height, collapsed_height, "collapse-agent-section")
+        }
+    };
+    section
+        .with_animation(
+            (animation_id, space_id.as_u64()),
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            move |this, delta| this.h(px(start + (end - start) * delta)),
+        )
+        .into_any_element()
+}
+
+fn transitioning_agent_icon(
+    entry: &SpaceAgentEntry,
+    index: usize,
+    expanding: bool,
+    animate: bool,
+) -> AnyElement {
+    let program = entry.agent.program;
+    let horizontal_travel = 15. + index as f32 * 20.;
+    let vertical_travel = 37. + index as f32 * 42.;
+    let resting_diameter = if expanding { 30. } else { 22. };
+    let resting_top = if expanding { -1. } else { 0. };
+    let icon = div()
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .top(px(resting_top))
+        .size(px(resting_diameter));
+    if !animate {
+        return icon
+            .child(agent_icon(program, resting_diameter))
+            .into_any_element();
+    }
+    let animation_id = if expanding {
+        "expand-agent-icon"
+    } else {
+        "collapse-agent-icon"
+    };
+    icon.with_animation(
+        (animation_id, entry.terminal_session_id.as_u64()),
+        Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
+        move |this, delta| {
+            let inverse = 1. - delta;
+            let (left, top, diameter) = if expanding {
+                (
+                    horizontal_travel * inverse,
+                    -vertical_travel * inverse - delta,
+                    22. + 8. * delta,
+                )
+            } else {
+                (
+                    -horizontal_travel * inverse,
+                    (vertical_travel - 1.) * inverse,
+                    30. - 8. * delta,
+                )
+            };
+            this.left(px(left))
+                .top(px(top))
+                .child(agent_icon(program, diameter))
+        },
+    )
+    .into_any_element()
+}
+
+fn agent_icon(program: AgentProgram, diameter: f32) -> AnyElement {
+    match program {
+        AgentProgram::Codex => agent_badge(OPENAI_ICON, rgb(0x101014), diameter),
+        AgentProgram::Claude => agent_badge(CLAUDE_ICON, rgb(0xd97757), diameter),
+        AgentProgram::Gemini => div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(diameter))
+            .child(img(gemini_image()).size(px(diameter)))
+            .into_any_element(),
+    }
+}
+
+fn agent_badge(data: &'static [u8], background: gpui::Rgba, diameter: f32) -> AnyElement {
+    let mark_size = (diameter * 0.55).round();
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(diameter))
+        .rounded_full()
+        .bg(background)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(mark_size))
+                .child(svg().data(data).size_full().text_color(rgb(0xffffff))),
+        )
+        .into_any_element()
+}
+
+fn gemini_image() -> Arc<Image> {
+    static GEMINI: OnceLock<Arc<Image>> = OnceLock::new();
+    Arc::clone(
+        GEMINI.get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Svg, GEMINI_ICON.to_vec()))),
+    )
+}
+
 fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
     if key.modifiers.control && key.key.len() == 1 {
         let byte = key.key.as_bytes()[0].to_ascii_uppercase();
@@ -2958,17 +3455,41 @@ fn windows_caption_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        PasteShortcutPlatform, SplitGeometry, UiSelection, accept_terminal_snapshot, first_pane_id,
-        pane_close_shortcut_for, pane_extents, selection_for_created, selection_for_pane,
-        split_ratio_at, terminal_input_bytes, terminal_paste_shortcut_for,
-        windows_caption_font_for_build,
+        PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, UiSelection,
+        accept_terminal_snapshot, first_pane_id, pane_close_shortcut_for, pane_extents,
+        prioritized_agent_summary, selection_for_created, selection_for_pane, split_ratio_at,
+        terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
     };
     use crate::{
-        CoreCommand, CoreModel, CreatedResource, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
-        TerminalLifecycle, TerminalSnapshot,
+        AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
+        PaneLayout, SplitAxis, SplitPlacement, SplitRatio, TabId, TerminalLifecycle,
+        TerminalSessionId, TerminalSnapshot,
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn compact_agent_summary_keeps_count_and_shows_top_three_by_priority() {
+        let agent = |id, program, state| SpaceAgentEntry {
+            agent: AgentSnapshot { program, state },
+            tab_id: TabId::from_u64(id),
+            pane_id: PaneId::from_u64(id),
+            terminal_session_id: TerminalSessionId::from_u64(id),
+        };
+        let summary = prioritized_agent_summary(vec![
+            agent(1, AgentProgram::Gemini, AgentState::Unknown),
+            agent(2, AgentProgram::Claude, AgentState::Idle),
+            agent(3, AgentProgram::Codex, AgentState::Blocked),
+            agent(4, AgentProgram::Gemini, AgentState::Working),
+        ])
+        .expect("agents produce a summary");
+
+        assert_eq!(summary.count, 4);
+        assert_eq!(summary.visible.len(), 3);
+        assert_eq!(summary.visible[0].agent.state, AgentState::Blocked);
+        assert_eq!(summary.visible[1].agent.state, AgentState::Working);
+        assert_eq!(summary.visible[2].agent.state, AgentState::Idle);
+    }
 
     #[test]
     fn named_space_key_maps_to_ascii_space_without_a_key_char() {
@@ -3189,6 +3710,8 @@ mod tests {
                 revision: 1,
                 lifecycle: TerminalLifecycle::Running,
                 active_work: false,
+                title: None,
+                agent: None,
                 cols: 1,
                 rows: 1,
                 cursor: None,

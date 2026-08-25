@@ -224,6 +224,10 @@ impl PtySession {
         Ok(processes.has_child_process(self.process_id))
     }
 
+    pub fn process_id(&self) -> Option<u32> {
+        Some(self.process_id)
+    }
+
     pub fn pause_reader(&mut self) -> Result<(), String> {
         self.control
             .send(ReaderControl::Pause)

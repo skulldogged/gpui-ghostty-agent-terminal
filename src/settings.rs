@@ -243,6 +243,7 @@ impl AppSettings {
             .map_err(|error| {
                 format!("write temporary settings {}: {error}", temporary.display())
             })?;
+        drop(file);
         replace_file(&temporary, &path)
             .map_err(|error| format!("replace settings {}: {error}", path.display()))
     }

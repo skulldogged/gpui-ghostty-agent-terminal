@@ -58,6 +58,13 @@ pub(crate) struct BackgroundRun {
 
 impl TerminalFrame {
     pub(crate) fn from_snapshot(snapshot: &TerminalSnapshot) -> Self {
+        Self::from_snapshot_with_cursor(snapshot, true)
+    }
+
+    pub(crate) fn from_snapshot_with_cursor(
+        snapshot: &TerminalSnapshot,
+        cursor_visible: bool,
+    ) -> Self {
         let mut cells = vec![None; usize::from(snapshot.cols) * usize::from(snapshot.rows)];
         for cell in &snapshot.cells {
             if let Some(offset) = offset(snapshot.cols, snapshot.rows, cell.x, cell.y) {
@@ -77,7 +84,7 @@ impl TerminalFrame {
                     .expect("in-bounds terminal coordinate")];
                 let width = cell.map(|cell| cell.width).unwrap_or(1);
                 if width == 0 {
-                    if snapshot.cursor == Some((x, y)) {
+                    if cursor_visible && snapshot.cursor == Some((x, y)) {
                         cursor_overlay = Some(BackgroundRun {
                             x,
                             y,
@@ -89,7 +96,7 @@ impl TerminalFrame {
                 }
 
                 let mut foreground = cell.map(|cell| cell.fg).unwrap_or(snapshot.default_fg);
-                let cursor_here = snapshot.cursor == Some((x, y));
+                let cursor_here = cursor_visible && snapshot.cursor == Some((x, y));
                 let mut background = cell.map(|cell| cell.bg).unwrap_or(snapshot.default_bg);
                 if cursor_here {
                     background = foreground;
@@ -139,6 +146,32 @@ impl TerminalFrame {
             cursor_overlay,
         }
     }
+
+    pub(crate) fn dimmed_toward(mut self, background: [u8; 3], contrast: f32) -> Self {
+        for row in &mut self.rows {
+            for run in &mut row.runs {
+                run.color = blend_toward(run.color, background, contrast);
+            }
+            for cell in &mut row.glyph_cells {
+                cell.color = blend_toward(cell.color, background, contrast);
+            }
+        }
+        for run in &mut self.opaque_backgrounds {
+            run.color = blend_toward(run.color, background, contrast);
+        }
+        if let Some(cursor) = &mut self.cursor_overlay {
+            cursor.color = blend_toward(cursor.color, background, contrast);
+        }
+        self
+    }
+}
+
+fn blend_toward(color: [u8; 3], background: [u8; 3], contrast: f32) -> [u8; 3] {
+    let contrast = contrast.clamp(0., 1.);
+    std::array::from_fn(|index| {
+        let background = f32::from(background[index]);
+        (background + (f32::from(color[index]) - background) * contrast).round() as u8
+    })
 }
 
 fn push_text_cell(
@@ -293,6 +326,34 @@ mod tests {
     }
 
     #[test]
+    fn an_inactive_pane_frame_omits_its_cursor() {
+        let snapshot = snapshot(
+            Some((1, 0)),
+            vec![
+                cell(0, 0, 2, "界", [0xaa, 0xbb, 0xcc]),
+                cell(1, 0, 0, "", [0xaa, 0xbb, 0xcc]),
+            ],
+        );
+
+        let frame = TerminalFrame::from_snapshot_with_cursor(&snapshot, false);
+
+        assert!(frame.cursor_overlay.is_none());
+        assert!(frame.opaque_backgrounds.is_empty());
+    }
+
+    #[test]
+    fn an_inactive_pane_frame_reduces_color_contrast() {
+        let frame = TerminalFrame::from_snapshot_with_cursor(
+            &snapshot(None, vec![cell(0, 0, 1, "x", [0xaa, 0xbb, 0xcc])]),
+            false,
+        )
+        .dimmed_toward([0; 3], 0.5);
+
+        assert_eq!(frame.rows[0].runs[0].color, [0x55, 0x5e, 0x66]);
+        assert_eq!(frame.rows[0].glyph_cells[0].color, [0x55, 0x5e, 0x66]);
+    }
+
+    #[test]
     fn every_glyph_in_a_combining_cluster_maps_to_one_terminal_cell() {
         let frame = TerminalFrame::from_snapshot(&snapshot(
             None,
@@ -313,6 +374,8 @@ mod tests {
             revision: 1,
             lifecycle: TerminalLifecycle::Running,
             active_work: false,
+            title: None,
+            agent: None,
             cols: 4,
             rows: 1,
             cursor,

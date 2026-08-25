@@ -168,6 +168,19 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
   if (!success(result)) return result;
   snapshot->alternate_screen = alternate_screen || alternate_screen_save;
 
+  GhosttyString title = {0};
+  result = ghostty_terminal_get(spike->terminal, GHOSTTY_TERMINAL_DATA_TITLE,
+                                &title);
+  if (!success(result)) return result;
+  size_t title_len = title.len;
+  if (title_len > sizeof(snapshot->title)) {
+    title_len = sizeof(snapshot->title);
+  }
+  if (title_len > 0 && title.ptr != NULL) {
+    memcpy(snapshot->title, title.ptr, title_len);
+  }
+  snapshot->title_len = (uint16_t)title_len;
+
   GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
   result = ghostty_render_state_colors_get(spike->render, &colors);
   if (!success(result)) return result;

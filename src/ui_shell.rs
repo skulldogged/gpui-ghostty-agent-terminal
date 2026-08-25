@@ -42,6 +42,8 @@ pub(crate) enum ShellIcon {
     SidebarClose,
     SidebarOpen,
     Close,
+    ChevronRight,
+    ChevronDown,
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +121,10 @@ impl WorkspaceShell {
 
     pub(crate) fn opaque_color(&self, role: ShellColor) -> Rgba {
         self.base_color(role)
+    }
+
+    pub(crate) fn control_hover(&self) -> Rgba {
+        self.base_color(ShellColor::Text).alpha(0.16)
     }
 
     pub(crate) fn icon(&self, icon: ShellIcon, color: Rgba, size: f32) -> gpui::Div {
@@ -285,6 +291,8 @@ impl ShellIcon {
             Self::SidebarClose => lucide_icons::Icon::PanelLeftClose,
             Self::SidebarOpen => lucide_icons::Icon::PanelLeftOpen,
             Self::Close => lucide_icons::Icon::X,
+            Self::ChevronRight => lucide_icons::Icon::ChevronRight,
+            Self::ChevronDown => lucide_icons::Icon::ChevronDown,
         }
     }
 }
