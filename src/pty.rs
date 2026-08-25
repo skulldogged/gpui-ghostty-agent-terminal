@@ -92,6 +92,11 @@ impl ProcessSnapshot {
         shell_process_id: u32,
     ) -> Option<crate::agent_integration::AgentProgram> {
         let shell_process_id = sysinfo::Pid::from_u32(shell_process_id);
+        if let Some(process) = self.system.process(shell_process_id)
+            && let Some(agent) = agent_program_for_process(process)
+        {
+            return Some(agent);
+        }
         let mut frontier = vec![shell_process_id];
         let mut visited = std::collections::HashSet::from([shell_process_id]);
 
@@ -107,15 +112,7 @@ impl ProcessSnapshot {
                     if !visited.insert(pid) {
                         continue;
                     }
-                    let command = process
-                        .cmd()
-                        .iter()
-                        .map(|argument| argument.to_string_lossy().into_owned())
-                        .collect::<Vec<_>>();
-                    if let Some(agent) = crate::agent_integration::AgentProgram::from_process(
-                        &process.name().to_string_lossy(),
-                        &command,
-                    ) {
+                    if let Some(agent) = agent_program_for_process(process) {
                         return Some(agent);
                     }
                     next.push(pid);
@@ -125,6 +122,20 @@ impl ProcessSnapshot {
         }
         None
     }
+}
+
+fn agent_program_for_process(
+    process: &sysinfo::Process,
+) -> Option<crate::agent_integration::AgentProgram> {
+    let command = process
+        .cmd()
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    crate::agent_integration::AgentProgram::from_process(
+        &process.name().to_string_lossy(),
+        &command,
+    )
 }
 
 #[cfg(windows)]

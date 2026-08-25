@@ -107,44 +107,40 @@ fn direct_agent_name(name: &str) -> Option<AgentProgram> {
 
 fn detect_state(program: AgentProgram, title: &str, screen: &str) -> AgentState {
     let title_lower = title.to_lowercase();
-    let screen_lower = screen.to_lowercase();
 
-    if title_lower.contains("action required")
-        || screen_lower.contains("waiting for user confirmation")
-        || screen_lower.contains("do you want to proceed?")
-        || screen_lower.contains("allow execution")
-        || screen_lower.contains("would you like to run")
-        || screen_lower.contains("press enter to confirm")
-    {
+    if title_lower.contains("action required") {
         return AgentState::Blocked;
     }
 
-    let visible_working = screen_lower.contains("esc to interrupt")
-        || screen_lower.contains("esc to cancel")
-        || (program == AgentProgram::Codex && title.chars().any(is_braille_spinner));
-    if visible_working {
+    if program == AgentProgram::Codex && title.chars().any(is_braille_spinner) {
         return AgentState::Working;
     }
 
-    let visible_idle = match program {
-        AgentProgram::Codex => !title.trim().is_empty(),
-        AgentProgram::Claude => {
-            title.starts_with("✳ ")
-                || screen
-                    .lines()
-                    .rev()
-                    .take(8)
-                    .any(|line| line.trim_start().starts_with('❯'))
+    for line in screen.lines().rev() {
+        let line = line.trim_start();
+        let line_lower = line.to_lowercase();
+        if line_lower.contains("waiting for user confirmation")
+            || line_lower.contains("do you want to proceed?")
+            || line_lower.contains("allow execution")
+            || line_lower.contains("would you like to run")
+            || line_lower.contains("press enter to confirm")
+        {
+            return AgentState::Blocked;
         }
-        AgentProgram::Gemini => screen.lines().rev().take(8).any(|line| {
-            let line = line.trim_start();
-            line.starts_with('>') || line.starts_with('❯')
-        }),
-    };
-    if visible_idle {
-        AgentState::Idle
-    } else {
-        AgentState::Unknown
+        if line_lower.contains("esc to interrupt") || line_lower.contains("esc to cancel") {
+            return AgentState::Working;
+        }
+        if matches!(program, AgentProgram::Claude | AgentProgram::Gemini)
+            && (line.starts_with('❯') || (program == AgentProgram::Gemini && line.starts_with('>')))
+        {
+            return AgentState::Idle;
+        }
+    }
+
+    match program {
+        AgentProgram::Codex if !title.trim().is_empty() => AgentState::Idle,
+        AgentProgram::Claude if title.starts_with("✳ ") => AgentState::Idle,
+        _ => AgentState::Unknown,
     }
 }
 
@@ -217,6 +213,15 @@ mod tests {
         assert_eq!(
             AgentSnapshot::from_screen(AgentProgram::Claude, None, "❯ ").state,
             AgentState::Idle
+        );
+        assert_eq!(
+            AgentSnapshot::from_screen(
+                AgentProgram::Claude,
+                None,
+                "Do you want to proceed?\nApproved\nThinking…  esc to interrupt"
+            )
+            .state,
+            AgentState::Working
         );
     }
 
