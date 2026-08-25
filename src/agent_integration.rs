@@ -36,31 +36,37 @@ impl AgentProgram {
 
     pub(crate) fn from_process(process_name: &str, command: &[String]) -> Option<Self> {
         let executable = normalized_executable(process_name);
-        direct_agent_name(&executable).or_else(|| {
-            let command = command
-                .iter()
-                .map(|argument| argument.to_lowercase().replace('\\', "/"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if command.contains("@openai/codex")
-                || command.contains("/codex/bin/")
-                || command.contains("/codex.js")
-            {
-                Some(Self::Codex)
-            } else if command.contains("@anthropic-ai/claude-code")
-                || command.contains("/claude-code/")
-                || command.contains("/claude/cli.js")
-            {
-                Some(Self::Claude)
-            } else if command.contains("@google/gemini-cli")
-                || command.contains("/gemini-cli/")
-                || command.contains("/gemini.js")
-            {
-                Some(Self::Gemini)
-            } else {
-                None
-            }
-        })
+        direct_agent_name(&executable)
+            .or_else(|| {
+                command
+                    .first()
+                    .and_then(|argument| direct_agent_name(&normalized_executable(argument)))
+            })
+            .or_else(|| {
+                let command = command
+                    .iter()
+                    .map(|argument| argument.to_lowercase().replace('\\', "/"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if command.contains("@openai/codex")
+                    || command.contains("/codex/bin/")
+                    || command.contains("/codex.js")
+                {
+                    Some(Self::Codex)
+                } else if command.contains("@anthropic-ai/claude-code")
+                    || command.contains("/claude-code/")
+                    || command.contains("/claude/cli.js")
+                {
+                    Some(Self::Claude)
+                } else if command.contains("@google/gemini-cli")
+                    || command.contains("/gemini-cli/")
+                    || command.contains("/gemini.js")
+                {
+                    Some(Self::Gemini)
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -183,6 +189,25 @@ mod tests {
                 ]
             ),
             Some(AgentProgram::Gemini)
+        );
+    }
+
+    #[test]
+    fn process_detection_uses_argv_zero_for_wrapped_agent_binaries() {
+        assert_eq!(
+            AgentProgram::from_process(".claude-wrapped", &["claude".into()]),
+            Some(AgentProgram::Claude)
+        );
+        assert_eq!(
+            AgentProgram::from_process(
+                ".codex-wrapped",
+                &["/etc/profiles/per-user/example/bin/codex".into()]
+            ),
+            Some(AgentProgram::Codex)
+        );
+        assert_eq!(
+            AgentProgram::from_process("bash", &["bash".into(), "claude".into()]),
+            None
         );
     }
 
