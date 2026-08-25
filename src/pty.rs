@@ -74,7 +74,7 @@ impl ProcessSnapshot {
         self.system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             sysinfo::ProcessRefreshKind::new()
-                .with_cmd(sysinfo::UpdateKind::Always)
+                .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
                 .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
         );
     }
