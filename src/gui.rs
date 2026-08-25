@@ -11,21 +11,21 @@ use crate::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations,
-    FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, Keystroke, MouseButton,
-    MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel, Render, ShapedLine, SharedString,
-    Task, TextRun, Window, WindowControlArea, canvas, div, ease_out_quint, fill, font, img, point,
+    FocusHandle, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point,
+    PromptButton, PromptLevel, Render, ShapedLine, SharedString, Task, TextRun, Transformation,
+    Window, WindowControlArea, canvas, div, ease_out_quint, fill, font, percentage, point,
     prelude::*, px, rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
 const INACTIVE_PANE_CONTRAST: f32 = 0.62;
-const OPENAI_ICON: &[u8] = include_bytes!("../assets/svgl/openai.svg");
-const CLAUDE_ICON: &[u8] = include_bytes!("../assets/svgl/claude.svg");
-const GEMINI_ICON: &[u8] = include_bytes!("../assets/svgl/gemini.svg");
+const OPENAI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/openai.svg");
+const CLAUDE_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/claude.svg");
+const GEMINI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/gemini.svg");
+const CHEVRON_RIGHT_ICON: &[u8] = include_bytes!("../assets/lucide/chevron-right.svg");
 
 pub(crate) fn open_terminal_window(
     cx: &mut App,
@@ -1146,16 +1146,20 @@ impl MultiplexerView {
         let toggle = div()
             .id(("toggle-space-agents", space_id.as_u64()))
             .flex()
+            .flex_none()
             .items_center()
+            .w_full()
             .h(px(28.))
             .mt(px(4.))
+            .pl(px(3.))
+            .pr(px(2.))
             .gap(px(7.))
             .rounded_md()
             .cursor_pointer()
             .text_size(px(12.))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(self.shell.color(ShellColor::MutedText))
-            .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
+            .hover(|this| this.bg(self.shell.control_hover()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -1185,21 +1189,19 @@ impl MultiplexerView {
                 .detach();
                 cx.notify();
             }))
-            .child(self.shell.icon(
-                if expanded {
-                    ShellIcon::ChevronDown
-                } else {
-                    ShellIcon::ChevronRight
-                },
-                self.shell.color(ShellColor::FaintText),
-                12.,
-            ))
             .when(!expanded, |this| this.child(icons))
-            .child(count_label);
+            .child(count_label)
+            .child(div().flex_1())
+            .child(transitioning_agent_chevron(
+                space_id,
+                expanded,
+                transition,
+                self.shell.color(ShellColor::FaintText),
+            ));
 
         let mut section = div().flex().flex_col().child(toggle);
         if expanded {
-            let mut rows = div().flex().flex_col().mt(px(3.)).gap(px(2.));
+            let mut rows = div().flex().flex_col().flex_none().mt(px(3.)).gap(px(2.));
             for (index, entry) in summary.visible.into_iter().enumerate() {
                 let tab_id = entry.tab_id;
                 let pane_id = entry.pane_id;
@@ -1216,6 +1218,7 @@ impl MultiplexerView {
                         div()
                             .truncate()
                             .text_size(px(12.))
+                            .line_height(px(19.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(self.shell.color(ShellColor::Text))
                             .child(format!(
@@ -1228,6 +1231,7 @@ impl MultiplexerView {
                         div()
                             .truncate()
                             .text_size(px(11.))
+                            .line_height(px(18.))
                             .text_color(self.shell.color(ShellColor::FaintText))
                             .child(agent_status_detail(entry.agent.state)),
                     );
@@ -1245,6 +1249,7 @@ impl MultiplexerView {
                     div()
                         .id(("space-agent", entry.terminal_session_id.as_u64()))
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap(px(8.))
                         .px_1()
@@ -1254,7 +1259,7 @@ impl MultiplexerView {
                         .when(active, |this| {
                             this.bg(self.shell.color(ShellColor::Selected))
                         })
-                        .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
+                        .hover(|this| this.bg(self.shell.control_hover()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -3219,6 +3224,41 @@ fn transitioning_agent_count_label(
         .into_any_element()
 }
 
+fn transitioning_agent_chevron(
+    space_id: SpaceId,
+    expanded: bool,
+    transition: Option<AgentLayoutTransition>,
+    color: gpui::Rgba,
+) -> AnyElement {
+    let chevron = svg()
+        .data(CHEVRON_RIGHT_ICON)
+        .size(px(12.))
+        .text_color(color);
+    let Some(transition) = transition else {
+        let rotation = if expanded { 0.25 } else { 0. };
+        return chevron
+            .with_transformation(Transformation::rotate(percentage(rotation)))
+            .into_any_element();
+    };
+    let animation_id = match transition {
+        AgentLayoutTransition::Expanding => "expand-agent-chevron",
+        AgentLayoutTransition::Collapsing => "collapse-agent-chevron",
+    };
+    chevron
+        .with_animation(
+            (animation_id, space_id.as_u64()),
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            move |chevron, delta| {
+                let rotation = match transition {
+                    AgentLayoutTransition::Expanding => delta * 0.25,
+                    AgentLayoutTransition::Collapsing => (1. - delta) * 0.25,
+                };
+                chevron.with_transformation(Transformation::rotate(percentage(rotation)))
+            },
+        )
+        .into_any_element()
+}
+
 fn transitioning_agent_section(
     section: gpui::Div,
     space_id: SpaceId,
@@ -3227,16 +3267,18 @@ fn transitioning_agent_section(
     transition: Option<AgentLayoutTransition>,
 ) -> AnyElement {
     let collapsed_height = 32.;
-    let expanded_height = 33. + visible_count as f32 * 42.;
-    let target_height = if expanded {
-        expanded_height
-    } else {
-        collapsed_height
-    };
-    let section = section.overflow_hidden().h(px(target_height));
+    let expanded_height = 33. + visible_count as f32 * 50.;
     let Some(transition) = transition else {
-        return section.into_any_element();
+        return if expanded {
+            section.into_any_element()
+        } else {
+            section
+                .overflow_hidden()
+                .h(px(collapsed_height))
+                .into_any_element()
+        };
     };
+    let section = section.overflow_hidden();
     let (start, end, animation_id) = match transition {
         AgentLayoutTransition::Expanding => {
             (collapsed_height, expanded_height, "expand-agent-section")
@@ -3297,8 +3339,8 @@ fn agent_icon_resting_geometry(expanded: bool) -> (f32, f32) {
 }
 
 fn agent_icon_transition_geometry(index: usize, expanding: bool, delta: f32) -> (f32, f32, f32) {
-    let horizontal_travel = 15. + index as f32 * 20.;
-    let vertical_travel = 37. + index as f32 * 42.;
+    let horizontal_travel = -1. + index as f32 * 20.;
+    let vertical_travel = 33. + index as f32 * 50.;
     let inverse = 1. - delta;
     if expanding {
         (
@@ -3316,21 +3358,12 @@ fn agent_icon_transition_geometry(index: usize, expanding: bool, delta: f32) -> 
 }
 
 fn agent_icon(program: AgentProgram, diameter: f32) -> AnyElement {
-    match program {
-        AgentProgram::Codex => agent_badge(OPENAI_ICON, rgb(0x101014), diameter),
-        AgentProgram::Claude => agent_badge(CLAUDE_ICON, rgb(0xd97757), diameter),
-        AgentProgram::Gemini => div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(diameter))
-            .child(img(gemini_image()).size(px(diameter)))
-            .into_any_element(),
-    }
-}
+    let background = match program {
+        AgentProgram::Codex => rgb(0x101014),
+        AgentProgram::Claude => rgb(0xd97757),
+        AgentProgram::Gemini => rgb(0x4285f4),
+    };
 
-fn agent_badge(data: &'static [u8], background: gpui::Rgba, diameter: f32) -> AnyElement {
-    let mark_size = agent_badge_mark_size(diameter);
     div()
         .flex()
         .items_center()
@@ -3339,26 +3372,20 @@ fn agent_badge(data: &'static [u8], background: gpui::Rgba, diameter: f32) -> An
         .rounded_full()
         .bg(background)
         .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(mark_size))
-                .child(svg().data(data).size_full().text_color(rgb(0xffffff))),
+            svg()
+                .data(agent_icon_data(program))
+                .size_full()
+                .text_color(rgb(0xffffff)),
         )
         .into_any_element()
 }
 
-fn agent_badge_mark_size(diameter: f32) -> f32 {
-    let rounded = (diameter * 0.55).round() as u32;
-    (rounded + rounded % 2) as f32
-}
-
-fn gemini_image() -> Arc<Image> {
-    static GEMINI: OnceLock<Arc<Image>> = OnceLock::new();
-    Arc::clone(
-        GEMINI.get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Svg, GEMINI_ICON.to_vec()))),
-    )
+fn agent_icon_data(program: AgentProgram) -> &'static [u8] {
+    match program {
+        AgentProgram::Codex => OPENAI_AGENT_ICON,
+        AgentProgram::Claude => CLAUDE_AGENT_ICON,
+        AgentProgram::Gemini => GEMINI_AGENT_ICON,
+    }
 }
 
 fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
@@ -3467,11 +3494,12 @@ fn windows_caption_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        OPENAI_ICON, PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, UiSelection,
-        accept_terminal_snapshot, agent_badge_mark_size, agent_icon_resting_geometry,
-        agent_icon_transition_geometry, first_pane_id, pane_close_shortcut_for, pane_extents,
-        prioritized_agent_summary, selection_for_created, selection_for_pane, split_ratio_at,
-        terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
+        CLAUDE_AGENT_ICON, GEMINI_AGENT_ICON, OPENAI_AGENT_ICON, PasteShortcutPlatform,
+        SpaceAgentEntry, SplitGeometry, UiSelection, accept_terminal_snapshot, agent_icon_data,
+        agent_icon_resting_geometry, agent_icon_transition_geometry, first_pane_id,
+        pane_close_shortcut_for, pane_extents, prioritized_agent_summary, selection_for_created,
+        selection_for_pane, split_ratio_at, terminal_input_bytes, terminal_paste_shortcut_for,
+        windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
@@ -3489,17 +3517,18 @@ mod tests {
     }
 
     #[test]
-    fn agent_badge_marks_use_even_resting_dimensions() {
-        assert_eq!(agent_badge_mark_size(30.), 18.);
-        assert_eq!(agent_badge_mark_size(22.), 12.);
-    }
-
-    #[test]
-    fn openai_icon_keeps_the_complete_svgl_canvas() {
-        let svg = std::str::from_utf8(OPENAI_ICON).expect("OpenAI icon is UTF-8 SVG");
-
-        assert!(svg.contains("viewBox=\"0 0 256 260\""));
-        assert!(!svg.contains("viewBox=\"-4.5 10.5 256 260\""));
+    fn agent_marks_use_one_shared_vector_canvas() {
+        for (program, data) in [
+            (AgentProgram::Codex, OPENAI_AGENT_ICON),
+            (AgentProgram::Claude, CLAUDE_AGENT_ICON),
+            (AgentProgram::Gemini, GEMINI_AGENT_ICON),
+        ] {
+            let svg = std::str::from_utf8(data).expect("agent mark is UTF-8 SVG");
+            assert!(svg.contains("viewBox=\"0 0 64 64\""));
+            assert!(svg.contains("<path"));
+            assert!(!svg.contains("<circle"));
+            assert_eq!(agent_icon_data(program), data);
+        }
     }
 
     #[test]

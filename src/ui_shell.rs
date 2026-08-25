@@ -42,8 +42,6 @@ pub(crate) enum ShellIcon {
     SidebarClose,
     SidebarOpen,
     Close,
-    ChevronRight,
-    ChevronDown,
 }
 
 #[derive(Clone, Copy)]
@@ -291,8 +289,6 @@ impl ShellIcon {
             Self::SidebarClose => lucide_icons::Icon::PanelLeftClose,
             Self::SidebarOpen => lucide_icons::Icon::PanelLeftOpen,
             Self::Close => lucide_icons::Icon::X,
-            Self::ChevronRight => lucide_icons::Icon::ChevronRight,
-            Self::ChevronDown => lucide_icons::Icon::ChevronDown,
         }
     }
 }
