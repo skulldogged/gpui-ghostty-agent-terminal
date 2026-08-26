@@ -412,10 +412,13 @@ fn run_terminal_runtime(
                         size,
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
-                            runtime.resize(terminal_session_id, size).map(|changed| {
-                                if changed
-                                    && let Ok(revision) =
-                                        runtime.terminal_revision(terminal_session_id)
+                            runtime.resize(terminal_session_id, size).map(|_changed| {
+                                // A successful no-op resize still acknowledges the current
+                                // geometry. This matters when an interactive drag reverses and a
+                                // coalesced final target is already applied: the GUI may have
+                                // deferred that target's earlier snapshot while waiting for an
+                                // intermediate size.
+                                if let Ok(revision) = runtime.terminal_revision(terminal_session_id)
                                 {
                                     changed_terminals.push((terminal_session_id, revision));
                                 }
@@ -796,9 +799,12 @@ impl From<ghostty::Cell> for TerminalCell {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalLifecycle, TerminalSnapshot, TerminalUpdate, apply_terminal_update};
-    use crate::TerminalSessionId;
+    use super::{
+        ApplicationCore, TerminalLifecycle, TerminalSnapshot, TerminalUpdate, apply_terminal_update,
+    };
+    use crate::{TerminalSessionId, TerminalSize};
     use std::collections::HashMap;
+    use std::time::Duration;
 
     #[test]
     fn a_new_full_frame_replaces_an_older_cached_snapshot() {
@@ -818,5 +824,29 @@ mod tests {
 
         assert_eq!(replacement.revision, 2);
         assert_eq!(snapshots[&terminal_session_id].revision, 2);
+    }
+
+    #[test]
+    fn a_no_op_resize_republishes_the_current_terminal_projection() {
+        let core = ApplicationCore::start().expect("start application core");
+        let changes = core.terminal_changes();
+        let terminal_session_id = core.core_snapshot().terminal_sessions[0].id;
+        let size = TerminalSize::new(100, 30, 9, 20);
+
+        core.resize_terminal(terminal_session_id, size)
+            .expect("apply initial resize");
+        let initial = changes
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initial resize publishes a terminal projection");
+
+        core.resize_terminal(terminal_session_id, size)
+            .expect("repeat current resize");
+        let repeated = changes
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no-op resize republishes the current terminal projection");
+
+        assert_eq!(initial.terminal_session_id, terminal_session_id);
+        assert_eq!(repeated.terminal_session_id, terminal_session_id);
+        assert_eq!(repeated.terminal_revision, initial.terminal_revision);
     }
 }
