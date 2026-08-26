@@ -4,7 +4,7 @@ use crate::{
     TabId, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
     core_model::default_space_name,
-    settings::{AppSettings, KeybindAction, MAX_FONT_SIZE, MIN_FONT_SIZE, Shortcut, ThemePreset},
+    settings::{AppSettings, KeybindAction, Shortcut, ThemePreset, adjust_font_size},
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{
         CellMetrics, GridDimensions, fixed_cell_glyph_x, font_points_to_pixels,
@@ -2098,7 +2098,7 @@ impl MultiplexerView {
                         .gap_1()
                         .child(self.settings_step_button("font-size-down", "−").on_click(
                             cx.listener(|view, _event, _window, cx| {
-                                let size = (view.settings.font_size - 1.).max(MIN_FONT_SIZE);
+                                let size = adjust_font_size(view.settings.font_size, -1.);
                                 view.update_terminal_font(
                                     view.settings.font_family.clone(),
                                     size,
@@ -2122,7 +2122,7 @@ impl MultiplexerView {
                         )
                         .child(self.settings_step_button("font-size-up", "+").on_click(
                             cx.listener(|view, _event, _window, cx| {
-                                let size = (view.settings.font_size + 1.).min(MAX_FONT_SIZE);
+                                let size = adjust_font_size(view.settings.font_size, 1.);
                                 view.update_terminal_font(
                                     view.settings.font_family.clone(),
                                     size,

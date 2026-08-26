@@ -330,6 +330,10 @@ fn minimum_persisted_font_size() -> f32 {
     MIN_FONT_SIZE.min(font_pixels_to_points(MIN_FONT_SIZE))
 }
 
+pub(crate) fn adjust_font_size(font_size: f32, delta: f32) -> f32 {
+    (font_size + delta).clamp(minimum_persisted_font_size(), MAX_FONT_SIZE)
+}
+
 pub(crate) fn default_shortcut(action: KeybindAction) -> Shortcut {
     let macos = cfg!(target_os = "macos");
     let mut shortcut = Shortcut {
@@ -464,6 +468,8 @@ mod tests {
     fn legacy_minimum_pixel_size_survives_point_migration() {
         let migrated = AppSettings::decode(r#"{"font_size":8}"#).unwrap();
         assert_eq!(migrated.font_size, font_pixels_to_points(8.));
+
+        assert_eq!(adjust_font_size(migrated.font_size, -1.), migrated.font_size);
 
         let serialized = serde_json::to_string(&migrated).unwrap();
         let decoded = AppSettings::decode(&serialized).unwrap();
