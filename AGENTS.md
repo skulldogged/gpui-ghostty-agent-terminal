@@ -8,6 +8,10 @@ Issues and specs are tracked in this repository's GitHub Issues. See `docs/agent
 
 When starting, resuming, or moving implementation between development machines, follow `docs/agents/cross-machine-work.md`.
 
+### Native GitHub stacks
+
+Call pull requests a native GitHub stack only after GitHub has created a stack object. A compatible base/head branch chain is a prerequisite, not proof of membership. Create or link the stack with GitHub's stack UI, `gh stack`, or the Stacks REST API; then read it back with API version `2026-03-10` and verify the pull request's non-null `stack` field plus the ordered pull request list from `/repos/{owner}/{repo}/stacks/{stack_number}`. Report the stack number, position, and size when declaring the stack complete.
+
 ### Triage labels
 
 Triage uses the five default Matt Pocock skill labels. See `docs/agents/triage-labels.md`.
@@ -34,4 +38,4 @@ This is a single-context repository. See `docs/agents/domain.md`.
 ### Review signal
 
 - Report correctness, process-lifetime, resource-safety, security, and supported-platform regressions introduced by the change. Do not report style preferences, naming opinions, or speculative abstractions without a concrete failure mode.
-- Run one local `codex review` after a PR is a merge candidate. Do not request a GitHub `@codex review` unless the operator explicitly asks for one. Run another local review only after a material finding required changes.
+- Use local Codex review proportionally. Run one when a material PR becomes a merge candidate or when the change carries meaningful correctness, lifetime, resource-safety, security, or supported-platform risk. For a trivial low-risk change—such as a few documentation lines or an obvious small single-file edit—use targeted validation and omit the full review. Do not request a GitHub `@codex review` unless the operator explicitly asks for one. Run another local review only after a material finding required changes.
