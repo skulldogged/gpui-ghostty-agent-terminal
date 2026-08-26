@@ -47,8 +47,8 @@ cargo run --release -- --development
 The renderer selects and verifies a native fixed-pitch family on each platform:
 Menlo/SF Mono on macOS, Cascadia Mono/Consolas on Windows, and DejaVu Sans Mono
 or Liberation Mono on Linux. `AGENT_TERMINAL_FONT` can request another installed
-fixed-pitch family, and `AGENT_TERMINAL_FONT_SIZE` accepts sizes from 8 through
-48 pixels.
+fixed-pitch family, and `AGENT_TERMINAL_FONT_SIZE` accepts point sizes from 8
+through 48.
 
 The native workspace shell uses platform window materials when they are
 available: Acrylic blur on supported Windows, native blur on macOS, and

@@ -1,9 +1,9 @@
-use crate::ghostty::SNAPSHOT_CELL_CAPACITY;
+use crate::{ghostty::SNAPSHOT_CELL_CAPACITY, terminal_session::TerminalSize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellMetrics {
-    pub width_px: u16,
-    pub height_px: u16,
+    width_px: u16,
+    height_px: u16,
 }
 
 impl CellMetrics {
@@ -12,6 +12,50 @@ impl CellMetrics {
             width_px,
             height_px,
         }
+    }
+
+    pub fn width_px(self) -> f32 {
+        f32::from(self.width_px)
+    }
+
+    pub fn height_px(self) -> f32 {
+        f32::from(self.height_px)
+    }
+
+    #[cfg(test)]
+    pub fn grid_width_px(self, cols: u16) -> f32 {
+        self.width_px() * f32::from(cols)
+    }
+
+    pub fn terminal_size(self, dimensions: GridDimensions) -> TerminalSize {
+        TerminalSize::new(
+            dimensions.cols,
+            dimensions.rows,
+            self.width_px,
+            self.height_px,
+        )
+    }
+}
+
+const PLATFORM_FONT_DPI: f32 = if cfg!(target_os = "macos") { 72. } else { 96. };
+
+pub fn font_points_to_pixels(font_size_points: f32) -> f32 {
+    font_points_to_pixels_at_dpi(font_size_points, PLATFORM_FONT_DPI)
+}
+
+pub fn font_pixels_to_points(font_size_px: f32) -> f32 {
+    font_size_px * 72. / PLATFORM_FONT_DPI
+}
+
+fn font_points_to_pixels_at_dpi(font_size_points: f32, dpi: f32) -> f32 {
+    font_size_points * dpi / 72.
+}
+
+pub fn measured_cell_width(advance_px: f32) -> u16 {
+    if advance_px.is_finite() {
+        advance_px.round().clamp(1., f32::from(u16::MAX)) as u16
+    } else {
+        1
     }
 }
 
@@ -35,11 +79,11 @@ impl GridDimensions {
         padding_px: f32,
         cells: CellMetrics,
     ) -> Self {
-        let content_width = (view_width_px - padding_px * 2.0).max(f32::from(cells.width_px));
-        let content_height = (view_height_px - padding_px * 2.0).max(f32::from(cells.height_px));
+        let content_width = (view_width_px - padding_px * 2.0).max(cells.width_px());
+        let content_height = (view_height_px - padding_px * 2.0).max(cells.height_px());
         fit_within_capacity(Self {
-            cols: cell_count(content_width, cells.width_px),
-            rows: cell_count(content_height, cells.height_px),
+            cols: cell_count(content_width, cells.width_px()),
+            rows: cell_count(content_height, cells.height_px()),
         })
     }
 }
@@ -63,8 +107,8 @@ fn fit_within_capacity(dimensions: GridDimensions) -> GridDimensions {
     GridDimensions { cols, rows }
 }
 
-fn cell_count(available_px: f32, cell_px: u16) -> u16 {
-    (available_px / f32::from(cell_px))
+fn cell_count(available_px: f32, cell_px: f32) -> u16 {
+    (available_px / cell_px)
         .floor()
         .clamp(1.0, f32::from(u16::MAX)) as u16
 }
@@ -75,17 +119,19 @@ pub fn cell_offset(cols: u16, x: u16, y: u16) -> Option<usize> {
 
 pub(crate) fn fixed_cell_glyph_x(
     cell_x: u16,
-    cell_width_px: u16,
+    cell_width_px: f32,
     natural_glyph_x: f32,
     natural_cell_x: f32,
 ) -> f32 {
-    f32::from(cell_x) * f32::from(cell_width_px) + natural_glyph_x - natural_cell_x
+    f32::from(cell_x) * cell_width_px + natural_glyph_x - natural_cell_x
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CellMetrics, GridDimensions, cell_offset, fixed_cell_glyph_x, measured_cell_height,
+        CellMetrics, GridDimensions, cell_offset, fixed_cell_glyph_x, font_pixels_to_points,
+        font_points_to_pixels, font_points_to_pixels_at_dpi, measured_cell_height,
+        measured_cell_width,
     };
 
     #[test]
@@ -128,17 +174,60 @@ mod tests {
     #[test]
     fn repeated_glyphs_stay_anchored_to_the_cursor_grid() {
         let natural_advance = 8.25;
-        let cell_width = 9;
+        let cell_width = 9.;
 
         for cell_x in 0..64 {
             let natural_x = f32::from(cell_x) * natural_advance;
             let painted_x = fixed_cell_glyph_x(cell_x, cell_width, natural_x, natural_x);
-            assert_eq!(painted_x, f32::from(cell_x) * f32::from(cell_width));
+            assert_eq!(painted_x, f32::from(cell_x) * cell_width);
         }
     }
 
     #[test]
+    fn point_sized_font_uses_ghostty_style_nearest_pixel_cells() {
+        let measured_advance_at_fourteen_pixels = 7.636_364;
+        let font_size_px = font_points_to_pixels_at_dpi(10., 96.);
+        let natural_advance = measured_advance_at_fourteen_pixels * font_size_px / 14.;
+        let cols = 54;
+        let cells = CellMetrics::new(measured_cell_width(natural_advance), 20);
+        let size = cells.terminal_size(GridDimensions { cols, rows: 24 });
+
+        assert!((font_size_px - 13.333_333).abs() < 0.001);
+        assert!((natural_advance - 7.272_727).abs() < 0.001);
+        assert_eq!(cells.grid_width_px(cols), 378.);
+        assert_eq!(size.cell_width_px, 7);
+        assert_eq!(cols * size.cell_width_px, 378);
+    }
+
+    #[test]
+    fn fractional_cell_advances_round_to_the_nearest_pixel() {
+        assert_eq!(measured_cell_width(7.49), 7);
+        assert_eq!(measured_cell_width(7.5), 8);
+    }
+
+    #[test]
+    fn adjacent_point_sizes_remain_distinct_render_sizes() {
+        let ten_points = font_points_to_pixels(10.);
+        let eleven_points = font_points_to_pixels(11.);
+        let expected_step = if cfg!(target_os = "macos") {
+            1.
+        } else {
+            1.333_333
+        };
+
+        assert!(eleven_points > ten_points);
+        assert!((eleven_points - ten_points - expected_step).abs() < 0.001);
+    }
+
+    #[test]
+    fn platform_point_conversion_round_trips_legacy_pixels() {
+        let font_size_points = font_pixels_to_points(14.);
+
+        assert!((font_points_to_pixels(font_size_points) - 14.).abs() < 0.001);
+    }
+
+    #[test]
     fn glyph_offsets_inside_a_combining_cluster_are_preserved() {
-        assert_eq!(fixed_cell_glyph_x(7, 9, 11.5, 10.75), 63.75);
+        assert_eq!(fixed_cell_glyph_x(7, 9., 11.5, 10.75), 63.75);
     }
 }

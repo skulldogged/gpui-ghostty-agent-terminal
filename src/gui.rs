@@ -6,7 +6,10 @@ use crate::{
     core_model::default_space_name,
     settings::{AppSettings, KeybindAction, MAX_FONT_SIZE, MIN_FONT_SIZE, Shortcut, ThemePreset},
     terminal_frame::{FrameRow, TerminalFrame},
-    terminal_grid::{CellMetrics, GridDimensions, fixed_cell_glyph_x, measured_cell_height},
+    terminal_grid::{
+        CellMetrics, GridDimensions, fixed_cell_glyph_x, font_points_to_pixels,
+        measured_cell_height, measured_cell_width,
+    },
     ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
@@ -224,8 +227,8 @@ struct TerminalFont {
 
 impl TerminalFont {
     fn resolve(settings: &AppSettings, cx: &App) -> Result<Self, String> {
-        let font_size = settings.effective_font_size();
-        let size = px(font_size);
+        let font_size_points = settings.effective_font_size();
+        let size = px(font_points_to_pixels(font_size_points));
         let requested = settings.effective_font_family();
         let available = cx.text_system().all_font_names();
         let family: SharedString = requested
@@ -259,16 +262,15 @@ impl TerminalFont {
             .text_system()
             .advance(font_id, size, '0')
             .map(|advance| f32::from(advance.width))
-            .unwrap_or(font_size * 0.6);
-        let cell_width = advance.ceil().max(1.0) as u16;
+            .unwrap_or_else(|_| f32::from(size) * 0.6);
         let ascent = f32::from(cx.text_system().ascent(font_id, size));
         let descent = f32::from(cx.text_system().descent(font_id, size));
-        let cell_height = measured_cell_height(font_size, ascent, descent);
+        let cell_height = measured_cell_height(f32::from(size), ascent, descent);
 
         Ok(Self {
             family,
             size,
-            cells: CellMetrics::new(cell_width, cell_height),
+            cells: CellMetrics::new(measured_cell_width(advance), cell_height),
         })
     }
 }
@@ -880,12 +882,7 @@ impl MultiplexerView {
         for (terminal_session_id, width, height) in panes {
             let dimensions =
                 GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
-            let size = TerminalSize::new(
-                dimensions.cols,
-                dimensions.rows,
-                self.terminal_font.cells.width_px,
-                self.terminal_font.cells.height_px,
-            );
+            let size = self.terminal_font.cells.terminal_size(dimensions);
             if self.requested_sizes.get(&terminal_session_id) != Some(&size) {
                 match self.driver.resize_terminal(terminal_session_id, size) {
                     Ok(()) => {
@@ -2121,7 +2118,7 @@ impl MultiplexerView {
                                 .text_size(px(12.))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(self.shell.opaque_color(ShellColor::Text))
-                                .child(format!("{} px", font_size.round() as u32)),
+                                .child(format!("{font_size:.1} pt")),
                         )
                         .child(self.settings_step_button("font-size-up", "+").on_click(
                             cx.listener(|view, _event, _window, cx| {
@@ -2580,16 +2577,13 @@ impl MultiplexerView {
                         Bounds::new(
                             point(
                                 bounds.left()
-                                    + px(f32::from(background.x)
-                                        * f32::from(paint_font.cells.width_px)),
+                                    + px(f32::from(background.x) * paint_font.cells.width_px()),
                                 bounds.top()
-                                    + px(f32::from(background.y)
-                                        * f32::from(paint_font.cells.height_px)),
+                                    + px(f32::from(background.y) * paint_font.cells.height_px()),
                             ),
                             size(
-                                px(f32::from(background.width)
-                                    * f32::from(paint_font.cells.width_px)),
-                                px(f32::from(paint_font.cells.height_px)),
+                                px(f32::from(background.width) * paint_font.cells.width_px()),
+                                px(paint_font.cells.height_px()),
                             ),
                         ),
                         color(background.color),
@@ -2601,9 +2595,9 @@ impl MultiplexerView {
                         line,
                         point(
                             bounds.left(),
-                            bounds.top() + px(y as f32 * f32::from(paint_font.cells.height_px)),
+                            bounds.top() + px(y as f32 * paint_font.cells.height_px()),
                         ),
-                        px(f32::from(paint_font.cells.height_px)),
+                        px(paint_font.cells.height_px()),
                         paint_font.cells,
                         window,
                     );
@@ -2613,15 +2607,13 @@ impl MultiplexerView {
                         Bounds::new(
                             point(
                                 bounds.left()
-                                    + px(f32::from(cursor.x)
-                                        * f32::from(paint_font.cells.width_px)),
+                                    + px(f32::from(cursor.x) * paint_font.cells.width_px()),
                                 bounds.top()
-                                    + px(f32::from(cursor.y)
-                                        * f32::from(paint_font.cells.height_px)),
+                                    + px(f32::from(cursor.y) * paint_font.cells.height_px()),
                             ),
                             size(
-                                px(f32::from(paint_font.cells.width_px)),
-                                px(f32::from(paint_font.cells.height_px)),
+                                px(paint_font.cells.width_px()),
+                                px(paint_font.cells.height_px()),
                             ),
                         ),
                         color(cursor.color),
@@ -3448,7 +3440,7 @@ fn paint_fixed_cell_line(
             };
             let glyph_x = fixed_cell_glyph_x(
                 glyph_cell.x,
-                cells.width_px,
+                cells.width_px(),
                 f32::from(glyph.position.x),
                 natural_cell_x,
             );

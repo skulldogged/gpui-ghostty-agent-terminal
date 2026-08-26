@@ -1,3 +1,4 @@
+use crate::terminal_grid::font_pixels_to_points;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -172,6 +173,13 @@ impl KeybindingSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FontSizeUnit {
+    Pixels,
+    Points,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
@@ -179,6 +187,7 @@ pub(crate) struct AppSettings {
     pub(crate) background_opacity: f32,
     pub(crate) font_family: Option<String>,
     pub(crate) font_size: f32,
+    font_size_unit: FontSizeUnit,
     pub(crate) keybindings: KeybindingSettings,
 }
 
@@ -188,7 +197,8 @@ impl Default for AppSettings {
             theme: ThemePreset::TokyoNight,
             background_opacity: 0.65,
             font_family: None,
-            font_size: 14.,
+            font_size: font_pixels_to_points(14.),
+            font_size_unit: FontSizeUnit::Points,
             keybindings: KeybindingSettings::default(),
         }
     }
@@ -200,11 +210,8 @@ impl AppSettings {
             return (Self::default(), None);
         };
         match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<Self>(&contents) {
-                Ok(mut settings) => {
-                    settings.sanitize();
-                    (settings, None)
-                }
+            Ok(contents) => match Self::decode(&contents) {
+                Ok(settings) => (settings, None),
                 Err(error) => (
                     Self::default(),
                     Some(format!(
@@ -248,6 +255,24 @@ impl AppSettings {
             .map_err(|error| format!("replace settings {}: {error}", path.display()))
     }
 
+    fn decode(contents: &str) -> Result<Self, serde_json::Error> {
+        let value = serde_json::from_str::<serde_json::Value>(contents)?;
+        let legacy_pixels =
+            value.get("font_size").is_some() && value.get("font_size_unit").is_none();
+        let mut settings = serde_json::from_value::<Self>(value)?;
+        if legacy_pixels || settings.font_size_unit == FontSizeUnit::Pixels {
+            let legacy_size = if settings.font_size.is_finite() {
+                settings.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+            } else {
+                14.
+            };
+            settings.font_size = font_pixels_to_points(legacy_size);
+            settings.font_size_unit = FontSizeUnit::Points;
+        }
+        settings.sanitize();
+        Ok(settings)
+    }
+
     pub(crate) fn effective_opacity(&self) -> f32 {
         std::env::var("AGENT_TERMINAL_BACKGROUND_OPACITY")
             .ok()
@@ -277,7 +302,8 @@ impl AppSettings {
             Self::default().background_opacity
         };
         self.font_size = if self.font_size.is_finite() {
-            self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+            self.font_size
+                .clamp(minimum_persisted_font_size(), MAX_FONT_SIZE)
         } else {
             Self::default().font_size
         };
@@ -298,6 +324,10 @@ impl AppSettings {
             }
         }
     }
+}
+
+fn minimum_persisted_font_size() -> f32 {
+    MIN_FONT_SIZE.min(font_pixels_to_points(MIN_FONT_SIZE))
 }
 
 pub(crate) fn default_shortcut(action: KeybindAction) -> Shortcut {
@@ -416,7 +446,37 @@ mod tests {
         assert_eq!(migrated.theme, ThemePreset::TokyoNight);
         let partial: AppSettings = serde_json::from_str(r#"{"theme":"nord"}"#).unwrap();
         assert_eq!(partial.theme, ThemePreset::Nord);
-        assert_eq!(partial.font_size, 14.);
+        assert_eq!(partial.font_size, font_pixels_to_points(14.));
+    }
+
+    #[test]
+    fn legacy_pixel_font_sizes_migrate_to_points_once() {
+        let migrated = AppSettings::decode(r#"{"font_size":14}"#).unwrap();
+        assert_eq!(migrated.font_size, font_pixels_to_points(14.));
+        assert_eq!(migrated.font_size_unit, FontSizeUnit::Points);
+
+        let serialized = serde_json::to_string(&migrated).unwrap();
+        let decoded = AppSettings::decode(&serialized).unwrap();
+        assert_eq!(decoded.font_size, font_pixels_to_points(14.));
+    }
+
+    #[test]
+    fn legacy_minimum_pixel_size_survives_point_migration() {
+        let migrated = AppSettings::decode(r#"{"font_size":8}"#).unwrap();
+        assert_eq!(migrated.font_size, font_pixels_to_points(8.));
+
+        let serialized = serde_json::to_string(&migrated).unwrap();
+        let decoded = AppSettings::decode(&serialized).unwrap();
+        assert_eq!(decoded.font_size, font_pixels_to_points(8.));
+    }
+
+    #[test]
+    fn legacy_pixel_bounds_are_applied_before_conversion() {
+        let below = AppSettings::decode(r#"{"font_size":1}"#).unwrap();
+        let above = AppSettings::decode(r#"{"font_size":100}"#).unwrap();
+
+        assert_eq!(below.font_size, font_pixels_to_points(MIN_FONT_SIZE));
+        assert_eq!(above.font_size, font_pixels_to_points(MAX_FONT_SIZE));
     }
 
     #[test]
