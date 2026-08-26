@@ -15,10 +15,22 @@ const COMMAND_CAPACITY: usize = 256;
 const MAX_HIERARCHY_REFRESH_ATTEMPTS: usize = 8;
 
 pub(crate) struct CoreDriver {
-    commands: flume::Sender<Command>,
+    commands: DriverCommandSender,
     updates: DriverUpdates,
     counters: Arc<DriverCounters>,
     next_command_id: AtomicU64,
+}
+
+struct DriverCommandSender {
+    queue: flume::Sender<Command>,
+    resize_batches: Arc<Mutex<ResizeBatchState>>,
+}
+
+#[derive(Default)]
+struct ResizeBatchState {
+    next_batch_id: u64,
+    trailing_batch: Option<u64>,
+    batches: HashMap<u64, HashMap<TerminalSessionId, TerminalSize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,13 +229,95 @@ enum Command {
         terminal_session_id: TerminalSessionId,
         bytes: Vec<u8>,
     },
-    Resize {
-        terminal_session_id: TerminalSessionId,
-        size: TerminalSize,
+    ResizeBatch {
+        batch_id: u64,
     },
     SetTerminalTheme {
         theme: TerminalTheme,
     },
+}
+
+impl DriverCommandSender {
+    fn new(queue: flume::Sender<Command>) -> Self {
+        Self {
+            queue,
+            resize_batches: Arc::new(Mutex::new(ResizeBatchState::default())),
+        }
+    }
+
+    fn worker_resize_batches(&self) -> Arc<Mutex<ResizeBatchState>> {
+        Arc::clone(&self.resize_batches)
+    }
+
+    fn send(&self, command: Command) -> Result<(), String> {
+        let mut resize_batches = self
+            .resize_batches
+            .lock()
+            .expect("window driver resize mutex poisoned");
+        resize_batches.trailing_batch = None;
+        self.queue.try_send(command).map_err(command_send_error)
+    }
+
+    fn resize(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        size: TerminalSize,
+    ) -> Result<(), String> {
+        let mut resize_batches = self
+            .resize_batches
+            .lock()
+            .expect("window driver resize mutex poisoned");
+        if let Some(batch_id) = resize_batches.trailing_batch
+            && let Some(batch) = resize_batches.batches.get_mut(&batch_id)
+        {
+            batch.insert(terminal_session_id, size);
+            return Ok(());
+        }
+
+        let batch_id = resize_batches.next_batch_id;
+        resize_batches.next_batch_id = resize_batches
+            .next_batch_id
+            .checked_add(1)
+            .expect("window driver resize batch identifiers exhausted");
+        resize_batches
+            .batches
+            .insert(batch_id, HashMap::from([(terminal_session_id, size)]));
+        match self.queue.try_send(Command::ResizeBatch { batch_id }) {
+            Ok(()) => {
+                resize_batches.trailing_batch = Some(batch_id);
+                Ok(())
+            }
+            Err(error) => {
+                resize_batches.batches.remove(&batch_id);
+                Err(command_send_error(error))
+            }
+        }
+    }
+}
+
+impl ResizeBatchState {
+    fn take_batch(
+        &mut self,
+        batch_id: u64,
+    ) -> Result<Vec<(TerminalSessionId, TerminalSize)>, String> {
+        let batch = self
+            .batches
+            .remove(&batch_id)
+            .ok_or_else(|| format!("window driver resize batch {batch_id} is missing"))?;
+        if self.trailing_batch == Some(batch_id) {
+            self.trailing_batch = None;
+        }
+        let mut batch = batch.into_iter().collect::<Vec<_>>();
+        batch.sort_unstable_by_key(|(terminal_session_id, _)| *terminal_session_id);
+        Ok(batch)
+    }
+}
+
+fn command_send_error(error: flume::TrySendError<Command>) -> String {
+    match error {
+        flume::TrySendError::Full(_) => "window driver command queue is busy".into(),
+        flume::TrySendError::Disconnected(_) => "window driver stopped".into(),
+    }
 }
 
 enum DriverEvent {
@@ -250,6 +344,8 @@ impl CoreDriver {
             .collect();
         let hierarchy_revision = projection.hierarchy.revision;
         let (commands_tx, commands_rx) = flume::bounded(COMMAND_CAPACITY);
+        let commands = DriverCommandSender::new(commands_tx);
+        let worker_resize_batches = commands.worker_resize_batches();
         let (wake_tx, wake_rx) = flume::bounded(1);
         let state = Arc::new(Mutex::new(DriverUpdateState::default()));
         let updates = DriverUpdates {
@@ -278,12 +374,13 @@ impl CoreDriver {
                     receivers,
                     publisher,
                     worker_counters,
+                    worker_resize_batches,
                 )
             })
             .map_err(|error| format!("spawn window driver: {error}"))?;
         Ok((
             Self {
-                commands: commands_tx,
+                commands,
                 updates,
                 counters,
                 next_command_id: AtomicU64::new(1),
@@ -328,10 +425,7 @@ impl CoreDriver {
         terminal_session_id: TerminalSessionId,
         size: TerminalSize,
     ) -> Result<(), String> {
-        self.send(Command::Resize {
-            terminal_session_id,
-            size,
-        })
+        self.commands.resize(terminal_session_id, size)
     }
 
     pub(crate) fn set_terminal_theme(&self, theme: TerminalTheme) -> Result<(), String> {
@@ -351,12 +445,7 @@ impl CoreDriver {
     }
 
     fn send(&self, command: Command) -> Result<(), String> {
-        self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => "window driver command queue is busy".into(),
-                flume::TrySendError::Disconnected(_) => "window driver stopped".into(),
-            })
+        self.commands.send(command)
     }
 }
 
@@ -379,6 +468,7 @@ fn run_driver(
     receivers: DriverReceivers,
     updates: DriverUpdatePublisher,
     counters: Arc<DriverCounters>,
+    resize_batches: Arc<Mutex<ResizeBatchState>>,
 ) {
     loop {
         let event = flume::Selector::new()
@@ -422,13 +512,13 @@ fn run_driver(
                 .paste_to(terminal_session_id, &bytes)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
-            DriverEvent::Command(Ok(Command::Resize {
-                terminal_session_id,
-                size,
-            })) => core
-                .resize_terminal(terminal_session_id, size)
-                .map(|()| Vec::new())
-                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::ResizeBatch { batch_id })) => {
+                let batch = resize_batches
+                    .lock()
+                    .expect("window driver resize mutex poisoned")
+                    .take_batch(batch_id);
+                batch.and_then(|batch| apply_resize_batch(&core, batch))
+            }
             DriverEvent::Command(Ok(Command::SetTerminalTheme { theme })) => core
                 .set_terminal_theme(theme)
                 .map(|()| Vec::new())
@@ -490,6 +580,24 @@ fn run_driver(
                 updates.publish(DriverUpdate::Error(error));
             }
         }
+    }
+}
+
+fn apply_resize_batch(
+    core: &ApplicationCore,
+    batch: Vec<(TerminalSessionId, TerminalSize)>,
+) -> Result<Vec<DriverUpdate>, String> {
+    let mut first_error = None;
+    for (terminal_session_id, size) in batch {
+        if let Err(error) = core.resize_terminal(terminal_session_id, size)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -632,8 +740,12 @@ fn refresh_terminal(
 }
 #[cfg(test)]
 mod tests {
-    use super::load_projection;
-    use crate::ApplicationCore;
+    use super::{Command, DriverCommandSender, DriverUpdate, load_projection};
+    use crate::{ApplicationCore, TerminalSessionId, TerminalSize, core_driver::CoreDriver};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn loads_initial_application_projection() {
@@ -642,5 +754,135 @@ mod tests {
 
         assert_eq!(projection.hierarchy.spaces.len(), 1);
         assert_eq!(projection.terminals.len(), 1);
+    }
+
+    #[test]
+    fn resize_burst_accepts_and_promptly_applies_the_latest_geometry() {
+        let core = ApplicationCore::start().expect("start application core");
+        let (driver, projection) = CoreDriver::start(core.clone()).expect("start window driver");
+        let updates = driver.updates();
+        let terminal_session_id = projection.hierarchy.terminal_sessions[0].id;
+        let mut final_size = TerminalSize::new(80, 24, 9, 20);
+
+        for step in 0..512_u16 {
+            final_size = TerminalSize::new(80 + step % 40, 24 + step % 10, 9, 20);
+            if let Err(error) = driver.resize_terminal(terminal_session_id, final_size) {
+                panic!("interactive resize request {step} filled the driver queue: {error}");
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = core
+                .terminal_snapshot(terminal_session_id)
+                .expect("read resized terminal snapshot");
+            if snapshot.cols == final_size.cols && snapshot.rows == final_size.rows {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "latest requested geometry was not applied promptly: expected {}x{}, got {}x{}",
+                final_size.cols,
+                final_size.rows,
+                snapshot.cols,
+                snapshot.rows,
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match updates.take_pending() {
+                Some(DriverUpdate::Terminal {
+                    terminal_session_id: updated_terminal_session_id,
+                    snapshot,
+                }) if updated_terminal_session_id == terminal_session_id
+                    && snapshot.cols == final_size.cols
+                    && snapshot.rows == final_size.rows =>
+                {
+                    break;
+                }
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "latest requested geometry did not reach the UI projection promptly"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_resize_batch_keeps_only_the_latest_geometry_per_terminal() {
+        let (queue, commands) = flume::bounded(1);
+        let sender = DriverCommandSender::new(queue);
+        let terminal_session_id = TerminalSessionId::from_u64(7);
+        let mut final_size = TerminalSize::new(80, 24, 9, 20);
+
+        for step in 0..512_u16 {
+            final_size = TerminalSize::new(80 + step % 40, 24 + step % 10, 9, 20);
+            sender
+                .resize(terminal_session_id, final_size)
+                .expect("coalesce pending resize");
+        }
+
+        assert_eq!(commands.len(), 1, "one wake command represents the burst");
+        let Command::ResizeBatch { batch_id } = commands.recv().expect("receive resize batch")
+        else {
+            panic!("resize burst queued a non-resize command");
+        };
+        let batch = sender
+            .resize_batches
+            .lock()
+            .expect("resize mutex")
+            .take_batch(batch_id)
+            .expect("take resize batch");
+
+        assert_eq!(batch, vec![(terminal_session_id, final_size)]);
+    }
+
+    #[test]
+    fn input_command_is_a_barrier_between_resize_batches() {
+        let (queue, commands) = flume::unbounded();
+        let sender = DriverCommandSender::new(queue);
+        let terminal_session_id = TerminalSessionId::from_u64(7);
+        let before_input = TerminalSize::new(80, 24, 9, 20);
+        let after_input = TerminalSize::new(120, 36, 9, 20);
+
+        sender
+            .resize(terminal_session_id, before_input)
+            .expect("queue resize before input");
+        sender
+            .send(Command::Input {
+                terminal_session_id,
+                bytes: vec![b'x'],
+            })
+            .expect("queue input barrier");
+        sender
+            .resize(terminal_session_id, after_input)
+            .expect("queue resize after input");
+
+        let first_batch_id = match commands.recv().expect("first command") {
+            Command::ResizeBatch { batch_id } => batch_id,
+            _ => panic!("first command must be the pre-input resize"),
+        };
+        assert!(matches!(
+            commands.recv().expect("second command"),
+            Command::Input { .. }
+        ));
+        let second_batch_id = match commands.recv().expect("third command") {
+            Command::ResizeBatch { batch_id } => batch_id,
+            _ => panic!("third command must be the post-input resize"),
+        };
+        let mut batches = sender.resize_batches.lock().expect("resize mutex");
+
+        assert_eq!(
+            batches.take_batch(first_batch_id).expect("first batch"),
+            vec![(terminal_session_id, before_input)]
+        );
+        assert_eq!(
+            batches.take_batch(second_batch_id).expect("second batch"),
+            vec![(terminal_session_id, after_input)]
+        );
     }
 }
