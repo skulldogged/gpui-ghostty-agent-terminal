@@ -645,6 +645,11 @@ impl MultiplexerView {
                 self.pending_split_resizes.clear();
                 self.preview_split_ratios.clear();
                 self.split_dragging = None;
+                // A resize is recorded as soon as it enters the asynchronous driver queue.
+                // If the driver later rejects that batch, retaining the recorded target would
+                // suppress old-geometry snapshots forever and prevent the render loop from
+                // retrying the resize.
+                self.requested_sizes.clear();
                 self.global_error = Some(error);
             }
         }
@@ -3278,31 +3283,30 @@ fn projected_split_extent(length: f32, ratio: f32, cell_step: f32) -> f32 {
     let raw_extent = length * ratio;
     let min_extent = length * (f32::from(SplitRatio::MIN_PARTS) / 1000.0);
     let max_extent = length * (f32::from(SplitRatio::MAX_PARTS) / 1000.0);
-    if raw_extent <= min_extent || raw_extent >= max_extent {
+    if !cell_step.is_finite() || cell_step <= 0.0 {
         return raw_extent.clamp(min_extent, max_extent);
     }
 
     let terminal_inset = TERMINAL_PADDING_PX * 2.0;
-    let snapped_extent =
-        terminal_inset + ((raw_extent - terminal_inset) / cell_step).round() * cell_step;
-    snapped_extent.clamp(min_extent, max_extent)
+    let minimum_cell = ((min_extent - terminal_inset) / cell_step).ceil();
+    let maximum_cell = ((max_extent - terminal_inset) / cell_step).floor();
+    if minimum_cell > maximum_cell {
+        return raw_extent.clamp(min_extent, max_extent);
+    }
+
+    let cell = ((raw_extent - terminal_inset) / cell_step)
+        .round()
+        .clamp(minimum_cell, maximum_cell);
+    terminal_inset + cell * cell_step
 }
 
 fn split_ratio_at(geometry: SplitGeometry, pointer: f32) -> SplitRatio {
     let raw_extent = pointer - geometry.start;
-    let min_extent = geometry.length * (f32::from(SplitRatio::MIN_PARTS) / 1000.0);
-    let max_extent = geometry.length * (f32::from(SplitRatio::MAX_PARTS) / 1000.0);
-    let extent = if raw_extent <= min_extent {
-        min_extent
-    } else if raw_extent >= max_extent {
-        max_extent
-    } else {
-        projected_split_extent(
-            geometry.length,
-            raw_extent / geometry.length,
-            geometry.cell_step,
-        )
-    };
+    let extent = projected_split_extent(
+        geometry.length,
+        raw_extent / geometry.length,
+        geometry.cell_step,
+    );
     let fraction = extent / geometry.length;
     let parts = (fraction * 1000.).round() as u16;
     SplitRatio::new(parts.clamp(SplitRatio::MIN_PARTS, SplitRatio::MAX_PARTS))
@@ -4018,7 +4022,7 @@ mod tests {
         agent_icon_resting_geometry, agent_icon_transition_geometry, first_pane_id,
         fitted_cluster_glyph_position, font_is_terminal_fallback_only,
         installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
-        pane_close_shortcut_for, pane_extents, prioritized_agent_summary,
+        pane_close_shortcut_for, pane_extents, prioritized_agent_summary, projected_split_extent,
         row_cell_is_followed_by_space, selection_for_created, selection_for_pane, split_ratio_at,
         terminal_font_with_fallbacks, terminal_input_bytes, terminal_paste_shortcut_for,
         windows_caption_font_for_build,
@@ -4444,6 +4448,23 @@ mod tests {
     }
 
     #[test]
+    fn bounded_split_extents_remain_on_the_terminal_cell_lattice() {
+        let length = 800.0;
+        let cell_step = 9.0;
+        let terminal_inset = TERMINAL_PADDING_PX * 2.0;
+
+        for ratio in [0.0, 0.8975, 0.9, 1.0] {
+            let extent = projected_split_extent(length, ratio, cell_step);
+            assert!(extent >= length * 0.1);
+            assert!(extent <= length * 0.9);
+            assert_eq!((extent - terminal_inset) % cell_step, 0.0);
+        }
+
+        assert_eq!(projected_split_extent(length, 0.8975, cell_step), 713.0);
+        assert_eq!(projected_split_extent(length, 0.9, cell_step), 713.0);
+    }
+
+    #[test]
     fn late_terminal_updates_cannot_restore_a_closed_terminal_projection() {
         let directory = std::env::current_dir().expect("current directory");
         let mut model = CoreModel::new();
@@ -4596,8 +4617,8 @@ mod tests {
         };
 
         assert_eq!(split_ratio_at(geometry, 780.).parts_per_thousand(), 700);
-        assert_eq!(split_ratio_at(geometry, 0.).parts_per_thousand(), 100);
-        assert_eq!(split_ratio_at(geometry, 2_000.).parts_per_thousand(), 900);
+        assert_eq!(split_ratio_at(geometry, 0.).parts_per_thousand(), 104);
+        assert_eq!(split_ratio_at(geometry, 2_000.).parts_per_thousand(), 891);
     }
 
     #[test]
