@@ -146,6 +146,8 @@ struct SplitGeometry {
     axis: SplitAxis,
     start: f32,
     length: f32,
+    first_extent: f32,
+    cell_step: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1116,6 +1118,7 @@ impl MultiplexerView {
                 height,
             },
             &self.preview_split_ratios,
+            self.terminal_font.cells,
             &mut panes,
             &mut split_geometries,
         );
@@ -2760,6 +2763,10 @@ impl MultiplexerView {
             PaneLayout::Split(split) => {
                 let first = self.render_pane_layout(&split.first, cx);
                 let second = self.render_pane_layout(&split.second, cx);
+                let projected_extent = self
+                    .split_geometries
+                    .get(&split.id)
+                    .map(|geometry| geometry.first_extent);
                 let ratio = self
                     .preview_split_ratios
                     .get(&split.id)
@@ -2772,13 +2779,23 @@ impl MultiplexerView {
                         .h_full()
                         .min_w_0()
                         .flex_basis(px(0.))
-                        .flex_grow(first_grow)
+                        .when_some(projected_extent, |this, extent| {
+                            this.w(px(extent)).flex_none()
+                        })
+                        .when(projected_extent.is_none(), |this| {
+                            this.flex_grow(first_grow)
+                        })
                         .child(first),
                     SplitAxis::Vertical => div()
                         .w_full()
                         .min_h_0()
                         .flex_basis(px(0.))
-                        .flex_grow(first_grow)
+                        .when_some(projected_extent, |this, extent| {
+                            this.h(px(extent)).flex_none()
+                        })
+                        .when(projected_extent.is_none(), |this| {
+                            this.flex_grow(first_grow)
+                        })
                         .child(first),
                 };
                 div()
@@ -2791,7 +2808,11 @@ impl MultiplexerView {
                     .child(
                         div()
                             .flex_basis(px(0.))
-                            .flex_grow(second_grow)
+                            .flex_grow(if projected_extent.is_some() {
+                                1.0
+                            } else {
+                                second_grow
+                            })
                             .min_w_0()
                             .min_h_0()
                             .child(second),
@@ -3144,6 +3165,7 @@ fn pane_extents(
             height,
         },
         &HashMap::new(),
+        CellMetrics::new(9, 20),
         output,
         &mut HashMap::new(),
     );
@@ -3153,6 +3175,7 @@ fn collect_layout_metrics(
     layout: &PaneLayout,
     rect: LayoutRect,
     preview_ratios: &HashMap<SplitId, SplitRatio>,
+    cells: CellMetrics,
     panes: &mut Vec<(TerminalSessionId, f32, f32)>,
     splits: &mut HashMap<SplitId, SplitGeometry>,
 ) {
@@ -3167,13 +3190,16 @@ fn collect_layout_metrics(
             match split.axis {
                 SplitAxis::Horizontal => {
                     let available = (rect.width - SPLIT_DIVIDER_PX).max(2.0);
-                    let first_width = available * ratio;
+                    let cell_step = cells.width_px();
+                    let first_width = projected_split_extent(available, ratio, cell_step);
                     splits.insert(
                         split.id,
                         SplitGeometry {
                             axis: split.axis,
                             start: rect.x,
                             length: available,
+                            first_extent: first_width,
+                            cell_step,
                         },
                     );
                     collect_layout_metrics(
@@ -3183,6 +3209,7 @@ fn collect_layout_metrics(
                             ..rect
                         },
                         preview_ratios,
+                        cells,
                         panes,
                         splits,
                     );
@@ -3194,19 +3221,23 @@ fn collect_layout_metrics(
                             ..rect
                         },
                         preview_ratios,
+                        cells,
                         panes,
                         splits,
                     );
                 }
                 SplitAxis::Vertical => {
                     let available = (rect.height - SPLIT_DIVIDER_PX).max(2.0);
-                    let first_height = available * ratio;
+                    let cell_step = cells.height_px();
+                    let first_height = projected_split_extent(available, ratio, cell_step);
                     splits.insert(
                         split.id,
                         SplitGeometry {
                             axis: split.axis,
                             start: rect.y,
                             length: available,
+                            first_extent: first_height,
+                            cell_step,
                         },
                     );
                     collect_layout_metrics(
@@ -3216,6 +3247,7 @@ fn collect_layout_metrics(
                             ..rect
                         },
                         preview_ratios,
+                        cells,
                         panes,
                         splits,
                     );
@@ -3227,6 +3259,7 @@ fn collect_layout_metrics(
                             ..rect
                         },
                         preview_ratios,
+                        cells,
                         panes,
                         splits,
                     );
@@ -3236,8 +3269,36 @@ fn collect_layout_metrics(
     }
 }
 
+fn projected_split_extent(length: f32, ratio: f32, cell_step: f32) -> f32 {
+    let raw_extent = length * ratio;
+    let min_extent = length * (f32::from(SplitRatio::MIN_PARTS) / 1000.0);
+    let max_extent = length * (f32::from(SplitRatio::MAX_PARTS) / 1000.0);
+    if raw_extent <= min_extent || raw_extent >= max_extent {
+        return raw_extent.clamp(min_extent, max_extent);
+    }
+
+    let terminal_inset = TERMINAL_PADDING_PX * 2.0;
+    let snapped_extent =
+        terminal_inset + ((raw_extent - terminal_inset) / cell_step).round() * cell_step;
+    snapped_extent.clamp(min_extent, max_extent)
+}
+
 fn split_ratio_at(geometry: SplitGeometry, pointer: f32) -> SplitRatio {
-    let fraction = ((pointer - geometry.start) / geometry.length).clamp(0., 1.);
+    let raw_extent = pointer - geometry.start;
+    let min_extent = geometry.length * (f32::from(SplitRatio::MIN_PARTS) / 1000.0);
+    let max_extent = geometry.length * (f32::from(SplitRatio::MAX_PARTS) / 1000.0);
+    let extent = if raw_extent <= min_extent {
+        min_extent
+    } else if raw_extent >= max_extent {
+        max_extent
+    } else {
+        projected_split_extent(
+            geometry.length,
+            raw_extent / geometry.length,
+            geometry.cell_step,
+        )
+    };
+    let fraction = extent / geometry.length;
     let parts = (fraction * 1000.).round() as u16;
     SplitRatio::new(parts.clamp(SplitRatio::MIN_PARTS, SplitRatio::MAX_PARTS))
         .expect("clamped pointer ratio must be valid")
@@ -3947,14 +4008,15 @@ fn windows_caption_font() -> &'static str {
 mod tests {
     use super::{
         CLAUDE_AGENT_ICON, FallbackClusterBounds, GEMINI_AGENT_ICON, OPENAI_AGENT_ICON,
-        PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, TerminalGlyphOverflow, UiSelection,
-        accept_terminal_snapshot, agent_icon_data, agent_icon_resting_geometry,
-        agent_icon_transition_geometry, first_pane_id, fitted_cluster_glyph_position,
-        font_is_terminal_fallback_only, installed_terminal_font_fallbacks_from,
-        layout_symbol_fallback_cluster, pane_close_shortcut_for, pane_extents,
-        prioritized_agent_summary, row_cell_is_followed_by_space, selection_for_created,
-        selection_for_pane, split_ratio_at, terminal_font_with_fallbacks, terminal_input_bytes,
-        terminal_paste_shortcut_for, windows_caption_font_for_build,
+        PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, TERMINAL_PADDING_PX,
+        TerminalGlyphOverflow, UiSelection, accept_terminal_snapshot, agent_icon_data,
+        agent_icon_resting_geometry, agent_icon_transition_geometry, first_pane_id,
+        fitted_cluster_glyph_position, font_is_terminal_fallback_only,
+        installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
+        pane_close_shortcut_for, pane_extents, prioritized_agent_summary,
+        row_cell_is_followed_by_space, selection_for_created, selection_for_pane, split_ratio_at,
+        terminal_font_with_fallbacks, terminal_input_bytes, terminal_paste_shortcut_for,
+        windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
@@ -4333,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_split_extents_follow_the_authoritative_ratios() {
+    fn recursive_split_extents_project_authoritative_ratios_to_cell_boundaries() {
         let directory = std::env::current_dir().expect("current directory");
         let mut model = CoreModel::new();
         let initial = model
@@ -4369,8 +4431,9 @@ mod tests {
         );
 
         assert_eq!(extents.len(), 2);
-        assert!((extents[0].1 - 597.0).abs() < 0.1);
-        assert!((extents[1].1 - 398.0).abs() < 0.1);
+        assert!((extents[0].1 - 596.0).abs() < 0.1);
+        assert!((extents[1].1 - 399.0).abs() < 0.1);
+        assert_eq!((extents[0].1 - TERMINAL_PADDING_PX * 2.0) % 9.0, 0.0);
         assert_eq!(extents[0].2, 500.0);
         assert_eq!(extents[1].2, 500.0);
     }
@@ -4468,11 +4531,33 @@ mod tests {
             axis: SplitAxis::Horizontal,
             start: 220.,
             length: 800.,
+            first_extent: 560.,
+            cell_step: 9.,
         };
 
         assert_eq!(split_ratio_at(geometry, 780.).parts_per_thousand(), 700);
         assert_eq!(split_ratio_at(geometry, 0.).parts_per_thousand(), 100);
         assert_eq!(split_ratio_at(geometry, 2_000.).parts_per_thousand(), 900);
+    }
+
+    #[test]
+    fn dragging_a_split_seam_only_moves_on_terminal_cell_boundaries() {
+        let geometry = SplitGeometry {
+            axis: SplitAxis::Horizontal,
+            start: 220.,
+            length: 800.,
+            first_extent: 560.,
+            cell_step: 9.,
+        };
+
+        let ratios = (780..785)
+            .map(|pointer| split_ratio_at(geometry, pointer as f32))
+            .collect::<Vec<_>>();
+
+        assert!(
+            ratios.windows(2).all(|pair| pair[0] == pair[1]),
+            "sub-cell pointer movement must not move the divider independently of the terminal grid"
+        );
     }
 
     #[test]
