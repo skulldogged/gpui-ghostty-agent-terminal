@@ -196,7 +196,12 @@ impl CoreRuntime {
             .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
         let size = size.validate()?;
         if size == session.size() {
-            return Ok(false);
+            // A repeated target is still an observable resize acknowledgement. Interactive
+            // resize coalescing can return to a geometry whose earlier frame was deferred by a
+            // client while an intermediate target was pending, so advance the projection
+            // revision and let subscribers request the current frame again.
+            runtime.revision = runtime.revision.saturating_add(1);
+            return Ok(true);
         }
         let result = session.resize(size);
         // The ordered resize barrier drains bytes accepted at the previous
