@@ -8,6 +8,7 @@ pub(crate) struct TerminalFrame {
     // explicit terminal backgrounds and cursor fills, which must stay opaque
     // when the pane surface becomes translucent.
     pub opaque_backgrounds: Vec<BackgroundRun>,
+    pub cursor_cell: Option<(u16, u16)>,
     pub cursor_overlay: Option<BackgroundRun>,
 }
 
@@ -38,6 +39,7 @@ impl FrameRow {
 pub(crate) struct GlyphCell {
     // Maps every shaped glyph in this UTF-8 range back to its Ghostty cell anchor.
     pub x: u16,
+    pub width: u8,
     pub byte_range: Range<usize>,
     pub color: [u8; 3],
 }
@@ -116,7 +118,7 @@ impl TerminalFrame {
 
                 match cell.map(|cell| cell.text.as_str()) {
                     Some(value) if !value.is_empty() => {
-                        push_text_cell(&mut text, &mut glyph_cells, x, value, foreground);
+                        push_text_cell(&mut text, &mut glyph_cells, x, width, value, foreground);
                         push_foreground(&mut runs, value.len(), foreground);
                     }
                     _ => {
@@ -125,6 +127,7 @@ impl TerminalFrame {
                                 &mut text,
                                 &mut glyph_cells,
                                 x.saturating_add(cell_offset),
+                                1,
                                 " ",
                                 foreground,
                             );
@@ -143,6 +146,7 @@ impl TerminalFrame {
         Self {
             rows,
             opaque_backgrounds,
+            cursor_cell: cursor_visible.then_some(snapshot.cursor).flatten(),
             cursor_overlay,
         }
     }
@@ -178,6 +182,7 @@ fn push_text_cell(
     text: &mut String,
     glyph_cells: &mut Vec<GlyphCell>,
     x: u16,
+    width: u8,
     value: &str,
     color: [u8; 3],
 ) {
@@ -185,6 +190,7 @@ fn push_text_cell(
     text.push_str(value);
     glyph_cells.push(GlyphCell {
         x,
+        width,
         byte_range: start..text.len(),
         color,
     });
@@ -238,16 +244,19 @@ mod tests {
             vec![
                 GlyphCell {
                     x: 0,
+                    width: 2,
                     byte_range: 0..3,
                     color: [0xaa, 0xbb, 0xcc],
                 },
                 GlyphCell {
                     x: 2,
+                    width: 1,
                     byte_range: 3..4,
                     color: [0xaa, 0xbb, 0xcc],
                 },
                 GlyphCell {
                     x: 3,
+                    width: 1,
                     byte_range: 4..5,
                     color: [0xdd; 3],
                 },

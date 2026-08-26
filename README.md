@@ -48,7 +48,12 @@ The renderer selects and verifies a native fixed-pitch family on each platform:
 Menlo/SF Mono on macOS, Cascadia Mono/Consolas on Windows, and DejaVu Sans Mono
 or Liberation Mono on Linux. `AGENT_TERMINAL_FONT` can request another installed
 fixed-pitch family, and `AGENT_TERMINAL_FONT_SIZE` accepts point sizes from 8
-through 48.
+through 48. A bundled `Symbols Nerd Font Mono` provides terminal glyph fallback
+on every platform, followed by an installed `Symbols Nerd Font` when available,
+without changing the primary font's cell metrics. Symbol fallbacks stay at their
+natural point size when the following cell is blank by default. Terminal
+settings can change this overflow policy to always preserve natural size or to
+fit symbols to their allocated cell width.
 
 The native workspace shell uses platform window materials when they are
 available: Acrylic blur on supported Windows, native blur on macOS, and

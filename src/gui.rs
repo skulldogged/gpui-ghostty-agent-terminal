@@ -4,7 +4,9 @@ use crate::{
     TabId, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
     core_model::default_space_name,
-    settings::{AppSettings, KeybindAction, Shortcut, ThemePreset, adjust_font_size},
+    settings::{
+        AppSettings, KeybindAction, Shortcut, TerminalGlyphOverflow, ThemePreset, adjust_font_size,
+    },
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{
         CellMetrics, GridDimensions, fixed_cell_glyph_x, font_points_to_pixels,
@@ -14,21 +16,26 @@ use crate::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations,
-    FocusHandle, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, Pixels, Point,
-    PromptButton, PromptLevel, Render, ShapedLine, SharedString, Task, TextRun, Transformation,
-    Window, WindowControlArea, canvas, div, ease_out_quint, fill, font, percentage, point,
-    prelude::*, px, rgb, size, svg,
+    FocusHandle, Font, FontFallbacks, FontId, IntoElement, KeyDownEvent, Keystroke, MouseButton,
+    MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel, Render, ShapedLine, SharedString,
+    Task, TextRun, Transformation, Window, WindowControlArea, canvas, div, ease_out_quint, fill,
+    font, percentage, point, prelude::*, px, rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
+#[cfg(any(windows, target_os = "macos"))]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
+const SYMBOL_OVERFLOW_TOLERANCE_CELLS: f32 = 0.25;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
 const INACTIVE_PANE_CONTRAST: f32 = 0.62;
 const OPENAI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/openai.svg");
 const CLAUDE_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/claude.svg");
 const GEMINI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/gemini.svg");
 const CHEVRON_RIGHT_ICON: &[u8] = include_bytes!("../assets/lucide/chevron-right.svg");
+const TERMINAL_FONT_FALLBACK_CANDIDATES: [&str; 2] =
+    ["Symbols Nerd Font Mono", "Symbols Nerd Font"];
 
 pub(crate) fn open_terminal_window(
     cx: &mut App,
@@ -221,8 +228,25 @@ impl UiSelection {
 #[derive(Clone)]
 struct TerminalFont {
     family: SharedString,
+    font: Font,
+    fallbacks: Vec<ResolvedTerminalFallback>,
+    primary_font_id: FontId,
+    #[cfg(any(windows, target_os = "macos"))]
+    primary_font: Font,
+    #[cfg(any(windows, target_os = "macos"))]
+    primary_face_id: FontId,
+    primary_baseline_px: f32,
     size: Pixels,
     cells: CellMetrics,
+    #[cfg(any(windows, target_os = "macos"))]
+    fallback_cache: Arc<Mutex<HashMap<char, Option<usize>>>>,
+}
+
+#[derive(Clone)]
+struct ResolvedTerminalFallback {
+    font_id: FontId,
+    #[cfg(any(windows, target_os = "macos"))]
+    font: Font,
 }
 
 impl TerminalFont {
@@ -257,22 +281,222 @@ impl TerminalFont {
                     .to_owned()
             })?
             .into();
-        let font_id = cx.text_system().resolve_font(&font(family.clone()));
+        let fallback_families = installed_terminal_font_fallbacks(&family, &available);
+        let primary_font = terminal_font_with_fallbacks(family.clone(), &fallback_families);
+        let font_id = cx.text_system().resolve_font(&primary_font);
+        #[cfg(any(windows, target_os = "macos"))]
+        let (primary_face, primary_face_id) = {
+            let primary_face = font(family.clone());
+            let primary_face_id = cx.text_system().resolve_font(&primary_face);
+            (primary_face, primary_face_id)
+        };
         let advance = cx
             .text_system()
             .advance(font_id, size, '0')
             .map(|advance| f32::from(advance.width))
             .unwrap_or_else(|_| f32::from(size) * 0.6);
         let ascent = f32::from(cx.text_system().ascent(font_id, size));
-        let descent = f32::from(cx.text_system().descent(font_id, size));
+        let descent = f32::from(cx.text_system().descent(font_id, size)).abs();
         let cell_height = measured_cell_height(f32::from(size), ascent, descent);
+        let primary_baseline_px = (f32::from(cell_height) - ascent - descent).max(0.) / 2. + ascent;
+        let fallbacks = fallback_families
+            .into_iter()
+            .map(|family| {
+                let font = font(family);
+                let font_id = cx.text_system().resolve_font(&font);
+                ResolvedTerminalFallback {
+                    font_id,
+                    #[cfg(any(windows, target_os = "macos"))]
+                    font,
+                }
+            })
+            .collect();
 
         Ok(Self {
             family,
+            font: primary_font,
+            fallbacks,
+            primary_font_id: font_id,
+            #[cfg(any(windows, target_os = "macos"))]
+            primary_font: primary_face,
+            #[cfg(any(windows, target_os = "macos"))]
+            primary_face_id,
+            primary_baseline_px,
             size,
             cells: CellMetrics::new(measured_cell_width(advance), cell_height),
+            #[cfg(any(windows, target_os = "macos"))]
+            fallback_cache: Arc::default(),
         })
     }
+}
+
+fn terminal_font_with_fallbacks(family: impl Into<SharedString>, fallbacks: &[String]) -> Font {
+    let mut terminal_font = font(family);
+    if !fallbacks.is_empty() {
+        terminal_font.fallbacks = Some(FontFallbacks::from_fonts(fallbacks.to_vec()));
+    }
+    terminal_font
+}
+
+fn terminal_text_runs(
+    row: &FrameRow,
+    terminal_font: &TerminalFont,
+    window: &Window,
+) -> Vec<TextRun> {
+    let mut runs = Vec::<TextRun>::new();
+
+    for glyph_cell in &row.glyph_cells {
+        let text = &row.text[glyph_cell.byte_range.clone()];
+        let font = terminal_font.font_for_text(text, window);
+        let color = color(glyph_cell.color).into();
+
+        if let Some(previous) = runs
+            .last_mut()
+            .filter(|run| run.font == *font && run.color == color)
+        {
+            previous.len += glyph_cell.byte_range.len();
+        } else {
+            runs.push(TextRun {
+                len: glyph_cell.byte_range.len(),
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+    }
+
+    runs
+}
+
+impl TerminalFont {
+    fn is_symbol_fallback(&self, font_id: FontId) -> bool {
+        self.fallbacks
+            .iter()
+            .any(|fallback| fallback.font_id == font_id)
+    }
+
+    fn font_for_text<'a>(&'a self, text: &str, window: &Window) -> &'a Font {
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = (text, window);
+            &self.font
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            // GPUI keeps bundled faces outside the platform collections consulted by named
+            // fallback on Windows and macOS. Probe the actual shaped face once per character and
+            // select the bundled face explicitly when the primary did not supply it.
+            let Some(character) = text.chars().next() else {
+                return &self.font;
+            };
+            if character.is_ascii() {
+                return &self.font;
+            }
+
+            if let Some(fallback) = self
+                .fallback_cache
+                .lock()
+                .expect("terminal fallback cache lock poisoned")
+                .get(&character)
+                .copied()
+            {
+                return fallback
+                    .and_then(|index| self.fallbacks.get(index))
+                    .map(|fallback| &fallback.font)
+                    .unwrap_or(&self.font);
+            }
+
+            let fallback = if font_face_contains_character(
+                &self.primary_font,
+                self.primary_face_id,
+                self.size,
+                character,
+                window,
+            ) {
+                None
+            } else {
+                self.fallbacks.iter().position(|fallback| {
+                    font_face_contains_character(
+                        &fallback.font,
+                        fallback.font_id,
+                        self.size,
+                        character,
+                        window,
+                    )
+                })
+            };
+            self.fallback_cache
+                .lock()
+                .expect("terminal fallback cache lock poisoned")
+                .insert(character, fallback);
+
+            fallback
+                .and_then(|index| self.fallbacks.get(index))
+                .map(|fallback| &fallback.font)
+                .unwrap_or(&self.font)
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn font_face_contains_character(
+    font: &Font,
+    font_id: FontId,
+    size: Pixels,
+    character: char,
+    window: &Window,
+) -> bool {
+    let mut encoded = [0; 4];
+    let text = character.encode_utf8(&mut encoded);
+    let run = TextRun {
+        len: text.len(),
+        font: font.clone(),
+        color: color([0; 3]).into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text.to_owned().into(), size, &[run], None);
+
+    shaped.runs.iter().any(|run| {
+        run.font_id == font_id
+            && run
+                .glyphs
+                .iter()
+                .any(|glyph| glyph.index == 0 && glyph.id.0 != 0)
+    })
+}
+
+fn installed_terminal_font_fallbacks(primary: &str, available: &[String]) -> Vec<String> {
+    installed_terminal_font_fallbacks_from(primary, available, &TERMINAL_FONT_FALLBACK_CANDIDATES)
+}
+
+fn installed_terminal_font_fallbacks_from(
+    primary: &str,
+    available: &[String],
+    candidates: &[&str],
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            available
+                .iter()
+                .find(|family| family.eq_ignore_ascii_case(candidate))
+        })
+        .filter(|family| !family.eq_ignore_ascii_case(primary))
+        .fold(Vec::new(), |mut fallbacks, family| {
+            if !fallbacks
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(family))
+            {
+                fallbacks.push(family.clone());
+            }
+            fallbacks
+        })
 }
 
 fn installed_monospace_fonts(size: Pixels, cx: &App) -> Vec<String> {
@@ -309,7 +533,15 @@ fn font_is_fixed_pitch(candidate: &str, size: Pixels, cx: &App) -> bool {
 }
 
 fn font_is_terminal_candidate(candidate: &str, size: Pixels, cx: &App) -> bool {
-    !candidate.eq_ignore_ascii_case("lucide") && font_is_fixed_pitch(candidate, size, cx)
+    !candidate.eq_ignore_ascii_case("lucide")
+        && !font_is_terminal_fallback_only(candidate)
+        && font_is_fixed_pitch(candidate, size, cx)
+}
+
+fn font_is_terminal_fallback_only(candidate: &str) -> bool {
+    TERMINAL_FONT_FALLBACK_CANDIDATES
+        .iter()
+        .any(|family| candidate.eq_ignore_ascii_case(family))
 }
 
 #[cfg(target_os = "macos")]
@@ -593,6 +825,15 @@ impl MultiplexerView {
                 cx.notify();
             }
         }
+    }
+
+    fn set_terminal_glyph_overflow(
+        &mut self,
+        terminal_glyph_overflow: TerminalGlyphOverflow,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.terminal_glyph_overflow = terminal_glyph_overflow;
+        self.save_settings(cx);
     }
 
     fn focused_terminal_session_id(&self) -> Option<TerminalSessionId> {
@@ -2189,6 +2430,51 @@ impl MultiplexerView {
             );
         }
 
+        let mut overflow_choices = div().flex().flex_row().flex_wrap().gap_2();
+        for (index, policy) in TerminalGlyphOverflow::ALL.into_iter().enumerate() {
+            let selected = self.settings.terminal_glyph_overflow == policy;
+            overflow_choices = overflow_choices.child(
+                div()
+                    .id(("terminal-glyph-overflow", index))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w(px(220.))
+                    .min_h(px(66.))
+                    .p_3()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(self.shell.opaque_color(if selected {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::Border
+                    }))
+                    .bg(self.shell.opaque_color(if selected {
+                        ShellColor::Selected
+                    } else {
+                        ShellColor::Chrome
+                    }))
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::Hover)))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.set_terminal_glyph_overflow(policy, cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(self.shell.opaque_color(ShellColor::Text))
+                            .child(policy.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                            .child(policy.description()),
+                    ),
+            );
+        }
+
         div()
             .flex()
             .flex_col()
@@ -2202,6 +2488,11 @@ impl MultiplexerView {
                 "Font family",
                 "Only fonts that measure as fixed-pitch are shown",
                 font_choices,
+            ))
+            .child(self.settings_group(
+                "Symbol overflow",
+                "Controls how fallback symbols may extend beyond their fixed-cell allocation",
+                overflow_choices,
             ))
             .into_any_element()
     }
@@ -2542,26 +2833,15 @@ impl MultiplexerView {
         let default_bg = self.shell.terminal_background(color(snapshot.default_bg));
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
+        let terminal_glyph_overflow = self.settings.terminal_glyph_overflow;
         let shape_frame = frame.clone();
         let terminal_canvas = canvas(
             move |_bounds, window, _cx| {
-                let font = font(terminal_font.family.clone());
                 shape_frame
                     .rows
                     .iter()
                     .map(|row| {
-                        let runs = row
-                            .runs
-                            .iter()
-                            .map(|run| TextRun {
-                                len: run.len,
-                                font: font.clone(),
-                                color: color(run.color).into(),
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            })
-                            .collect::<Vec<_>>();
+                        let runs = terminal_text_runs(row, &terminal_font, window);
                         window.text_system().shape_line(
                             row.text.clone().into(),
                             terminal_font.size,
@@ -2590,6 +2870,10 @@ impl MultiplexerView {
                     ));
                 }
                 for (y, line) in lines.iter().enumerate() {
+                    let cursor_x = frame
+                        .cursor_cell
+                        .filter(|(_, cursor_y)| usize::from(*cursor_y) == y)
+                        .map(|(cursor_x, _)| cursor_x);
                     let _ = paint_fixed_cell_line(
                         &frame.rows[y],
                         line,
@@ -2597,8 +2881,9 @@ impl MultiplexerView {
                             bounds.left(),
                             bounds.top() + px(y as f32 * paint_font.cells.height_px()),
                         ),
-                        px(paint_font.cells.height_px()),
-                        paint_font.cells,
+                        &paint_font,
+                        terminal_glyph_overflow,
+                        cursor_x,
                         window,
                     );
                 }
@@ -3414,51 +3699,226 @@ fn paint_fixed_cell_line(
     row: &FrameRow,
     line: &ShapedLine,
     origin: Point<Pixels>,
-    line_height: Pixels,
-    cells: CellMetrics,
+    terminal_font: &TerminalFont,
+    terminal_glyph_overflow: TerminalGlyphOverflow,
+    cursor_x: Option<u16>,
     window: &mut Window,
 ) -> gpui::Result<()> {
-    let mut natural_cell_x = vec![None; row.glyph_cells.len()];
+    let mut cell_layouts = vec![CellGlyphLayout::default(); row.glyph_cells.len()];
+    let mut positioned_glyphs = Vec::with_capacity(row.glyph_cells.len());
     for run in &line.runs {
         for glyph in &run.glyphs {
             if let Some(cell_index) = row.glyph_cell_index(glyph.index) {
-                natural_cell_x[cell_index].get_or_insert(f32::from(glyph.position.x));
+                let layout = &mut cell_layouts[cell_index];
+                layout.natural_x.get_or_insert(f32::from(glyph.position.x));
+                match layout.font_id {
+                    Some(font_id) if font_id != run.font_id => {
+                        layout.mixed_fonts = true;
+                    }
+                    None => layout.font_id = Some(run.font_id),
+                    _ => {}
+                }
+                layout.symbol_fallback |= terminal_font.is_symbol_fallback(run.font_id);
+                positioned_glyphs.push((cell_index, run.font_id, glyph));
             }
         }
     }
 
-    let padding_top = (line_height - line.ascent - line.descent) / 2.;
-    let baseline_y = origin.y + padding_top + line.ascent;
+    for (cell_index, font_id, glyph) in &positioned_glyphs {
+        let layout = &mut cell_layouts[*cell_index];
+        // Only the known Symbols Nerd Font faces use this source-scalar width policy. Other
+        // fallback faces may substitute several source characters into unrelated glyph IDs;
+        // keeping their native shaped geometry avoids remeasuring the wrong glyph.
+        if !layout.symbol_fallback
+            || *font_id == terminal_font.primary_font_id
+            || layout.mixed_fonts
+            || layout.invalid_bounds
+        {
+            continue;
+        }
+        let Some(character) = row
+            .text
+            .get(glyph.index..)
+            .and_then(|text| text.chars().next())
+        else {
+            layout.invalid_bounds = true;
+            layout.bounds = None;
+            continue;
+        };
+        let (Ok(bounds), Ok(advance)) = (
+            window
+                .text_system()
+                .typographic_bounds(*font_id, line.font_size, character),
+            window
+                .text_system()
+                .advance(*font_id, line.font_size, character),
+        ) else {
+            layout.invalid_bounds = true;
+            layout.bounds = None;
+            continue;
+        };
+        let natural_cell_x = layout.natural_x.expect("positioned glyph has an origin");
+        let relative_x = f32::from(glyph.position.x) - natural_cell_x;
+        let bounds_left = f32::from(bounds.origin.x);
+        let next = FallbackClusterBounds {
+            left: relative_x + bounds_left.min(0.),
+            right: relative_x
+                + f32::from(advance.width).max(bounds_left + f32::from(bounds.size.width)),
+        };
+        layout.bounds = Some(
+            layout
+                .bounds
+                .map(|current| current.union(next))
+                .unwrap_or(next),
+        );
+    }
+    for (cell_index, layout) in cell_layouts.iter_mut().enumerate() {
+        if let Some(bounds) = layout.bounds {
+            let allocated_width_px =
+                terminal_font.cells.width_px() * f32::from(row.glyph_cells[cell_index].width);
+            layout.fitted = Some(layout_symbol_fallback_cluster(
+                f32::from(line.font_size),
+                terminal_font.primary_baseline_px,
+                terminal_font.cells.width_px(),
+                allocated_width_px,
+                row_cell_is_followed_by_space(row, cell_index, cursor_x),
+                terminal_glyph_overflow,
+                bounds,
+            ));
+        }
+    }
+
     for run in &line.runs {
         for glyph in &run.glyphs {
             let Some(cell_index) = row.glyph_cell_index(glyph.index) else {
                 continue;
             };
             let glyph_cell = &row.glyph_cells[cell_index];
-            let Some(natural_cell_x) = natural_cell_x[cell_index] else {
+            let cell_layout = &cell_layouts[cell_index];
+            let Some(natural_cell_x) = cell_layout.natural_x else {
                 continue;
             };
-            let glyph_x = fixed_cell_glyph_x(
-                glyph_cell.x,
-                cells.width_px(),
-                f32::from(glyph.position.x),
-                natural_cell_x,
-            );
-            let glyph_origin = point(origin.x + px(glyph_x), baseline_y);
+            let relative_x = f32::from(glyph.position.x) - natural_cell_x;
+            let relative_y = f32::from(glyph.position.y);
+            let (glyph_x, glyph_y, glyph_size) = if let Some(geometry) = cell_layout.fitted {
+                let (glyph_x, glyph_y) = fitted_cluster_glyph_position(
+                    f32::from(glyph_cell.x) * terminal_font.cells.width_px(),
+                    relative_x,
+                    relative_y,
+                    geometry,
+                );
+                (glyph_x, glyph_y, px(geometry.font_size_px))
+            } else {
+                (
+                    fixed_cell_glyph_x(
+                        glyph_cell.x,
+                        terminal_font.cells.width_px(),
+                        f32::from(glyph.position.x),
+                        natural_cell_x,
+                    ),
+                    terminal_font.primary_baseline_px + relative_y,
+                    line.font_size,
+                )
+            };
+            let glyph_origin = point(origin.x + px(glyph_x), origin.y + px(glyph_y));
             if glyph.is_emoji {
-                window.paint_emoji(glyph_origin, run.font_id, glyph.id, line.font_size)?;
+                window.paint_emoji(glyph_origin, run.font_id, glyph.id, glyph_size)?;
             } else {
                 window.paint_glyph(
                     glyph_origin,
                     run.font_id,
                     glyph.id,
-                    line.font_size,
+                    glyph_size,
                     color(glyph_cell.color).into(),
                 )?;
             }
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CellGlyphLayout {
+    natural_x: Option<f32>,
+    font_id: Option<FontId>,
+    mixed_fonts: bool,
+    symbol_fallback: bool,
+    invalid_bounds: bool,
+    bounds: Option<FallbackClusterBounds>,
+    fitted: Option<FittedFallbackCluster>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FittedFallbackCluster {
+    font_size_px: f32,
+    scale: f32,
+    x_offset_px: f32,
+    baseline_px: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FallbackClusterBounds {
+    left: f32,
+    right: f32,
+}
+
+impl FallbackClusterBounds {
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            right: self.right.max(other.right),
+        }
+    }
+}
+
+fn fitted_cluster_glyph_position(
+    cell_anchor_x: f32,
+    relative_x: f32,
+    relative_y: f32,
+    geometry: FittedFallbackCluster,
+) -> (f32, f32) {
+    (
+        cell_anchor_x + geometry.x_offset_px + relative_x * geometry.scale,
+        geometry.baseline_px + relative_y * geometry.scale,
+    )
+}
+
+fn row_cell_is_followed_by_space(row: &FrameRow, cell_index: usize, cursor_x: Option<u16>) -> bool {
+    let Some(cell) = row.glyph_cells.get(cell_index) else {
+        return false;
+    };
+    let next_x = cell.x.saturating_add(u16::from(cell.width));
+    row.glyph_cells
+        .get(cell_index + 1)
+        .filter(|next| next.x == next_x)
+        .filter(|next| cursor_x != Some(next.x))
+        .and_then(|next| row.text.get(next.byte_range.clone()))
+        .is_some_and(|text| !text.is_empty() && text.chars().all(|character| character == ' '))
+}
+
+fn layout_symbol_fallback_cluster(
+    font_size_px: f32,
+    primary_baseline_px: f32,
+    cell_width_px: f32,
+    allocated_width_px: f32,
+    followed_by_space: bool,
+    overflow: TerminalGlyphOverflow,
+    bounds: FallbackClusterBounds,
+) -> FittedFallbackCluster {
+    let footprint_width = (bounds.right - bounds.left).max(1.);
+    let maximum_width_px = allocated_width_px + cell_width_px * SYMBOL_OVERFLOW_TOLERANCE_CELLS;
+    let scale = if overflow.allows(followed_by_space) {
+        1.
+    } else {
+        1_f32.min(maximum_width_px / footprint_width)
+    };
+
+    FittedFallbackCluster {
+        font_size_px: font_size_px * scale,
+        scale,
+        x_offset_px: if scale < 1. { -bounds.left * scale } else { 0. },
+        baseline_px: primary_baseline_px,
+    }
 }
 
 fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
@@ -3486,20 +3946,203 @@ fn windows_caption_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLAUDE_AGENT_ICON, GEMINI_AGENT_ICON, OPENAI_AGENT_ICON, PasteShortcutPlatform,
-        SpaceAgentEntry, SplitGeometry, UiSelection, accept_terminal_snapshot, agent_icon_data,
-        agent_icon_resting_geometry, agent_icon_transition_geometry, first_pane_id,
-        pane_close_shortcut_for, pane_extents, prioritized_agent_summary, selection_for_created,
-        selection_for_pane, split_ratio_at, terminal_input_bytes, terminal_paste_shortcut_for,
-        windows_caption_font_for_build,
+        CLAUDE_AGENT_ICON, FallbackClusterBounds, GEMINI_AGENT_ICON, OPENAI_AGENT_ICON,
+        PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, TerminalGlyphOverflow, UiSelection,
+        accept_terminal_snapshot, agent_icon_data, agent_icon_resting_geometry,
+        agent_icon_transition_geometry, first_pane_id, fitted_cluster_glyph_position,
+        font_is_terminal_fallback_only, installed_terminal_font_fallbacks_from,
+        layout_symbol_fallback_cluster, pane_close_shortcut_for, pane_extents,
+        prioritized_agent_summary, row_cell_is_followed_by_space, selection_for_created,
+        selection_for_pane, split_ratio_at, terminal_font_with_fallbacks, terminal_input_bytes,
+        terminal_paste_shortcut_for, windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
         PaneLayout, SplitAxis, SplitPlacement, SplitRatio, TabId, TerminalLifecycle,
         TerminalSessionId, TerminalSnapshot,
+        terminal_frame::{FrameRow, GlyphCell},
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn terminal_font_fallbacks_use_available_nerd_families_in_priority_order() {
+        let available = vec![
+            "Symbols Nerd Font".to_owned(),
+            "Victor Mono".to_owned(),
+            "SYMBOLS NERD FONT MONO".to_owned(),
+        ];
+
+        assert_eq!(
+            installed_terminal_font_fallbacks_from(
+                "Victor Mono",
+                &available,
+                &["Symbols Nerd Font Mono", "Symbols Nerd Font"],
+            ),
+            vec![
+                "SYMBOLS NERD FONT MONO".to_owned(),
+                "Symbols Nerd Font".to_owned()
+            ]
+        );
+        assert_eq!(
+            installed_terminal_font_fallbacks_from(
+                "Symbols Nerd Font Mono",
+                &available,
+                &["Symbols Nerd Font Mono", "Symbols Nerd Font"],
+            ),
+            vec!["Symbols Nerd Font".to_owned()]
+        );
+    }
+
+    #[test]
+    fn terminal_symbol_fallbacks_are_not_primary_font_choices() {
+        assert!(font_is_terminal_fallback_only("Symbols Nerd Font Mono"));
+        assert!(font_is_terminal_fallback_only("symbols nerd font"));
+        assert!(!font_is_terminal_fallback_only("Victor Mono"));
+    }
+
+    #[test]
+    fn terminal_font_preserves_the_primary_and_attaches_ordered_fallbacks() {
+        let fallbacks = vec![
+            "Symbols Nerd Font Mono".to_owned(),
+            "Symbols Nerd Font".to_owned(),
+        ];
+        let terminal_font = terminal_font_with_fallbacks("Victor Mono", &fallbacks);
+
+        assert_eq!(terminal_font.family.as_ref(), "Victor Mono");
+        assert_eq!(
+            terminal_font
+                .fallbacks
+                .expect("terminal fallback chain should be present")
+                .fallback_list(),
+            fallbacks
+        );
+    }
+
+    #[test]
+    fn every_glyph_in_a_fallback_cluster_uses_one_shared_transform() {
+        let fitted = layout_symbol_fallback_cluster(
+            14.,
+            15.,
+            8.,
+            8.,
+            false,
+            TerminalGlyphOverflow::Never,
+            FallbackClusterBounds {
+                left: 0.,
+                right: 16.,
+            },
+        );
+        let first = fitted_cluster_glyph_position(24., 1., -2., fitted);
+        let second = fitted_cluster_glyph_position(24., 5., 2., fitted);
+
+        assert_eq!(second.0 - first.0, 2.5);
+        assert_eq!(second.1 - first.1, 2.5);
+    }
+
+    #[test]
+    fn symbol_fallbacks_keep_their_natural_size_when_followed_by_space() {
+        let layout = layout_symbol_fallback_cluster(
+            14.,
+            15.,
+            8.,
+            8.,
+            true,
+            TerminalGlyphOverflow::WhenFollowedBySpace,
+            FallbackClusterBounds {
+                left: -1.,
+                right: 15.,
+            },
+        );
+
+        assert_eq!(layout.font_size_px, 14.);
+        assert_eq!(layout.scale, 1.);
+        assert_eq!(layout.x_offset_px, 0.);
+        assert_eq!(layout.baseline_px, 15.);
+    }
+
+    #[test]
+    fn symbol_fallbacks_fit_width_but_not_height_when_the_next_cell_is_occupied() {
+        let layout = layout_symbol_fallback_cluster(
+            14.,
+            15.,
+            8.,
+            8.,
+            false,
+            TerminalGlyphOverflow::WhenFollowedBySpace,
+            FallbackClusterBounds {
+                left: -1.,
+                right: 15.,
+            },
+        );
+
+        assert!((layout.scale - 0.625).abs() < 0.001);
+        assert!((layout.font_size_px - 8.75).abs() < 0.001);
+        assert!((layout.x_offset_px - 0.625).abs() < 0.001);
+        assert_eq!(layout.baseline_px, 15.);
+    }
+
+    #[test]
+    fn symbol_overflow_policy_distinguishes_always_and_never() {
+        let bounds = FallbackClusterBounds {
+            left: 0.,
+            right: 16.,
+        };
+        let always = layout_symbol_fallback_cluster(
+            14.,
+            15.,
+            8.,
+            8.,
+            false,
+            TerminalGlyphOverflow::Always,
+            bounds,
+        );
+        let never = layout_symbol_fallback_cluster(
+            14.,
+            15.,
+            8.,
+            8.,
+            true,
+            TerminalGlyphOverflow::Never,
+            bounds,
+        );
+
+        assert_eq!(always.scale, 1.);
+        assert!((never.scale - 0.625).abs() < 0.001);
+    }
+
+    #[test]
+    fn overflow_safety_uses_the_ghostty_cell_after_the_allocated_span() {
+        let row = FrameRow {
+            text: "\u{f120} A".to_owned(),
+            runs: Vec::new(),
+            glyph_cells: vec![
+                GlyphCell {
+                    x: 0,
+                    width: 1,
+                    byte_range: 0..3,
+                    color: [0; 3],
+                },
+                GlyphCell {
+                    x: 1,
+                    width: 1,
+                    byte_range: 3..4,
+                    color: [0; 3],
+                },
+                GlyphCell {
+                    x: 2,
+                    width: 1,
+                    byte_range: 4..5,
+                    color: [0; 3],
+                },
+            ],
+        };
+
+        assert!(row_cell_is_followed_by_space(&row, 0, None));
+        assert!(!row_cell_is_followed_by_space(&row, 0, Some(1)));
+        assert!(!row_cell_is_followed_by_space(&row, 1, None));
+        assert!(!row_cell_is_followed_by_space(&row, 2, None));
+    }
 
     #[test]
     fn expanded_agent_icons_rest_on_the_row_centerline() {

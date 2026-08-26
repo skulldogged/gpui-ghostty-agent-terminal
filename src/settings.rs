@@ -180,6 +180,43 @@ enum FontSizeUnit {
     Points,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalGlyphOverflow {
+    #[default]
+    WhenFollowedBySpace,
+    Always,
+    Never,
+}
+
+impl TerminalGlyphOverflow {
+    pub(crate) const ALL: [Self; 3] = [Self::WhenFollowedBySpace, Self::Always, Self::Never];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::WhenFollowedBySpace => "When safe",
+            Self::Always => "Always",
+            Self::Never => "Never",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::WhenFollowedBySpace => "Keep symbols full-size when the next cell is blank",
+            Self::Always => "Keep symbols full-size even beside other text",
+            Self::Never => "Fit symbols to their terminal cell allocation",
+        }
+    }
+
+    pub(crate) fn allows(self, followed_by_space: bool) -> bool {
+        match self {
+            Self::WhenFollowedBySpace => followed_by_space,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
@@ -187,6 +224,7 @@ pub(crate) struct AppSettings {
     pub(crate) background_opacity: f32,
     pub(crate) font_family: Option<String>,
     pub(crate) font_size: f32,
+    pub(crate) terminal_glyph_overflow: TerminalGlyphOverflow,
     font_size_unit: FontSizeUnit,
     pub(crate) keybindings: KeybindingSettings,
 }
@@ -198,6 +236,7 @@ impl Default for AppSettings {
             background_opacity: 0.65,
             font_family: None,
             font_size: font_pixels_to_points(14.),
+            terminal_glyph_overflow: TerminalGlyphOverflow::default(),
             font_size_unit: FontSizeUnit::Points,
             keybindings: KeybindingSettings::default(),
         }
@@ -451,6 +490,25 @@ mod tests {
         let partial: AppSettings = serde_json::from_str(r#"{"theme":"nord"}"#).unwrap();
         assert_eq!(partial.theme, ThemePreset::Nord);
         assert_eq!(partial.font_size, font_pixels_to_points(14.));
+        assert_eq!(
+            partial.terminal_glyph_overflow,
+            TerminalGlyphOverflow::WhenFollowedBySpace
+        );
+    }
+
+    #[test]
+    fn glyph_overflow_policy_round_trips_all_supported_values() {
+        for policy in TerminalGlyphOverflow::ALL {
+            let settings = AppSettings {
+                terminal_glyph_overflow: policy,
+                ..AppSettings::default()
+            };
+
+            let serialized = serde_json::to_string(&settings).unwrap();
+            let decoded: AppSettings = serde_json::from_str(&serialized).unwrap();
+
+            assert_eq!(decoded.terminal_glyph_overflow, policy);
+        }
     }
 
     #[test]
@@ -469,7 +527,10 @@ mod tests {
         let migrated = AppSettings::decode(r#"{"font_size":8}"#).unwrap();
         assert_eq!(migrated.font_size, font_pixels_to_points(8.));
 
-        assert_eq!(adjust_font_size(migrated.font_size, -1.), migrated.font_size);
+        assert_eq!(
+            adjust_font_size(migrated.font_size, -1.),
+            migrated.font_size
+        );
 
         let serialized = serde_json::to_string(&migrated).unwrap();
         let decoded = AppSettings::decode(&serialized).unwrap();
