@@ -6,6 +6,9 @@ use std::borrow::Cow;
 
 use crate::settings::ThemePreset;
 
+pub(crate) const TERMINAL_SYMBOL_FONT_BYTES: &[u8] =
+    include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkspaceShell {
     appearance: WindowBackgroundAppearance,
@@ -293,10 +296,13 @@ impl ShellIcon {
     }
 }
 
-pub(crate) fn install_icon_font(cx: &App) -> Result<(), String> {
+pub(crate) fn install_application_fonts(cx: &App) -> Result<(), String> {
     cx.text_system()
-        .add_fonts(vec![Cow::Borrowed(lucide_icons::LUCIDE_FONT_BYTES)])
-        .map_err(|error| format!("register Lucide icon font: {error}"))
+        .add_fonts(vec![
+            Cow::Borrowed(lucide_icons::LUCIDE_FONT_BYTES),
+            Cow::Borrowed(TERMINAL_SYMBOL_FONT_BYTES),
+        ])
+        .map_err(|error| format!("register bundled application fonts: {error}"))
 }
 
 #[cfg(test)]
