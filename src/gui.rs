@@ -632,27 +632,14 @@ impl MultiplexerView {
             DriverUpdate::Terminal {
                 terminal_session_id,
                 snapshot,
-            } => {
-                if std::env::var_os("AGENT_TERMINAL_RESIZE_TRACE").is_some() {
-                    let requested = self.requested_sizes.get(&terminal_session_id);
-                    eprintln!(
-                        "[DEBUG-resize-trace] snapshot session={} revision={} cols={} rows={} cursor_y={:?} requested={:?}",
-                        terminal_session_id.as_u64(),
-                        snapshot.revision,
-                        snapshot.cols,
-                        snapshot.rows,
-                        snapshot.cursor.map(|(_, y)| y),
-                        requested.map(|size| (size.cols, size.rows)),
-                    );
-                }
-                accept_terminal_snapshot(
-                    &self.hierarchy,
-                    &mut self.terminals,
-                    &mut self.terminal_errors,
-                    terminal_session_id,
-                    snapshot,
-                )
-            }
+            } => accept_terminal_snapshot(
+                &self.hierarchy,
+                &mut self.terminals,
+                &mut self.terminal_errors,
+                terminal_session_id,
+                self.requested_sizes.get(&terminal_session_id).copied(),
+                snapshot,
+            ),
             DriverUpdate::Error(error) => {
                 self.selections_after_commands.clear();
                 self.pending_split_resizes.clear();
@@ -1142,14 +1129,6 @@ impl MultiplexerView {
                 GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
             let size = self.terminal_font.cells.terminal_size(dimensions);
             if self.requested_sizes.get(&terminal_session_id) != Some(&size) {
-                if std::env::var_os("AGENT_TERMINAL_RESIZE_TRACE").is_some() {
-                    eprintln!(
-                        "[DEBUG-resize-trace] request session={} cols={} rows={}",
-                        terminal_session_id.as_u64(),
-                        size.cols,
-                        size.rows,
-                    );
-                }
                 match self.driver.resize_terminal(terminal_session_id, size) {
                     Ok(()) => {
                         self.requested_sizes.insert(terminal_session_id, size);
@@ -2988,6 +2967,7 @@ fn accept_terminal_snapshot(
     terminals: &mut HashMap<TerminalSessionId, TerminalSnapshot>,
     terminal_errors: &mut HashMap<TerminalSessionId, String>,
     terminal_session_id: TerminalSessionId,
+    requested_size: Option<TerminalSize>,
     snapshot: TerminalSnapshot,
 ) {
     if !hierarchy
@@ -2995,6 +2975,9 @@ fn accept_terminal_snapshot(
         .iter()
         .any(|session| session.id == terminal_session_id)
     {
+        return;
+    }
+    if requested_size.is_some_and(|size| (snapshot.cols, snapshot.rows) != (size.cols, size.rows)) {
         return;
     }
     if let Some(message) = lifecycle_message(&snapshot.lifecycle) {
@@ -4043,7 +4026,7 @@ mod tests {
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
         PaneLayout, SplitAxis, SplitPlacement, SplitRatio, TabId, TerminalLifecycle,
-        TerminalSessionId, TerminalSnapshot,
+        TerminalSessionId, TerminalSize, TerminalSnapshot,
         terminal_frame::{FrameRow, GlyphCell},
     };
     use gpui::{Keystroke, Modifiers};
@@ -4489,6 +4472,7 @@ mod tests {
             &mut terminals,
             &mut terminal_errors,
             terminal_session_id,
+            None,
             TerminalSnapshot {
                 revision: 1,
                 lifecycle: TerminalLifecycle::Running,
@@ -4505,6 +4489,60 @@ mod tests {
         );
 
         assert!(!terminals.contains_key(&terminal_session_id));
+    }
+
+    #[test]
+    fn superseded_terminal_geometry_cannot_replace_the_displayed_projection() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let hierarchy = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "Space".into(),
+                    directory,
+                },
+            )
+            .expect("create Space")
+            .snapshot;
+        let terminal_session_id = hierarchy.terminal_sessions[0].id;
+        let snapshot = |revision, cols| TerminalSnapshot {
+            revision,
+            lifecycle: TerminalLifecycle::Running,
+            active_work: false,
+            title: None,
+            agent: None,
+            cols,
+            rows: 69,
+            cursor: Some((0, 28)),
+            default_fg: [0xdd; 3],
+            default_bg: [0x11; 3],
+            cells: Vec::new(),
+        };
+        let mut terminals = HashMap::from([(terminal_session_id, snapshot(20, 143))]);
+        let mut terminal_errors = HashMap::new();
+
+        accept_terminal_snapshot(
+            &hierarchy,
+            &mut terminals,
+            &mut terminal_errors,
+            terminal_session_id,
+            Some(TerminalSize::new(145, 69, 9, 20)),
+            snapshot(21, 144),
+        );
+
+        assert_eq!(terminals[&terminal_session_id].cols, 143);
+
+        accept_terminal_snapshot(
+            &hierarchy,
+            &mut terminals,
+            &mut terminal_errors,
+            terminal_session_id,
+            Some(TerminalSize::new(145, 69, 9, 20)),
+            snapshot(22, 145),
+        );
+
+        assert_eq!(terminals[&terminal_session_id].cols, 145);
     }
 
     #[test]
