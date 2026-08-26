@@ -813,6 +813,51 @@ mod tests {
     }
 
     #[test]
+    fn repeated_resize_target_republishes_the_current_projection() {
+        let core = ApplicationCore::start().expect("start application core");
+        let (driver, projection) = CoreDriver::start(core).expect("start window driver");
+        let updates = driver.updates();
+        let terminal_session_id = projection.hierarchy.terminal_sessions[0].id;
+        let size = TerminalSize::new(100, 30, 9, 20);
+
+        let receive_matching_projection = |minimum_revision| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match updates.take_pending() {
+                    Some(DriverUpdate::Terminal {
+                        terminal_session_id: updated_terminal_session_id,
+                        snapshot,
+                    }) if updated_terminal_session_id == terminal_session_id
+                        && snapshot.cols == size.cols
+                        && snapshot.rows == size.rows
+                        && snapshot.revision > minimum_revision =>
+                    {
+                        return snapshot.revision;
+                    }
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(5)),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "repeated resize target did not republish its current projection"
+                );
+            }
+        };
+
+        driver
+            .resize_terminal(terminal_session_id, size)
+            .expect("apply initial resize");
+        let initial_revision = receive_matching_projection(0);
+
+        driver
+            .resize_terminal(terminal_session_id, size)
+            .expect("repeat current resize");
+        let repeated_revision = receive_matching_projection(initial_revision);
+
+        assert!(repeated_revision > initial_revision);
+    }
+
+    #[test]
     fn pending_resize_batch_keeps_only_the_latest_geometry_per_terminal() {
         let (queue, commands) = flume::bounded(1);
         let sender = DriverCommandSender::new(queue);

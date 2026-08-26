@@ -847,6 +847,6 @@ mod tests {
 
         assert_eq!(initial.terminal_session_id, terminal_session_id);
         assert_eq!(repeated.terminal_session_id, terminal_session_id);
-        assert_eq!(repeated.terminal_revision, initial.terminal_revision);
+        assert!(repeated.terminal_revision > initial.terminal_revision);
     }
 }
