@@ -632,13 +632,27 @@ impl MultiplexerView {
             DriverUpdate::Terminal {
                 terminal_session_id,
                 snapshot,
-            } => accept_terminal_snapshot(
-                &self.hierarchy,
-                &mut self.terminals,
-                &mut self.terminal_errors,
-                terminal_session_id,
-                snapshot,
-            ),
+            } => {
+                if std::env::var_os("AGENT_TERMINAL_RESIZE_TRACE").is_some() {
+                    let requested = self.requested_sizes.get(&terminal_session_id);
+                    eprintln!(
+                        "[DEBUG-resize-trace] snapshot session={} revision={} cols={} rows={} cursor_y={:?} requested={:?}",
+                        terminal_session_id.as_u64(),
+                        snapshot.revision,
+                        snapshot.cols,
+                        snapshot.rows,
+                        snapshot.cursor.map(|(_, y)| y),
+                        requested.map(|size| (size.cols, size.rows)),
+                    );
+                }
+                accept_terminal_snapshot(
+                    &self.hierarchy,
+                    &mut self.terminals,
+                    &mut self.terminal_errors,
+                    terminal_session_id,
+                    snapshot,
+                )
+            }
             DriverUpdate::Error(error) => {
                 self.selections_after_commands.clear();
                 self.pending_split_resizes.clear();
@@ -1128,6 +1142,14 @@ impl MultiplexerView {
                 GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
             let size = self.terminal_font.cells.terminal_size(dimensions);
             if self.requested_sizes.get(&terminal_session_id) != Some(&size) {
+                if std::env::var_os("AGENT_TERMINAL_RESIZE_TRACE").is_some() {
+                    eprintln!(
+                        "[DEBUG-resize-trace] request session={} cols={} rows={}",
+                        terminal_session_id.as_u64(),
+                        size.cols,
+                        size.rows,
+                    );
+                }
                 match self.driver.resize_terminal(terminal_session_id, size) {
                     Ok(()) => {
                         self.requested_sizes.insert(terminal_session_id, size);
