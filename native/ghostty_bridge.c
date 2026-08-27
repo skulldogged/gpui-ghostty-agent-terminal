@@ -59,6 +59,19 @@ static void write_pty(GhosttyTerminal terminal, void* userdata,
   spike->pty_response_len = required;
 }
 
+static void begin_pty_response(SpikeTerminal* spike) {
+  spike->pty_response_len = 0;
+  spike->pty_response_failed = false;
+}
+
+static int finish_pty_response(SpikeTerminal* spike, const uint8_t** response,
+                               size_t* response_len) {
+  if (spike->pty_response_failed) return GHOSTTY_OUT_OF_MEMORY;
+  *response = spike->pty_response;
+  *response_len = spike->pty_response_len;
+  return GHOSTTY_SUCCESS;
+}
+
 SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollback) {
   SpikeTerminal* spike = calloc(1, sizeof(SpikeTerminal));
   if (spike == NULL) return NULL;
@@ -123,21 +136,22 @@ int spike_terminal_write(SpikeTerminal* spike, const uint8_t* data, size_t len,
     return GHOSTTY_INVALID_VALUE;
   }
 
-  spike->pty_response_len = 0;
-  spike->pty_response_failed = false;
+  begin_pty_response(spike);
   ghostty_terminal_vt_write(spike->terminal, data, len);
-  if (spike->pty_response_failed) return GHOSTTY_OUT_OF_MEMORY;
-
-  *response = spike->pty_response;
-  *response_len = spike->pty_response_len;
-  return GHOSTTY_SUCCESS;
+  return finish_pty_response(spike, response, response_len);
 }
 
 int spike_terminal_resize(SpikeTerminal* spike, uint16_t cols, uint16_t rows,
-                          uint32_t cell_width_px, uint32_t cell_height_px) {
-  if (spike == NULL) return GHOSTTY_INVALID_VALUE;
-  return ghostty_terminal_resize(spike->terminal, cols, rows, cell_width_px,
-                                 cell_height_px);
+                          uint32_t cell_width_px, uint32_t cell_height_px,
+                          const uint8_t** response, size_t* response_len) {
+  if (spike == NULL || response == NULL || response_len == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  begin_pty_response(spike);
+  GhosttyResult result = ghostty_terminal_resize(
+      spike->terminal, cols, rows, cell_width_px, cell_height_px);
+  if (!success(result)) return result;
+  return finish_pty_response(spike, response, response_len);
 }
 
 static GhosttyColorRgb color_from_bytes(const uint8_t* color) {

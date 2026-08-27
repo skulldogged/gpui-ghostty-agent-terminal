@@ -254,19 +254,12 @@ impl TerminalSession {
 
     fn resize_while_reader_paused(&mut self, size: TerminalSize) -> Result<(), String> {
         let previous_size = self.size;
-        self.terminal.resize(
-            size.cols,
-            size.rows,
-            u32::from(size.cell_width_px),
-            u32::from(size.cell_height_px),
-        )?;
+        if let Err(error) = self.resize_terminal_state(size) {
+            let rollback_error = self.resize_terminal_state(previous_size).err();
+            return Err(combine_errors(error, rollback_error));
+        }
         if let Err(process_error) = self.process.resize(size.pty_size()) {
-            let rollback = self.terminal.resize(
-                previous_size.cols,
-                previous_size.rows,
-                u32::from(previous_size.cell_width_px),
-                u32::from(previous_size.cell_height_px),
-            );
+            let rollback = self.resize_terminal_state(previous_size);
             return match rollback {
                 Ok(()) => Err(process_error),
                 Err(rollback_error) => Err(format!(
@@ -276,6 +269,16 @@ impl TerminalSession {
         }
         self.size = size;
         Ok(())
+    }
+
+    fn resize_terminal_state(&mut self, size: TerminalSize) -> Result<(), String> {
+        let response = self.terminal.resize(
+            size.cols,
+            size.rows,
+            u32::from(size.cell_width_px),
+            u32::from(size.cell_height_px),
+        )?;
+        self.write_terminal_response(&response)
     }
 
     #[cfg(test)]
@@ -351,11 +354,15 @@ impl TerminalSession {
 
     fn feed_process_output(&mut self, bytes: &[u8]) -> Result<(), String> {
         let response = self.terminal.feed(bytes)?;
+        self.write_terminal_response(&response)
+    }
+
+    fn write_terminal_response(&mut self, response: &[u8]) -> Result<(), String> {
         if response.is_empty() {
             return Ok(());
         }
         self.process
-            .write(&response)
+            .write(response)
             .map_err(|error| format!("write terminal query response: {error}"))
     }
 }
@@ -564,6 +571,38 @@ mod tests {
                 .expect("recording transport mutex poisoned")
                 .as_slice(),
             b"\x1b[?62;22c"
+        );
+    }
+
+    #[test]
+    fn resize_reports_return_to_processes_using_in_band_size_reports() {
+        let size = TerminalSize::default();
+        let next_size = TerminalSize::new(100, 40, 9, 18);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[?2048h".to_vec()))
+            .expect("enable in-band size reports");
+        session.snapshot().expect("process terminal mode");
+        session.resize(next_size).expect("resize terminal session");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[48;40;100;720;900t"
         );
     }
 

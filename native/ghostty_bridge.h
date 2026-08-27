@@ -69,7 +69,8 @@ void spike_terminal_free(SpikeTerminal* terminal);
 int spike_terminal_write(SpikeTerminal* terminal, const uint8_t* data, size_t len,
                          const uint8_t** response, size_t* response_len);
 int spike_terminal_resize(SpikeTerminal* terminal, uint16_t cols, uint16_t rows,
-                          uint32_t cell_width_px, uint32_t cell_height_px);
+                          uint32_t cell_width_px, uint32_t cell_height_px,
+                          const uint8_t** response, size_t* response_len);
 int spike_terminal_set_theme(SpikeTerminal* terminal, const uint8_t* foreground,
                              const uint8_t* background, const uint8_t* cursor,
                              const uint8_t* ansi_palette);

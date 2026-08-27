@@ -1,6 +1,7 @@
 use crate::{
     pty::{
-        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
+        PROCESS_INPUT_QUEUE_CAPACITY, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
+        enqueue_process_input, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     },
     terminal_session::TerminalEvent,
 };
@@ -54,7 +55,7 @@ unsafe extern "system" {
 }
 
 pub struct PtySession {
-    input: OwnedHandle,
+    input: flume::Sender<Vec<u8>>,
     pseudoconsole: Arc<SharedPseudoConsole>,
     process: OwnedHandle,
     process_id: u32,
@@ -124,6 +125,31 @@ impl PtySession {
         let (output_tx, output_rx) = flume::bounded(256);
         let (control_tx, control_rx) = flume::bounded(1);
         let (shutdown_tx, shutdown_rx) = flume::bounded(1);
+        let (input_tx, input_rx) = flume::bounded::<Vec<u8>>(PROCESS_INPUT_QUEUE_CAPACITY);
+
+        let mut input_handle = input.write;
+        let writer_events = events.clone();
+        let writer_shutdown = shutdown_rx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("terminal-conpty-writer".into())
+            .spawn(move || {
+                while let Some(bytes) = receive_or_shutdown(&input_rx, &writer_shutdown) {
+                    if let Err(error) = write_handle(input_handle.raw(), &bytes) {
+                        let _ = send_or_shutdown(
+                            &writer_events,
+                            &writer_shutdown,
+                            TerminalEvent::Failed(format!("write ConPTY: {error}")),
+                        );
+                        break;
+                    }
+                }
+                let _ = input_handle.close();
+            })
+        {
+            unsafe { TerminateProcess(process.raw(), 0) };
+            return Err(format!("spawn ConPTY writer thread: {error}"));
+        }
+
         let mut output_handle = output.read;
         let reader_events = events.clone();
         let reader_shutdown = shutdown_rx.clone();
@@ -201,7 +227,7 @@ impl PtySession {
 
         Ok((
             Self {
-                input: input.write,
+                input: input_tx,
                 pseudoconsole,
                 process,
                 process_id,
@@ -213,7 +239,7 @@ impl PtySession {
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        write_handle(self.input.raw(), bytes).map_err(|error| format!("write ConPTY: {error}"))
+        enqueue_process_input(&self.input, bytes, "ConPTY")
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
@@ -319,7 +345,6 @@ impl Drop for PtySession {
         // worker blocked while publishing output or a lifecycle event then
         // cancels its send and releases its pipe handle.
         drop(self.shutdown.take());
-        let _ = self.input.close();
         unsafe {
             TerminateProcess(self.process.raw(), 0);
         }

@@ -17,6 +17,29 @@ pub(crate) enum ReaderControl {
     Resume,
 }
 
+pub(crate) const PROCESS_INPUT_QUEUE_CAPACITY: usize = 64;
+
+pub(crate) fn enqueue_process_input(
+    input: &flume::Sender<Vec<u8>>,
+    bytes: &[u8],
+    transport: &str,
+) -> Result<(), String> {
+    input.try_send(bytes.to_vec()).map_err(|error| match error {
+        flume::TrySendError::Full(_) => format!("{transport} input queue is full"),
+        flume::TrySendError::Disconnected(_) => format!("{transport} input writer stopped"),
+    })
+}
+
+pub(crate) fn receive_or_shutdown<T>(
+    receiver: &flume::Receiver<T>,
+    shutdown: &flume::Receiver<()>,
+) -> Option<T> {
+    flume::Selector::new()
+        .recv(receiver, |message| message.ok())
+        .recv(shutdown, |_| None)
+        .wait()
+}
+
 pub(crate) fn send_or_shutdown<T>(
     sender: &flume::Sender<T>,
     shutdown: &flume::Receiver<()>,
@@ -144,7 +167,8 @@ pub use crate::windows_pty::PtySession;
 #[cfg(unix)]
 mod unix {
     use super::{
-        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
+        PROCESS_INPUT_QUEUE_CAPACITY, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
+        enqueue_process_input, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     };
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
@@ -154,7 +178,7 @@ mod unix {
 
     pub struct PtySession {
         _master: Box<dyn MasterPty + Send>,
-        writer: Box<dyn Write + Send>,
+        input: flume::Sender<Vec<u8>>,
         child: Option<Box<dyn Child + Send>>,
         shell_process_id: Option<u32>,
         control: flume::Sender<ReaderControl>,
@@ -198,6 +222,26 @@ mod unix {
             let (output_tx, output_rx) = flume::bounded(256);
             let (control_tx, control_rx) = flume::bounded(1);
             let (shutdown_tx, shutdown_rx) = flume::bounded(1);
+            let (input_tx, input_rx) = flume::bounded::<Vec<u8>>(PROCESS_INPUT_QUEUE_CAPACITY);
+
+            let writer_events = events.clone();
+            let writer_shutdown = shutdown_rx.clone();
+            std::thread::Builder::new()
+                .name("terminal-pty-writer".into())
+                .spawn(move || {
+                    let mut writer = writer;
+                    while let Some(bytes) = receive_or_shutdown(&input_rx, &writer_shutdown) {
+                        if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                            let _ = send_or_shutdown(
+                                &writer_events,
+                                &writer_shutdown,
+                                TerminalEvent::Failed(format!("write PTY: {error}")),
+                            );
+                            break;
+                        }
+                    }
+                })
+                .map_err(|error| format!("spawn PTY writer thread: {error}"))?;
 
             std::thread::Builder::new()
                 .name("terminal-pty-reader".into())
@@ -244,7 +288,7 @@ mod unix {
             Ok((
                 Self {
                     _master: pair.master,
-                    writer,
+                    input: input_tx,
                     child: Some(child),
                     shell_process_id,
                     control: control_tx,
@@ -255,10 +299,7 @@ mod unix {
         }
 
         pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-            self.writer
-                .write_all(bytes)
-                .and_then(|_| self.writer.flush())
-                .map_err(|error| format!("write PTY: {error}"))
+            enqueue_process_input(&self.input, bytes, "PTY")
         }
 
         pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
@@ -449,7 +490,9 @@ pub use unix::PtySession;
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessSnapshot, PtyOutput, ReaderControl, reader_checkpoint};
+    use super::{
+        ProcessSnapshot, PtyOutput, ReaderControl, enqueue_process_input, reader_checkpoint,
+    };
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -497,6 +540,17 @@ mod tests {
         drop(shutdown);
 
         assert!(!super::send_or_shutdown(&events, &shutdown_receiver, ()));
+    }
+
+    #[test]
+    fn process_input_queue_reports_backpressure_without_blocking() {
+        let (input, _queued) = flume::bounded(1);
+        enqueue_process_input(&input, b"first", "test PTY").expect("fill input queue");
+
+        assert_eq!(
+            enqueue_process_input(&input, b"second", "test PTY").unwrap_err(),
+            "test PTY input queue is full"
+        );
     }
 
     #[test]

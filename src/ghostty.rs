@@ -100,6 +100,8 @@ unsafe extern "C" {
         rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
+        response: *mut *const u8,
+        response_len: *mut usize,
     ) -> i32;
     fn spike_terminal_set_theme(
         terminal: *mut c_void,
@@ -278,13 +280,7 @@ impl Terminal {
         };
         self.selection_text_cache = None;
         result_ok(result, "process terminal output")?;
-        if response_len == 0 {
-            return Ok(Vec::new());
-        }
-        if response.is_null() {
-            return Err("libghostty-vt returned a null PTY response".into());
-        }
-        Ok(unsafe { std::slice::from_raw_parts(response, response_len) }.to_vec())
+        copy_pty_response(response, response_len)
     }
 
     pub fn resize(
@@ -293,11 +289,22 @@ impl Terminal {
         rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
+        let mut response = std::ptr::null();
+        let mut response_len = 0;
         let result = unsafe {
-            spike_terminal_resize(self.raw.as_ptr(), cols, rows, cell_width_px, cell_height_px)
+            spike_terminal_resize(
+                self.raw.as_ptr(),
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                &mut response,
+                &mut response_len,
+            )
         };
-        result_ok(result, "resize")
+        result_ok(result, "resize")?;
+        copy_pty_response(response, response_len)
     }
 
     #[cfg(feature = "gui")]
@@ -566,6 +573,16 @@ impl Terminal {
             cells,
         })
     }
+}
+
+fn copy_pty_response(response: *const u8, response_len: usize) -> Result<Vec<u8>, String> {
+    if response_len == 0 {
+        return Ok(Vec::new());
+    }
+    if response.is_null() {
+        return Err("libghostty-vt returned a null PTY response".into());
+    }
+    Ok(unsafe { std::slice::from_raw_parts(response, response_len) }.to_vec())
 }
 
 impl Drop for Terminal {
