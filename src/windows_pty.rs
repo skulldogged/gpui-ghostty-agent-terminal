@@ -1,7 +1,8 @@
 use crate::{
     pty::{
-        PROCESS_INPUT_QUEUE_CAPACITY, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
-        enqueue_process_input, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
+        PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessSnapshot, PtyOutput, PtySize,
+        ReaderControl, enqueue_process_input, enqueue_process_resize, reader_checkpoint,
+        receive_or_shutdown, send_or_shutdown,
     },
     terminal_session::TerminalEvent,
 };
@@ -55,7 +56,7 @@ unsafe extern "system" {
 }
 
 pub struct PtySession {
-    input: flume::Sender<Vec<u8>>,
+    input: flume::Sender<ProcessInput>,
     pseudoconsole: Arc<SharedPseudoConsole>,
     process: OwnedHandle,
     process_id: u32,
@@ -125,20 +126,42 @@ impl PtySession {
         let (output_tx, output_rx) = flume::bounded(256);
         let (control_tx, control_rx) = flume::bounded(1);
         let (shutdown_tx, shutdown_rx) = flume::bounded(1);
-        let (input_tx, input_rx) = flume::bounded::<Vec<u8>>(PROCESS_INPUT_QUEUE_CAPACITY);
+        let (input_tx, input_rx) = flume::bounded(PROCESS_INPUT_QUEUE_CAPACITY);
 
         let mut input_handle = input.write;
         let writer_events = events.clone();
         let writer_shutdown = shutdown_rx.clone();
+        let writer_pseudoconsole = Arc::clone(&pseudoconsole);
         if let Err(error) = std::thread::Builder::new()
             .name("terminal-conpty-writer".into())
             .spawn(move || {
-                while let Some(bytes) = receive_or_shutdown(&input_rx, &writer_shutdown) {
-                    if let Err(error) = write_handle(input_handle.raw(), &bytes) {
+                while let Some(command) = receive_or_shutdown(&input_rx, &writer_shutdown) {
+                    let (result, completion) = match command {
+                        ProcessInput::Write(bytes) => (
+                            write_handle(input_handle.raw(), &bytes)
+                                .map_err(|error| format!("write ConPTY: {error}")),
+                            None,
+                        ),
+                        ProcessInput::Resize {
+                            size,
+                            response,
+                            completed,
+                        } => (
+                            writer_pseudoconsole.resize(size).and_then(|_| {
+                                write_handle(input_handle.raw(), &response)
+                                    .map_err(|error| format!("write ConPTY: {error}"))
+                            }),
+                            Some(completed),
+                        ),
+                    };
+                    if let Some(completion) = completion {
+                        let _ = completion.send(result.clone());
+                    }
+                    if let Err(error) = result {
                         let _ = send_or_shutdown(
                             &writer_events,
                             &writer_shutdown,
-                            TerminalEvent::Failed(format!("write ConPTY: {error}")),
+                            TerminalEvent::Failed(error),
                         );
                         break;
                     }
@@ -242,8 +265,8 @@ impl PtySession {
         enqueue_process_input(&self.input, bytes, "ConPTY")
     }
 
-    pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
-        self.pseudoconsole.resize(size)
+    pub fn resize(&mut self, size: PtySize, response: &[u8]) -> Result<(), String> {
+        enqueue_process_resize(&self.input, size, response, "ConPTY")
     }
 
     pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {

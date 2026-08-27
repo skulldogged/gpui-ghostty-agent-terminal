@@ -19,12 +19,50 @@ pub(crate) enum ReaderControl {
 
 pub(crate) const PROCESS_INPUT_QUEUE_CAPACITY: usize = 64;
 
+pub(crate) enum ProcessInput {
+    Write(Vec<u8>),
+    Resize {
+        size: PtySize,
+        response: Vec<u8>,
+        completed: flume::Sender<Result<(), String>>,
+    },
+}
+
 pub(crate) fn enqueue_process_input(
-    input: &flume::Sender<Vec<u8>>,
+    input: &flume::Sender<ProcessInput>,
     bytes: &[u8],
     transport: &str,
 ) -> Result<(), String> {
-    input.try_send(bytes.to_vec()).map_err(|error| match error {
+    enqueue_process_command(input, ProcessInput::Write(bytes.to_vec()), transport)
+}
+
+pub(crate) fn enqueue_process_resize(
+    input: &flume::Sender<ProcessInput>,
+    size: PtySize,
+    response: &[u8],
+    transport: &str,
+) -> Result<(), String> {
+    let (completed, completion) = flume::bounded(1);
+    enqueue_process_command(
+        input,
+        ProcessInput::Resize {
+            size,
+            response: response.to_vec(),
+            completed,
+        },
+        transport,
+    )?;
+    completion
+        .recv()
+        .map_err(|_| format!("{transport} input writer stopped before resize completed"))?
+}
+
+fn enqueue_process_command(
+    input: &flume::Sender<ProcessInput>,
+    command: ProcessInput,
+    transport: &str,
+) -> Result<(), String> {
+    input.try_send(command).map_err(|error| match error {
         flume::TrySendError::Full(_) => format!("{transport} input queue is full"),
         flume::TrySendError::Disconnected(_) => format!("{transport} input writer stopped"),
     })
@@ -167,18 +205,22 @@ pub use crate::windows_pty::PtySession;
 #[cfg(unix)]
 mod unix {
     use super::{
-        PROCESS_INPUT_QUEUE_CAPACITY, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
-        enqueue_process_input, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
+        PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessSnapshot, PtyOutput, PtySize,
+        ReaderControl, enqueue_process_input, enqueue_process_resize, reader_checkpoint,
+        receive_or_shutdown, send_or_shutdown,
     };
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
         Child, CommandBuilder, MasterPty, PtySize as PortablePtySize, native_pty_system,
     };
-    use std::io::{Read, Write};
+    use std::{
+        io::{Read, Write},
+        sync::{Arc, Mutex},
+    };
 
     pub struct PtySession {
-        _master: Box<dyn MasterPty + Send>,
-        input: flume::Sender<Vec<u8>>,
+        master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+        input: flume::Sender<ProcessInput>,
         child: Option<Box<dyn Child + Send>>,
         shell_process_id: Option<u32>,
         control: flume::Sender<ReaderControl>,
@@ -222,20 +264,57 @@ mod unix {
             let (output_tx, output_rx) = flume::bounded(256);
             let (control_tx, control_rx) = flume::bounded(1);
             let (shutdown_tx, shutdown_rx) = flume::bounded(1);
-            let (input_tx, input_rx) = flume::bounded::<Vec<u8>>(PROCESS_INPUT_QUEUE_CAPACITY);
+            let (input_tx, input_rx) = flume::bounded(PROCESS_INPUT_QUEUE_CAPACITY);
+            let master = Arc::new(Mutex::new(pair.master));
 
             let writer_events = events.clone();
             let writer_shutdown = shutdown_rx.clone();
+            let writer_master = Arc::clone(&master);
             std::thread::Builder::new()
                 .name("terminal-pty-writer".into())
                 .spawn(move || {
                     let mut writer = writer;
-                    while let Some(bytes) = receive_or_shutdown(&input_rx, &writer_shutdown) {
-                        if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                    while let Some(command) = receive_or_shutdown(&input_rx, &writer_shutdown) {
+                        let (result, completion) = match command {
+                            ProcessInput::Write(bytes) => (
+                                writer
+                                    .write_all(&bytes)
+                                    .and_then(|_| writer.flush())
+                                    .map_err(|error| format!("update PTY transport: {error}")),
+                                None,
+                            ),
+                            ProcessInput::Resize {
+                                size,
+                                response,
+                                completed,
+                            } => {
+                                let result = writer_master
+                                    .lock()
+                                    .map_err(|_| "lock PTY master for resize".to_string())
+                                    .and_then(|master| {
+                                        master
+                                            .resize(size.into())
+                                            .map_err(|error| format!("resize PTY: {error}"))
+                                    })
+                                    .and_then(|_| {
+                                        writer
+                                            .write_all(&response)
+                                            .and_then(|_| writer.flush())
+                                            .map_err(|error| {
+                                                format!("write PTY resize response: {error}")
+                                            })
+                                    });
+                                (result, Some(completed))
+                            }
+                        };
+                        if let Some(completion) = completion {
+                            let _ = completion.send(result.clone());
+                        }
+                        if let Err(error) = result {
                             let _ = send_or_shutdown(
                                 &writer_events,
                                 &writer_shutdown,
-                                TerminalEvent::Failed(format!("write PTY: {error}")),
+                                TerminalEvent::Failed(error),
                             );
                             break;
                         }
@@ -287,7 +366,7 @@ mod unix {
 
             Ok((
                 Self {
-                    _master: pair.master,
+                    master,
                     input: input_tx,
                     child: Some(child),
                     shell_process_id,
@@ -302,10 +381,8 @@ mod unix {
             enqueue_process_input(&self.input, bytes, "PTY")
         }
 
-        pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
-            self._master
-                .resize(size.into())
-                .map_err(|error| format!("resize PTY: {error}"))
+        pub fn resize(&mut self, size: PtySize, response: &[u8]) -> Result<(), String> {
+            enqueue_process_resize(&self.input, size, response, "PTY")
         }
 
         pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -313,7 +390,9 @@ mod unix {
                 .shell_process_id
                 .ok_or_else(|| "terminal shell does not expose its process ID".to_string())?;
             let foreground_process_group = self
-                ._master
+                .master
+                .lock()
+                .map_err(|_| "lock PTY master for process inspection".to_string())?
                 .process_group_leader()
                 .ok_or_else(|| "inspect foreground PTY process group".to_string())?;
             let foreground_process_group = u32::try_from(foreground_process_group)
@@ -491,7 +570,8 @@ pub use unix::PtySession;
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessSnapshot, PtyOutput, ReaderControl, enqueue_process_input, reader_checkpoint,
+        ProcessInput, ProcessSnapshot, PtyOutput, PtySize, ReaderControl, enqueue_process_input,
+        enqueue_process_resize, reader_checkpoint,
     };
     use std::{
         process::{Command, Stdio},
@@ -551,6 +631,42 @@ mod tests {
             enqueue_process_input(&input, b"second", "test PTY").unwrap_err(),
             "test PTY input queue is full"
         );
+    }
+
+    #[test]
+    fn process_resize_stays_ordered_after_earlier_input() {
+        let (input, queued) = flume::bounded(2);
+        enqueue_process_input(&input, b"before resize", "test PTY").expect("queue input");
+        let size = PtySize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 900,
+            pixel_height: 720,
+        };
+        let resize_input = input.clone();
+        let resize = std::thread::spawn(move || {
+            enqueue_process_resize(&resize_input, size, b"size report", "test PTY")
+        });
+
+        assert!(matches!(
+            queued.recv().expect("receive input"),
+            ProcessInput::Write(bytes) if bytes == b"before resize"
+        ));
+        let ProcessInput::Resize {
+            size: queued_size,
+            response,
+            completed,
+        } = queued.recv().expect("receive resize")
+        else {
+            panic!("second transport command must be the resize");
+        };
+        assert_eq!(queued_size, size);
+        assert_eq!(response, b"size report");
+        completed.send(Ok(())).expect("complete resize");
+        resize
+            .join()
+            .expect("join resize sender")
+            .expect("finish ordered resize");
     }
 
     #[test]

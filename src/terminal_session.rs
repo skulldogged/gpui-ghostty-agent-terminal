@@ -77,7 +77,7 @@ trait TerminalTransport: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String>;
     fn pause_reader(&mut self) -> Result<(), String>;
-    fn resize(&mut self, size: PtySize) -> Result<(), String>;
+    fn resize(&mut self, size: PtySize, response: &[u8]) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
     fn process_id(&self) -> Option<u32> {
         None
@@ -100,8 +100,8 @@ impl TerminalTransport for PtySession {
         PtySession::pause_reader(self)
     }
 
-    fn resize(&mut self, size: PtySize) -> Result<(), String> {
-        PtySession::resize(self, size)
+    fn resize(&mut self, size: PtySize, response: &[u8]) -> Result<(), String> {
+        PtySession::resize(self, size, response)
     }
 
     fn resume_reader(&mut self) -> Result<(), String> {
@@ -254,12 +254,15 @@ impl TerminalSession {
 
     fn resize_while_reader_paused(&mut self, size: TerminalSize) -> Result<(), String> {
         let previous_size = self.size;
-        if let Err(error) = self.resize_terminal_state(size) {
-            let rollback_error = self.resize_terminal_state(previous_size).err();
-            return Err(combine_errors(error, rollback_error));
-        }
-        if let Err(process_error) = self.process.resize(size.pty_size()) {
-            let rollback = self.resize_terminal_state(previous_size);
+        let response = match self.resize_terminal_state(size) {
+            Ok(response) => response,
+            Err(error) => {
+                let rollback_error = self.resize_terminal_state(previous_size).err();
+                return Err(combine_errors(error, rollback_error));
+            }
+        };
+        if let Err(process_error) = self.process.resize(size.pty_size(), &response) {
+            let rollback = self.resize_terminal_state(previous_size).map(|_| ());
             return match rollback {
                 Ok(()) => Err(process_error),
                 Err(rollback_error) => Err(format!(
@@ -271,14 +274,13 @@ impl TerminalSession {
         Ok(())
     }
 
-    fn resize_terminal_state(&mut self, size: TerminalSize) -> Result<(), String> {
-        let response = self.terminal.resize(
+    fn resize_terminal_state(&mut self, size: TerminalSize) -> Result<Vec<u8>, String> {
+        self.terminal.resize(
             size.cols,
             size.rows,
             u32::from(size.cell_width_px),
             u32::from(size.cell_height_px),
-        )?;
-        self.write_terminal_response(&response)
+        )
     }
 
     #[cfg(test)]
@@ -410,6 +412,11 @@ mod tests {
         output: flume::Sender<PtyOutput>,
     }
 
+    struct FailingResizeTransport {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        output: flume::Sender<PtyOutput>,
+    }
+
     impl TerminalTransport for RecordingTransport {
         fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
             self.bytes
@@ -429,8 +436,40 @@ mod tests {
                 .map_err(|error| format!("pause test reader: {error}"))
         }
 
-        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+        fn resize(&mut self, _size: PtySize, response: &[u8]) -> Result<(), String> {
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(response);
             Ok(())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl TerminalTransport for FailingResizeTransport {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Paused)
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize, _response: &[u8]) -> Result<(), String> {
+            Err("injected platform resize failure".into())
         }
 
         fn resume_reader(&mut self) -> Result<(), String> {
@@ -454,7 +493,7 @@ mod tests {
                 .map_err(|error| format!("pause test reader: {error}"))
         }
 
-        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+        fn resize(&mut self, _size: PtySize, _response: &[u8]) -> Result<(), String> {
             Ok(())
         }
 
@@ -486,7 +525,7 @@ mod tests {
                 .map_err(|error| format!("pause test reader: {error}"))
         }
 
-        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+        fn resize(&mut self, _size: PtySize, _response: &[u8]) -> Result<(), String> {
             Ok(())
         }
 
@@ -603,6 +642,42 @@ mod tests {
                 .expect("recording transport mutex poisoned")
                 .as_slice(),
             b"\x1b[48;40;100;720;900t"
+        );
+    }
+
+    #[test]
+    fn failed_platform_resize_does_not_emit_uncommitted_size_report() {
+        let size = TerminalSize::default();
+        let next_size = TerminalSize::new(100, 40, 9, 18);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(FailingResizeTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[?2048h".to_vec()))
+            .expect("enable in-band size reports");
+        session.snapshot().expect("process terminal mode");
+
+        assert_eq!(
+            session.resize(next_size).unwrap_err(),
+            "injected platform resize failure"
+        );
+        assert_eq!(session.size(), size);
+        assert!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .is_empty(),
+            "the failed geometry and rollback reports must both remain internal"
         );
     }
 
