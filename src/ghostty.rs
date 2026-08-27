@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 pub(crate) const SNAPSHOT_CELL_CAPACITY: usize = 65_536;
+const MAX_SCROLL_OUTPUT_STEPS: usize = 16_384;
 
 #[repr(C)]
 #[derive(Default)]
@@ -91,6 +92,23 @@ unsafe extern "C" {
         output_len: usize,
         output_written: *mut usize,
     ) -> i32;
+    fn spike_terminal_scroll(
+        terminal: *mut c_void,
+        delta_rows: isize,
+        delta_columns: isize,
+        pointer_x: f32,
+        pointer_y: f32,
+        viewport_width: u32,
+        viewport_height: u32,
+        cell_width: u32,
+        cell_height: u32,
+        modifiers: u16,
+        output: *mut u8,
+        output_len: usize,
+        output_written: *mut usize,
+        viewport_changed: *mut bool,
+    ) -> i32;
+    fn spike_terminal_scroll_to_bottom(terminal: *mut c_void, changed: *mut bool) -> i32;
     fn spike_terminal_snapshot(
         terminal: *mut c_void,
         force_full: bool,
@@ -106,6 +124,25 @@ pub const SOURCE_REVISION: &str = env!("GHOSTTY_SOURCE_REVISION");
 pub struct Terminal {
     raw: NonNull<c_void>,
     raw_cells: Box<[RawCell]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollInput {
+    pub delta_rows: isize,
+    pub delta_columns: isize,
+    pub pointer_x: f32,
+    pub pointer_y: f32,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub modifiers: u16,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScrollResult {
+    pub viewport_changed: bool,
+    pub input: Vec<u8>,
 }
 
 pub struct Snapshot {
@@ -207,6 +244,63 @@ impl Terminal {
         }
         output.truncate(written);
         Ok(output)
+    }
+
+    pub(crate) fn scroll(&mut self, input: ScrollInput) -> Result<ScrollResult, String> {
+        if input.delta_rows == 0 && input.delta_columns == 0 {
+            return Ok(ScrollResult::default());
+        }
+        let output_steps = input
+            .delta_rows
+            .unsigned_abs()
+            .checked_add(input.delta_columns.unsigned_abs())
+            .ok_or_else(|| "terminal scroll output is too large".to_string())?;
+        if output_steps > MAX_SCROLL_OUTPUT_STEPS {
+            return Err("terminal scroll output is too large".into());
+        }
+        let output_capacity = output_steps
+            .checked_mul(128)
+            .ok_or_else(|| "terminal scroll output is too large".to_string())?;
+        let mut output = vec![0; output_capacity];
+        let mut output_written = 0;
+        let mut viewport_changed = false;
+        let result = unsafe {
+            spike_terminal_scroll(
+                self.raw.as_ptr(),
+                input.delta_rows,
+                input.delta_columns,
+                input.pointer_x,
+                input.pointer_y,
+                input.viewport_width,
+                input.viewport_height,
+                input.cell_width,
+                input.cell_height,
+                input.modifiers,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut output_written,
+                &mut viewport_changed,
+            )
+        };
+        result_ok(result, "route terminal scroll")?;
+        if output_written > output.len() {
+            return Err(format!(
+                "libghostty-vt scroll needs {output_written} bytes, buffer has {}",
+                output.len()
+            ));
+        }
+        output.truncate(output_written);
+        Ok(ScrollResult {
+            viewport_changed,
+            input: output,
+        })
+    }
+
+    pub(crate) fn scroll_to_bottom(&mut self) -> Result<bool, String> {
+        let mut changed = false;
+        let result = unsafe { spike_terminal_scroll_to_bottom(self.raw.as_ptr(), &mut changed) };
+        result_ok(result, "scroll terminal to bottom")?;
+        Ok(changed)
     }
 
     #[cfg_attr(feature = "gui", allow(dead_code))]
@@ -322,7 +416,7 @@ pub fn snapshot_text(snapshot: &Snapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Terminal;
+    use super::{ScrollInput, Terminal};
     #[cfg(feature = "gui")]
     use crate::terminal_theme::ThemePreset;
 
@@ -369,6 +463,105 @@ mod tests {
         assert!(forced.full);
         assert_eq!(forced.dirty_rows, vec![0, 1, 2]);
         assert_eq!(forced.cells.len(), 24);
+    }
+
+    #[test]
+    fn viewport_scrolling_uses_ghostty_scrollback() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let bottom = terminal.snapshot().expect("snapshot bottom");
+        assert!(super::snapshot_text(&bottom).contains("five"));
+
+        let scroll = terminal
+            .scroll(ScrollInput {
+                delta_rows: -2,
+                delta_columns: 0,
+                pointer_x: 0.0,
+                pointer_y: 0.0,
+                viewport_width: 80,
+                viewport_height: 60,
+                cell_width: 10,
+                cell_height: 20,
+                modifiers: 0,
+            })
+            .expect("scroll up");
+        assert!(scroll.viewport_changed);
+        assert!(scroll.input.is_empty());
+        let history = terminal.snapshot().expect("snapshot history");
+        let history_text = super::snapshot_text(&history);
+        assert!(history_text.contains("two"));
+        assert!(!history_text.contains("five"));
+
+        assert!(terminal.scroll_to_bottom().expect("scroll bottom"));
+        let bottom = terminal.snapshot().expect("snapshot restored bottom");
+        assert!(super::snapshot_text(&bottom).contains("five"));
+    }
+
+    #[test]
+    fn alternate_screen_scrolls_as_cursor_keys() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal.feed(b"\x1b[?1049h");
+
+        let scroll = terminal
+            .scroll(ScrollInput {
+                delta_rows: -2,
+                delta_columns: 0,
+                pointer_x: 0.0,
+                pointer_y: 0.0,
+                viewport_width: 80,
+                viewport_height: 60,
+                cell_width: 10,
+                cell_height: 20,
+                modifiers: 0,
+            })
+            .expect("scroll alternate screen");
+
+        assert!(!scroll.viewport_changed);
+        assert_eq!(scroll.input, b"\x1b[A\x1b[A");
+    }
+
+    #[test]
+    fn mouse_tracking_scrolls_as_mouse_reports() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h");
+
+        let scroll = terminal
+            .scroll(ScrollInput {
+                delta_rows: -1,
+                delta_columns: -1,
+                pointer_x: 25.0,
+                pointer_y: 30.0,
+                viewport_width: 80,
+                viewport_height: 60,
+                cell_width: 10,
+                cell_height: 20,
+                modifiers: 0,
+            })
+            .expect("scroll mouse-aware terminal");
+
+        assert!(!scroll.viewport_changed);
+        assert_eq!(scroll.input, b"\x1b[<64;3;2M\x1b[<66;3;2M");
+    }
+
+    #[test]
+    fn unbounded_scroll_output_is_rejected_before_allocation() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+
+        let error = terminal
+            .scroll(ScrollInput {
+                delta_rows: u32::MAX as isize,
+                delta_columns: 0,
+                pointer_x: 0.0,
+                pointer_y: 0.0,
+                viewport_width: 80,
+                viewport_height: 60,
+                cell_width: 10,
+                cell_height: 20,
+                modifiers: 0,
+            })
+            .expect_err("reject an unbounded scroll event");
+
+        assert_eq!(error, "terminal scroll output is too large");
     }
 
     #[test]

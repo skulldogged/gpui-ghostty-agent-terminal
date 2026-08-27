@@ -55,11 +55,20 @@ int spike_terminal_set_theme(SpikeTerminal* terminal, const uint8_t* foreground,
                              const uint8_t* background, const uint8_t* cursor,
                              const uint8_t* ansi_palette);
 int spike_terminal_encode_paste(SpikeTerminal* terminal, uint8_t* data,
-                                size_t data_len, uint8_t* output,
-                                size_t output_len, size_t* output_written);
+                                 size_t data_len, uint8_t* output,
+                                 size_t output_len, size_t* output_written);
+int spike_terminal_scroll(SpikeTerminal* terminal, intptr_t delta_rows,
+                          intptr_t delta_columns,
+                          float pointer_x, float pointer_y,
+                          uint32_t viewport_width, uint32_t viewport_height,
+                          uint32_t cell_width, uint32_t cell_height,
+                          uint16_t modifiers, uint8_t* output,
+                          size_t output_len, size_t* output_written,
+                          bool* viewport_changed);
+int spike_terminal_scroll_to_bottom(SpikeTerminal* terminal, bool* changed);
 int spike_terminal_snapshot(SpikeTerminal* terminal, bool force_full,
-                            SpikeSnapshot* snapshot, SpikeCell* cells,
-                            size_t capacity);
+                             SpikeSnapshot* snapshot, SpikeCell* cells,
+                             size_t capacity);
 
 #ifdef __cplusplus
 }

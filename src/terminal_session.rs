@@ -156,13 +156,39 @@ impl TerminalSession {
         ))
     }
 
-    pub fn input(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.process.write(bytes)
+    pub fn input(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        let viewport_changed = self.terminal.scroll_to_bottom()?;
+        self.process.write(bytes)?;
+        Ok(viewport_changed)
+    }
+
+    pub(crate) fn scroll(&mut self, input: ghostty::ScrollInput) -> Result<bool, String> {
+        self.process.pause_reader()?;
+        let mut changed = match self.drain_until_reader_paused() {
+            Ok(changed) => changed,
+            Err(error) => {
+                let resume_error = self.process.resume_reader().err();
+                return Err(combine_errors(error, resume_error));
+            }
+        };
+
+        let scroll_result = self.terminal.scroll(input).and_then(|result| {
+            changed |= result.viewport_changed;
+            if !result.input.is_empty() {
+                self.process.write(&result.input)?;
+            }
+            Ok(())
+        });
+        let resume_error = self.process.resume_reader().err();
+        match scroll_result {
+            Ok(()) => resume_error.map_or(Ok(changed), Err),
+            Err(error) => Err(combine_errors(error, resume_error)),
+        }
     }
 
     pub fn paste(&mut self, bytes: &[u8]) -> Result<bool, String> {
         self.process.pause_reader()?;
-        let changed = match self.drain_until_reader_paused() {
+        let mut changed = match self.drain_until_reader_paused() {
             Ok(changed) => changed,
             Err(error) => {
                 let resume_error = self.process.resume_reader().err();
@@ -172,8 +198,13 @@ impl TerminalSession {
 
         let paste_result = self
             .terminal
-            .encode_paste(bytes)
-            .and_then(|encoded| self.process.write(&encoded));
+            .scroll_to_bottom()
+            .and_then(|viewport_changed| {
+                changed |= viewport_changed;
+                self.terminal
+                    .encode_paste(bytes)
+                    .and_then(|encoded| self.process.write(&encoded))
+            });
         let resume_error = self.process.resume_reader().err();
         match paste_result {
             Ok(()) => resume_error.map_or(Ok(changed), Err),
@@ -340,8 +371,9 @@ mod tests {
         output: flume::Sender<PtyOutput>,
     }
 
-    struct OutputBeforePaste {
+    struct OutputBeforeCommand {
         output: flume::Sender<PtyOutput>,
+        output_before_pause: Vec<u8>,
         bytes: Arc<Mutex<Vec<u8>>>,
         resumed: Arc<Mutex<bool>>,
         fail_write: bool,
@@ -405,7 +437,7 @@ mod tests {
         }
     }
 
-    impl TerminalTransport for OutputBeforePaste {
+    impl TerminalTransport for OutputBeforeCommand {
         fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
             if self.fail_write {
                 return Err("injected paste write failure".into());
@@ -423,7 +455,7 @@ mod tests {
 
         fn pause_reader(&mut self) -> Result<(), String> {
             self.output
-                .send(PtyOutput::Bytes(b"\x1b[?2004h".to_vec()))
+                .send(PtyOutput::Bytes(self.output_before_pause.clone()))
                 .and_then(|_| self.output.send(PtyOutput::Paused))
                 .map_err(|error| format!("pause test reader: {error}"))
         }
@@ -487,6 +519,53 @@ mod tests {
     }
 
     #[test]
+    fn input_restores_a_scrolled_viewport_before_writing() {
+        let size = TerminalSize::new(8, 3, 10, 20);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let mut terminal =
+            ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(
+            terminal
+                .scroll(ghostty::ScrollInput {
+                    delta_rows: -2,
+                    delta_columns: 0,
+                    pointer_x: 0.0,
+                    pointer_y: 0.0,
+                    viewport_width: 80,
+                    viewport_height: 60,
+                    cell_width: 10,
+                    cell_height: 20,
+                    modifiers: 0,
+                })
+                .expect("scroll terminal")
+                .viewport_changed
+        );
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx,
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        assert!(session.input(b"x").expect("write terminal input"));
+
+        let snapshot = session.snapshot().expect("snapshot restored viewport");
+        assert!(ghostty::snapshot_text(&snapshot).contains("five"));
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"x"
+        );
+    }
+
+    #[test]
     fn paste_writes_ghostty_encoded_unicode_and_multiline_bytes_once() {
         let size = TerminalSize::default();
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -518,6 +597,53 @@ mod tests {
     }
 
     #[test]
+    fn paste_restores_a_scrolled_viewport_before_writing() {
+        let size = TerminalSize::new(8, 3, 10, 20);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let mut terminal =
+            ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(
+            terminal
+                .scroll(ghostty::ScrollInput {
+                    delta_rows: -2,
+                    delta_columns: 0,
+                    pointer_x: 0.0,
+                    pointer_y: 0.0,
+                    viewport_width: 80,
+                    viewport_height: 60,
+                    cell_width: 10,
+                    cell_height: 20,
+                    modifiers: 0,
+                })
+                .expect("scroll terminal")
+                .viewport_changed
+        );
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx,
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        assert!(session.paste(b"x").expect("paste terminal input"));
+
+        let snapshot = session.snapshot().expect("snapshot restored viewport");
+        assert!(ghostty::snapshot_text(&snapshot).contains("five"));
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"x"
+        );
+    }
+
+    #[test]
     fn paste_consumes_output_accepted_before_the_reader_barrier() {
         let size = TerminalSize::default();
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -527,8 +653,9 @@ mod tests {
             .expect("create test terminal without bracketed paste enabled");
         let mut session = TerminalSession {
             terminal,
-            process: Box::new(OutputBeforePaste {
+            process: Box::new(OutputBeforeCommand {
                 output: output_tx,
+                output_before_pause: b"\x1b[?2004h".to_vec(),
                 bytes: Arc::clone(&bytes),
                 resumed: Arc::clone(&resumed),
                 fail_write: false,
@@ -556,6 +683,57 @@ mod tests {
     }
 
     #[test]
+    fn scroll_consumes_mode_changes_accepted_before_the_reader_barrier() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let resumed = Arc::new(Mutex::new(false));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows)
+            .expect("create test terminal on the primary screen");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(OutputBeforeCommand {
+                output: output_tx,
+                output_before_pause: b"\x1b[?1049h".to_vec(),
+                bytes: Arc::clone(&bytes),
+                resumed: Arc::clone(&resumed),
+                fail_write: false,
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        assert!(
+            session
+                .scroll(ghostty::ScrollInput {
+                    delta_rows: -1,
+                    delta_columns: 0,
+                    pointer_x: 0.0,
+                    pointer_y: 0.0,
+                    viewport_width: 800,
+                    viewport_height: 480,
+                    cell_width: 10,
+                    cell_height: 20,
+                    modifiers: 0,
+                })
+                .expect("scroll through ordered terminal session barrier")
+        );
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[A",
+            "scroll routing must observe preceding alternate-screen mode changes"
+        );
+        assert!(
+            *resumed.lock().expect("resume marker mutex poisoned"),
+            "the reader must resume after an ordered scroll"
+        );
+    }
+
+    #[test]
     fn paste_resumes_the_reader_after_a_write_failure() {
         let size = TerminalSize::default();
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -565,8 +743,9 @@ mod tests {
             .expect("create test terminal without bracketed paste enabled");
         let mut session = TerminalSession {
             terminal,
-            process: Box::new(OutputBeforePaste {
+            process: Box::new(OutputBeforeCommand {
                 output: output_tx,
+                output_before_pause: b"\x1b[?2004h".to_vec(),
                 bytes,
                 resumed: Arc::clone(&resumed),
                 fail_write: true,

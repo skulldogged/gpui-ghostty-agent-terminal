@@ -2,6 +2,7 @@ use super::{TerminalLifecycle, TerminalUpdate};
 use crate::{
     AgentProgram, CoreCommand, CoreEffect, CoreModel, PaneId, PaneLayout, TerminalSessionId,
     core_model::default_space_name,
+    ghostty,
     pty::ProcessSnapshot,
     terminal_session::{TerminalEvent, TerminalEvents, TerminalSession, TerminalSize},
     terminal_theme::TerminalTheme,
@@ -153,8 +154,29 @@ impl CoreRuntime {
         &mut self,
         terminal_session_id: TerminalSessionId,
         bytes: &[u8],
-    ) -> Result<(), String> {
-        self.live_terminal_mut(terminal_session_id)?.input(bytes)
+    ) -> Result<bool, String> {
+        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let session = runtime
+            .session
+            .as_mut()
+            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
+        let result = session.input(bytes);
+        match result {
+            Ok(changed) => {
+                if changed {
+                    runtime.revision = runtime.revision.saturating_add(1);
+                    runtime.last_snapshot_revision = None;
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                // Input restores the viewport before writing. Preserve that
+                // terminal-state change even if the transport write fails.
+                runtime.revision = runtime.revision.saturating_add(1);
+                runtime.last_snapshot_revision = None;
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn paste(
@@ -179,6 +201,35 @@ impl CoreRuntime {
                 // The ordered reader barrier may have fed terminal output even
                 // when encoding, writing, or resuming subsequently failed.
                 runtime.revision = runtime.revision.saturating_add(1);
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn scroll(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        input: ghostty::ScrollInput,
+    ) -> Result<bool, String> {
+        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let session = runtime
+            .session
+            .as_mut()
+            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
+        let result = session.scroll(input);
+        match result {
+            Ok(changed) => {
+                if changed {
+                    runtime.revision = runtime.revision.saturating_add(1);
+                    runtime.last_snapshot_revision = None;
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                // The ordered reader barrier may have fed terminal output even
+                // when scroll encoding, writing, or resuming subsequently failed.
+                runtime.revision = runtime.revision.saturating_add(1);
+                runtime.last_snapshot_revision = None;
                 Err(error)
             }
         }
@@ -338,17 +389,6 @@ impl CoreRuntime {
                 }
             }
         }
-    }
-
-    fn live_terminal_mut(
-        &mut self,
-        terminal_session_id: TerminalSessionId,
-    ) -> Result<&mut TerminalSession, String> {
-        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
-        runtime
-            .session
-            .as_mut()
-            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))
     }
 
     fn runtime_terminal_mut(
