@@ -13,15 +13,16 @@ use crate::{
         CellMetrics, GridDimensions, fixed_cell_glyph_x, font_points_to_pixels,
         measured_cell_height, measured_cell_width,
     },
+    terminal_selection::{point_for_position, selection_rows},
     ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations,
-    FocusHandle, Font, FontFallbacks, FontId, IntoElement, KeyDownEvent, Keystroke, MouseButton,
-    MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel, Render, ScrollDelta,
-    ScrollWheelEvent, ShapedLine, SharedString, Task, TextRun, TouchPhase, Transformation, Window,
-    WindowControlArea, canvas, div, ease_out_quint, fill, font, percentage, point, prelude::*, px,
-    rgb, size, svg,
+    Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context,
+    Decorations, FocusHandle, Font, FontFallbacks, FontId, IntoElement, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton,
+    PromptLevel, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Task, TextRun,
+    TouchPhase, Transformation, Window, WindowControlArea, canvas, div, ease_out_quint, fill, font,
+    percentage, point, prelude::*, px, rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -81,6 +82,7 @@ pub(crate) fn open_terminal_window(
                 requested_sizes: HashMap::new(),
                 terminal_scroll_remainders: HashMap::new(),
                 terminal_bounds: Arc::new(Mutex::new(HashMap::new())),
+                terminal_selection_drag: None,
                 move_source: None,
                 selections_after_commands: HashMap::new(),
                 sidebar_width: WorkspaceShell::SIDEBAR_WIDTH,
@@ -126,6 +128,7 @@ struct MultiplexerView {
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
     terminal_scroll_remainders: HashMap<TerminalSessionId, ScrollRemainder>,
     terminal_bounds: Arc<Mutex<HashMap<PaneId, Bounds<Pixels>>>>,
+    terminal_selection_drag: Option<TerminalSelectionDrag>,
     move_source: Option<PaneId>,
     selections_after_commands: HashMap<u64, PaneId>,
     sidebar_width: f32,
@@ -145,6 +148,13 @@ struct UiSelection {
     space_id: Option<SpaceId>,
     tab_id: Option<TabId>,
     pane_id: Option<PaneId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalSelectionDrag {
+    pane_id: PaneId,
+    terminal_session_id: TerminalSessionId,
+    input: ghostty::SelectionInput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -815,7 +825,15 @@ impl MultiplexerView {
         let Some(terminal_session_id) = self.focused_terminal_session_id() else {
             return;
         };
+        if terminal_copy_shortcut(&event.keystroke)
+            && let Some(text) = self.selected_terminal_text()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            cx.stop_propagation();
+            return;
+        }
         if terminal_paste_shortcut(&event.keystroke) {
+            self.clear_terminal_selection();
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
                 && let Err(error) = self.driver.paste_to(terminal_session_id, text.into_bytes())
             {
@@ -826,6 +844,7 @@ impl MultiplexerView {
             return;
         }
         if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
+            self.clear_terminal_selection();
             if let Err(error) = self.driver.input_to(terminal_session_id, bytes) {
                 self.global_error = Some(error);
                 cx.notify();
@@ -947,6 +966,164 @@ impl MultiplexerView {
             .and_then(|tab| terminal_for_pane(&tab.layout, pane_id))
     }
 
+    fn terminal_selection_input_at(
+        &self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+        event_type: ghostty::SelectionEventType,
+        click_count: usize,
+    ) -> Option<(TerminalSessionId, ghostty::SelectionInput, bool)> {
+        let terminal_session_id = self
+            .selected_tab()
+            .and_then(|tab| terminal_for_pane(&tab.layout, pane_id))?;
+        let snapshot = self.terminals.get(&terminal_session_id)?;
+        let bounds = self
+            .terminal_bounds
+            .lock()
+            .expect("terminal bounds mutex poisoned")
+            .get(&pane_id)
+            .copied()?;
+        let pointer_x = f32::from(position.x - bounds.left());
+        let pointer_y = f32::from(position.y - bounds.top());
+        let point = point_for_position(
+            pointer_x,
+            pointer_y,
+            self.terminal_font.cells.width_px(),
+            self.terminal_font.cells.height_px(),
+            snapshot,
+        )?;
+        let screen_height = f32::from(bounds.size.height).max(1.0);
+        let autoscroll = pointer_y < 0.0 || pointer_y >= screen_height;
+        Some((
+            terminal_session_id,
+            ghostty::SelectionInput {
+                event_type,
+                click_count: click_count.min(usize::from(u8::MAX)) as u8,
+                x: point.x,
+                y: point.y,
+                pointer_x,
+                pointer_y,
+                columns: u32::from(snapshot.cols),
+                cell_width: self.terminal_font.cells.width_px().round().max(1.0) as u32,
+                padding_left: 0,
+                screen_height: screen_height.ceil() as u32,
+            },
+            autoscroll,
+        ))
+    }
+
+    fn start_terminal_selection(
+        &mut self,
+        pane_id: PaneId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let moving_pane = self.move_source.is_some();
+        self.focus_pane(pane_id, window, cx);
+        if moving_pane {
+            self.terminal_selection_drag = None;
+            return;
+        }
+        let Some((terminal_session_id, input, _)) = self.terminal_selection_input_at(
+            pane_id,
+            event.position,
+            ghostty::SelectionEventType::Press,
+            event.click_count,
+        ) else {
+            return;
+        };
+        if let Err(error) = self.driver.selection_event(terminal_session_id, input) {
+            self.global_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.terminal_selection_drag = Some(TerminalSelectionDrag {
+            pane_id,
+            terminal_session_id,
+            input,
+        });
+    }
+
+    fn update_terminal_selection_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.terminal_selection_drag else {
+            return;
+        };
+        let Some((terminal_session_id, input, autoscroll)) = self.terminal_selection_input_at(
+            drag.pane_id,
+            position,
+            ghostty::SelectionEventType::Drag,
+            usize::from(drag.input.click_count),
+        ) else {
+            return;
+        };
+        if let Err(error) = self.driver.selection_event(terminal_session_id, input) {
+            self.global_error = Some(error);
+            self.terminal_selection_drag = None;
+            cx.notify();
+            return;
+        }
+        if autoscroll {
+            let mut autoscroll_input = input;
+            autoscroll_input.event_type = ghostty::SelectionEventType::Autoscroll;
+            if let Err(error) = self
+                .driver
+                .selection_event(terminal_session_id, autoscroll_input)
+            {
+                self.global_error = Some(error);
+                self.terminal_selection_drag = None;
+                cx.notify();
+                return;
+            }
+        }
+        self.terminal_selection_drag = Some(TerminalSelectionDrag {
+            pane_id: drag.pane_id,
+            terminal_session_id,
+            input,
+        });
+    }
+
+    fn finish_terminal_selection(&mut self, _position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.terminal_selection_drag.take() else {
+            return;
+        };
+        let mut input = drag.input;
+        input.event_type = ghostty::SelectionEventType::Release;
+        if let Err(error) = self.driver.selection_event(drag.terminal_session_id, input) {
+            self.global_error = Some(error);
+            cx.notify();
+        }
+    }
+
+    fn selected_terminal_text(&self) -> Option<String> {
+        self.terminals
+            .get(&self.focused_terminal_session_id()?)?
+            .selection_text
+            .clone()
+    }
+
+    fn clear_terminal_selection(&mut self) {
+        let terminal_session_id = self
+            .terminal_selection_drag
+            .take()
+            .map(|drag| drag.terminal_session_id)
+            .or_else(|| {
+                let terminal_session_id = self.focused_terminal_session_id()?;
+                self.terminals
+                    .get(&terminal_session_id)?
+                    .selection_text
+                    .as_ref()?;
+                Some(terminal_session_id)
+            });
+        if let Some(terminal_session_id) = terminal_session_id
+            && let Err(error) = self
+                .driver
+                .selection_event(terminal_session_id, ghostty::SelectionInput::clear())
+        {
+            self.global_error = Some(error);
+        }
+    }
+
     fn selected_terminal_background(&self) -> gpui::Rgba {
         self.focused_terminal_session_id()
             .and_then(|terminal_session_id| self.terminals.get(&terminal_session_id))
@@ -1006,6 +1183,7 @@ impl MultiplexerView {
     }
 
     fn select_space(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_terminal_selection();
         self.selection.space_id = Some(space_id);
         self.selection.tab_id = None;
         self.selection.pane_id = None;
@@ -1015,6 +1193,7 @@ impl MultiplexerView {
     }
 
     fn select_tab(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_terminal_selection();
         self.selection.tab_id = Some(tab_id);
         self.selection.pane_id = None;
         self.selection = self.selection.normalized(&self.hierarchy);
@@ -1023,6 +1202,9 @@ impl MultiplexerView {
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.pane_id != Some(pane_id) {
+            self.clear_terminal_selection();
+        }
         if let Some(source_pane_id) = self.move_source
             && source_pane_id != pane_id
         {
@@ -2948,12 +3130,16 @@ impl MultiplexerView {
                 .child("Starting terminal…")
                 .into_any_element();
         };
-        let frame = if inactive {
+        let mut frame = if inactive {
             TerminalFrame::from_snapshot_with_cursor(snapshot, false)
                 .dimmed_toward(snapshot.default_bg, INACTIVE_PANE_CONTRAST)
         } else {
             TerminalFrame::from_snapshot(snapshot)
         };
+        let selection_rows = selection_rows(snapshot);
+        let terminal_theme = self.settings.theme.terminal_theme();
+        frame.apply_selection_foreground(&selection_rows, terminal_theme.selection_foreground);
+        let selection_background = color(terminal_theme.selection_background);
         let default_bg = self.shell.terminal_background(color(snapshot.default_bg));
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
@@ -2996,6 +3182,26 @@ impl MultiplexerView {
                             ),
                         ),
                         color(background.color),
+                    ));
+                }
+                for selection in &selection_rows {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.left()
+                                    + px(f32::from(selection.start_x)
+                                        * paint_font.cells.width_px()),
+                                bounds.top()
+                                    + px(f32::from(selection.y)
+                                        * paint_font.cells.height_px()),
+                            ),
+                            size(
+                                px(f32::from(selection.end_x - selection.start_x + 1)
+                                    * paint_font.cells.width_px()),
+                                px(paint_font.cells.height_px()),
+                            ),
+                        ),
+                        selection_background,
                     ));
                 }
                 for (y, line) in lines.iter().enumerate() {
@@ -3048,8 +3254,12 @@ impl MultiplexerView {
             .p(px(TERMINAL_PADDING_PX))
             .font_family(self.terminal_font.family.clone())
             .text_size(self.terminal_font.size)
-            .on_click(
-                cx.listener(move |view, _event, window, cx| view.focus_pane(pane_id, window, cx)),
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                    view.start_terminal_selection(pane_id, event, window, cx)
+                }),
             )
             .on_scroll_wheel(cx.listener(move |view, event, _window, cx| {
                 view.on_terminal_scroll(pane_id, terminal_session_id, event, cx)
@@ -3108,6 +3318,7 @@ impl Render for MultiplexerView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|view, event, window, cx| view.on_key_down(event, window, cx)))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
+                view.update_terminal_selection_drag(event.position, cx);
                 if view.sidebar_dragging {
                     let viewport = window.viewport_size().width.as_f32();
                     let max_width = (viewport - 500.)
@@ -3124,7 +3335,8 @@ impl Render for MultiplexerView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, _event, _window, cx| {
+                cx.listener(|view, event: &MouseUpEvent, _window, cx| {
+                    view.finish_terminal_selection(event.position, cx);
                     if view.sidebar_dragging {
                         view.sidebar_dragging = false;
                         cx.notify();
@@ -3134,7 +3346,8 @@ impl Render for MultiplexerView {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|view, _event, _window, cx| {
+                cx.listener(|view, event: &MouseUpEvent, _window, cx| {
+                    view.finish_terminal_selection(event.position, cx);
                     if view.sidebar_dragging {
                         view.sidebar_dragging = false;
                         cx.notify();
@@ -3465,6 +3678,35 @@ fn terminal_paste_shortcut(key: &Keystroke) -> bool {
     let platform = PasteShortcutPlatform::Windows;
 
     terminal_paste_shortcut_for(key, platform)
+}
+
+fn terminal_copy_shortcut(key: &Keystroke) -> bool {
+    #[cfg(target_os = "macos")]
+    let platform = PasteShortcutPlatform::MacOs;
+    #[cfg(target_os = "linux")]
+    let platform = PasteShortcutPlatform::Linux;
+    #[cfg(target_os = "windows")]
+    let platform = PasteShortcutPlatform::Windows;
+
+    terminal_copy_shortcut_for(key, platform)
+}
+
+fn terminal_copy_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> bool {
+    if !key.key.eq_ignore_ascii_case("c") || key.modifiers.alt || key.modifiers.function {
+        return false;
+    }
+
+    match platform {
+        PasteShortcutPlatform::MacOs => {
+            key.modifiers.platform && !key.modifiers.control && !key.modifiers.shift
+        }
+        PasteShortcutPlatform::Linux => {
+            key.modifiers.control && key.modifiers.shift && !key.modifiers.platform
+        }
+        PasteShortcutPlatform::Windows => {
+            key.modifiers.control && key.modifiers.shift && !key.modifiers.platform
+        }
+    }
 }
 
 fn terminal_paste_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> bool {
@@ -4137,8 +4379,9 @@ mod tests {
         installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
         normalize_page_scroll_delta, pane_close_shortcut_for, pane_extents,
         prioritized_agent_summary, projected_split_extent, row_cell_is_followed_by_space,
-        selection_for_created, selection_for_pane, split_ratio_at, terminal_font_with_fallbacks,
-        terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
+        selection_for_created, selection_for_pane, split_ratio_at, terminal_copy_shortcut_for,
+        terminal_font_with_fallbacks, terminal_input_bytes, terminal_paste_shortcut_for,
+        windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
@@ -4435,6 +4678,49 @@ mod tests {
     }
 
     #[test]
+    fn copy_shortcuts_follow_each_desktop_convention() {
+        let key = |modifiers| Keystroke {
+            key: "c".into(),
+            key_char: None,
+            modifiers,
+        };
+        let command_c = key(Modifiers {
+            platform: true,
+            ..Default::default()
+        });
+        let control_c = key(Modifiers {
+            control: true,
+            ..Default::default()
+        });
+        let control_shift_c = key(Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        });
+
+        assert!(terminal_copy_shortcut_for(
+            &command_c,
+            PasteShortcutPlatform::MacOs
+        ));
+        assert!(terminal_copy_shortcut_for(
+            &control_shift_c,
+            PasteShortcutPlatform::Linux
+        ));
+        assert!(terminal_copy_shortcut_for(
+            &control_shift_c,
+            PasteShortcutPlatform::Windows
+        ));
+        assert!(!terminal_copy_shortcut_for(
+            &control_c,
+            PasteShortcutPlatform::Linux
+        ));
+        assert!(!terminal_copy_shortcut_for(
+            &control_c,
+            PasteShortcutPlatform::Windows
+        ));
+    }
+
+    #[test]
     fn pane_close_shortcut_is_deliberate_on_every_desktop() {
         let key = |modifiers| Keystroke {
             key: "w".into(),
@@ -4625,6 +4911,7 @@ mod tests {
                 cursor: None,
                 default_fg: [0xdd; 3],
                 default_bg: [0x11; 3],
+                selection_text: None,
                 cells: Vec::new(),
             },
         );
@@ -4658,6 +4945,7 @@ mod tests {
             cursor: Some((0, 28)),
             default_fg: [0xdd; 3],
             default_bg: [0x11; 3],
+            selection_text: None,
             cells: Vec::new(),
         };
         let mut terminals = HashMap::from([(terminal_session_id, snapshot(20, 143))]);

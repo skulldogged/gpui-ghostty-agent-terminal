@@ -233,6 +233,10 @@ enum Command {
         terminal_session_id: TerminalSessionId,
         input: crate::ghostty::ScrollInput,
     },
+    Selection {
+        terminal_session_id: TerminalSessionId,
+        input: crate::ghostty::SelectionInput,
+    },
     ResizeBatch {
         batch_id: u64,
     },
@@ -426,6 +430,17 @@ impl CoreDriver {
         })
     }
 
+    pub(crate) fn selection_event(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        input: crate::ghostty::SelectionInput,
+    ) -> Result<(), String> {
+        self.send(Command::Selection {
+            terminal_session_id,
+            input,
+        })
+    }
+
     pub(crate) fn apply_core_command(&self, command: CoreCommand) -> Result<u64, String> {
         let command_id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         self.send(Command::Apply {
@@ -532,6 +547,13 @@ fn run_driver(
                 input,
             })) => core
                 .scroll_terminal(terminal_session_id, input)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::Selection {
+                terminal_session_id,
+                input,
+            })) => core
+                .selection_event(terminal_session_id, input)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
             DriverEvent::Command(Ok(Command::ResizeBatch { batch_id })) => {

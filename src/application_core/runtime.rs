@@ -235,6 +235,33 @@ impl CoreRuntime {
         }
     }
 
+    pub(super) fn selection_event(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        input: ghostty::SelectionInput,
+    ) -> Result<bool, String> {
+        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let session = runtime
+            .session
+            .as_mut()
+            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
+        let result = session.selection_event(input);
+        match result {
+            Ok(changed) => {
+                if changed {
+                    runtime.revision = runtime.revision.saturating_add(1);
+                    runtime.last_snapshot_revision = None;
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                runtime.revision = runtime.revision.saturating_add(1);
+                runtime.last_snapshot_revision = None;
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn resize(
         &mut self,
         terminal_session_id: TerminalSessionId,

@@ -24,6 +24,8 @@ typedef struct {
   uint8_t bg_g;
   uint8_t bg_b;
   bool has_explicit_bg;
+  bool soft_wrapped;
+  bool selected;
 } SpikeCell;
 
 typedef struct {
@@ -36,6 +38,7 @@ typedef struct {
   bool cursor_visible;
   bool bracketed_paste;
   bool alternate_screen;
+  bool selection_active;
   uint8_t default_fg_r;
   uint8_t default_fg_g;
   uint8_t default_fg_b;
@@ -45,6 +48,19 @@ typedef struct {
   bool full;
   size_t cell_count;
 } SpikeSnapshot;
+
+typedef struct {
+  uint8_t type;
+  uint8_t click_count;
+  uint16_t x;
+  uint16_t y;
+  float pointer_x;
+  float pointer_y;
+  uint32_t columns;
+  uint32_t cell_width;
+  uint32_t padding_left;
+  uint32_t screen_height;
+} SpikeSelectionInput;
 
 SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollback);
 void spike_terminal_free(SpikeTerminal* terminal);
@@ -66,6 +82,11 @@ int spike_terminal_scroll(SpikeTerminal* terminal, intptr_t delta_rows,
                           size_t output_len, size_t* output_written,
                           bool* viewport_changed);
 int spike_terminal_scroll_to_bottom(SpikeTerminal* terminal, bool* changed);
+int spike_terminal_selection_event(SpikeTerminal* terminal,
+                                   const SpikeSelectionInput* input,
+                                   bool* viewport_changed);
+int spike_terminal_selection_text(SpikeTerminal* terminal, uint8_t* output,
+                                  size_t output_len, size_t* output_written);
 int spike_terminal_snapshot(SpikeTerminal* terminal, bool force_full,
                              SpikeSnapshot* snapshot, SpikeCell* cells,
                              size_t capacity);

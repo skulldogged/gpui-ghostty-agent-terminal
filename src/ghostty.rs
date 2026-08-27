@@ -19,6 +19,8 @@ struct RawCell {
     bg_g: u8,
     bg_b: u8,
     has_explicit_bg: bool,
+    soft_wrapped: bool,
+    selected: bool,
 }
 
 #[repr(C)]
@@ -32,6 +34,7 @@ struct RawSnapshot {
     cursor_visible: bool,
     bracketed_paste: bool,
     alternate_screen: bool,
+    selection_active: bool,
     default_fg_r: u8,
     default_fg_g: u8,
     default_fg_b: u8,
@@ -40,6 +43,20 @@ struct RawSnapshot {
     default_bg_b: u8,
     full: bool,
     cell_count: usize,
+}
+
+#[repr(C)]
+struct RawSelectionInput {
+    event_type: u8,
+    click_count: u8,
+    x: u16,
+    y: u16,
+    pointer_x: f32,
+    pointer_y: f32,
+    columns: u32,
+    cell_width: u32,
+    padding_left: u32,
+    screen_height: u32,
 }
 
 impl Default for RawSnapshot {
@@ -54,6 +71,7 @@ impl Default for RawSnapshot {
             cursor_visible: false,
             bracketed_paste: false,
             alternate_screen: false,
+            selection_active: false,
             default_fg_r: 0,
             default_fg_g: 0,
             default_fg_b: 0,
@@ -109,6 +127,17 @@ unsafe extern "C" {
         viewport_changed: *mut bool,
     ) -> i32;
     fn spike_terminal_scroll_to_bottom(terminal: *mut c_void, changed: *mut bool) -> i32;
+    fn spike_terminal_selection_event(
+        terminal: *mut c_void,
+        input: *const RawSelectionInput,
+        viewport_changed: *mut bool,
+    ) -> i32;
+    fn spike_terminal_selection_text(
+        terminal: *mut c_void,
+        output: *mut u8,
+        output_len: usize,
+        output_written: *mut usize,
+    ) -> i32;
     fn spike_terminal_snapshot(
         terminal: *mut c_void,
         force_full: bool,
@@ -124,6 +153,8 @@ pub const SOURCE_REVISION: &str = env!("GHOSTTY_SOURCE_REVISION");
 pub struct Terminal {
     raw: NonNull<c_void>,
     raw_cells: Box<[RawCell]>,
+    selection_text_cache: Option<String>,
+    selection_dragging: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +176,46 @@ pub(crate) struct ScrollResult {
     pub input: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionEventType {
+    Press,
+    Drag,
+    Release,
+    Autoscroll,
+    Clear,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectionInput {
+    pub event_type: SelectionEventType,
+    pub click_count: u8,
+    pub x: u16,
+    pub y: u16,
+    pub pointer_x: f32,
+    pub pointer_y: f32,
+    pub columns: u32,
+    pub cell_width: u32,
+    pub padding_left: u32,
+    pub screen_height: u32,
+}
+
+impl SelectionInput {
+    pub(crate) fn clear() -> Self {
+        Self {
+            event_type: SelectionEventType::Clear,
+            click_count: 0,
+            x: 0,
+            y: 0,
+            pointer_x: 0.0,
+            pointer_y: 0.0,
+            columns: 0,
+            cell_width: 0,
+            padding_left: 0,
+            screen_height: 0,
+        }
+    }
+}
+
 pub struct Snapshot {
     pub full: bool,
     pub dirty_rows: Vec<u16>,
@@ -156,6 +227,7 @@ pub struct Snapshot {
     pub alternate_screen: bool,
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
+    pub selection_text: Option<String>,
     pub cells: Vec<Cell>,
 }
 
@@ -169,6 +241,8 @@ pub struct Cell {
     pub bg: [u8; 3],
     #[cfg_attr(feature = "gui", allow(dead_code))]
     pub has_explicit_bg: bool,
+    pub soft_wrapped: bool,
+    pub selected: bool,
 }
 
 impl Terminal {
@@ -179,11 +253,14 @@ impl Terminal {
             raw_cells: (0..SNAPSHOT_CELL_CAPACITY)
                 .map(|_| RawCell::default())
                 .collect(),
+            selection_text_cache: None,
+            selection_dragging: false,
         })
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
         unsafe { spike_terminal_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
+        self.selection_text_cache = None;
     }
 
     pub fn resize(
@@ -303,6 +380,83 @@ impl Terminal {
         Ok(changed)
     }
 
+    pub(crate) fn selection_event(&mut self, input: SelectionInput) -> Result<bool, String> {
+        let raw = RawSelectionInput {
+            event_type: match input.event_type {
+                SelectionEventType::Press => 0,
+                SelectionEventType::Drag => 1,
+                SelectionEventType::Release => 2,
+                SelectionEventType::Autoscroll => 3,
+                SelectionEventType::Clear => 4,
+            },
+            click_count: input.click_count,
+            x: input.x,
+            y: input.y,
+            pointer_x: input.pointer_x,
+            pointer_y: input.pointer_y,
+            columns: input.columns,
+            cell_width: input.cell_width,
+            padding_left: input.padding_left,
+            screen_height: input.screen_height,
+        };
+        let mut viewport_changed = false;
+        let result = unsafe {
+            spike_terminal_selection_event(self.raw.as_ptr(), &raw, &mut viewport_changed)
+        };
+        result_ok(result, "update selection")?;
+        match input.event_type {
+            SelectionEventType::Press
+            | SelectionEventType::Drag
+            | SelectionEventType::Autoscroll => {
+                self.selection_dragging = true;
+                self.selection_text_cache = None;
+            }
+            SelectionEventType::Release => {
+                self.selection_dragging = false;
+                self.selection_text_cache = self.selection_text()?;
+            }
+            SelectionEventType::Clear => {
+                self.selection_dragging = false;
+                self.selection_text_cache = None;
+            }
+        }
+        Ok(viewport_changed)
+    }
+
+    fn selection_text(&mut self) -> Result<Option<String>, String> {
+        let mut required = 0;
+        let result = unsafe {
+            spike_terminal_selection_text(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut required)
+        };
+        if result == -4 {
+            return Ok(None);
+        }
+        if result != -3 {
+            result_ok(result, "measure selection text")?;
+        }
+        let mut output = vec![0; required];
+        let mut written = 0;
+        let result = unsafe {
+            spike_terminal_selection_text(
+                self.raw.as_ptr(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+            )
+        };
+        result_ok(result, "format selection text")?;
+        if written > output.len() {
+            return Err(format!(
+                "libghostty-vt selection needs {written} bytes, buffer has {}",
+                output.len()
+            ));
+        }
+        output.truncate(written);
+        String::from_utf8(output)
+            .map(Some)
+            .map_err(|error| format!("libghostty-vt selection is not UTF-8: {error}"))
+    }
+
     #[cfg_attr(feature = "gui", allow(dead_code))]
     pub fn snapshot(&mut self) -> Result<Snapshot, String> {
         self.render_update(true)
@@ -338,6 +492,8 @@ impl Terminal {
                 fg: [raw.fg_r, raw.fg_g, raw.fg_b],
                 bg: [raw.bg_r, raw.bg_g, raw.bg_b],
                 has_explicit_bg: raw.has_explicit_bg,
+                soft_wrapped: raw.soft_wrapped,
+                selected: raw.selected,
             })
             .collect();
         let mut dirty_rows = cells.iter().map(|cell| cell.y).collect::<Vec<_>>();
@@ -354,6 +510,12 @@ impl Terminal {
                 })
                 .collect::<String>();
         let title = (!title.trim().is_empty()).then(|| title.trim().to_owned());
+        if !raw_snapshot.selection_active {
+            self.selection_text_cache = None;
+        } else if !self.selection_dragging && self.selection_text_cache.is_none() {
+            self.selection_text_cache = self.selection_text()?;
+        }
+        let selection_text = self.selection_text_cache.clone();
 
         Ok(Snapshot {
             full: raw_snapshot.full,
@@ -376,6 +538,7 @@ impl Terminal {
                 raw_snapshot.default_bg_g,
                 raw_snapshot.default_bg_b,
             ],
+            selection_text,
             cells,
         })
     }
