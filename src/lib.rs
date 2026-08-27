@@ -40,7 +40,7 @@ pub use agent_integration::{AgentProgram, AgentSnapshot, AgentState};
 #[cfg(feature = "gui")]
 pub use application_core::{
     ApplicationCore, CoreCommandOutcome, SemanticEvent, SemanticEventKind, TerminalCell,
-    TerminalChange, TerminalLifecycle, TerminalSnapshot,
+    TerminalChange, TerminalCursorShape, TerminalLifecycle, TerminalSnapshot,
 };
 pub use core_model::{
     CoreCommand, CoreCommit, CoreEffect, CoreModel, CoreModelError, CoreSnapshot, CreatedResource,

@@ -300,6 +300,17 @@ impl TerminalSession {
         self.terminal.set_theme(theme)
     }
 
+    pub(crate) fn set_default_cursor_shape(
+        &mut self,
+        shape: ghostty::CursorShape,
+    ) -> Result<(), String> {
+        self.terminal.set_default_cursor_shape(shape)
+    }
+
+    pub(crate) fn set_default_cursor_blink(&mut self, blink: bool) -> Result<(), String> {
+        self.terminal.set_default_cursor_blink(blink)
+    }
+
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), String> {
         let size = size.validate()?;
         if size == self.size {

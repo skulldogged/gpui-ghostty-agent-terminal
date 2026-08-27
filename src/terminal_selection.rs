@@ -85,7 +85,7 @@ pub(crate) fn selection_rows(snapshot: &TerminalSnapshot) -> Vec<SelectionRow> {
 #[cfg(test)]
 mod tests {
     use super::{SelectionRow, TerminalPoint, point_for_position, selection_rows};
-    use crate::{TerminalCell, TerminalLifecycle, TerminalSnapshot};
+    use crate::{TerminalCell, TerminalCursorShape, TerminalLifecycle, TerminalSnapshot};
 
     #[test]
     fn pointer_positions_clamp_to_the_visible_grid() {
@@ -142,6 +142,9 @@ mod tests {
             cols,
             rows,
             cursor: None,
+            cursor_shape: TerminalCursorShape::Block,
+            cursor_blinking: false,
+            cursor_wide_tail: false,
             default_fg: [0xdd; 3],
             default_bg: [0x11; 3],
             selection_text: None,
