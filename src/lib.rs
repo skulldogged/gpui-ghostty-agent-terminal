@@ -14,6 +14,8 @@ mod terminal_frame;
 #[cfg(feature = "gui")]
 mod terminal_grid;
 #[cfg(feature = "gui")]
+mod terminal_selection;
+#[cfg(feature = "gui")]
 mod terminal_session;
 #[cfg(feature = "gui")]
 mod terminal_theme;

@@ -11,6 +11,11 @@ struct SpikeTerminal {
   GhosttyRenderStateRowCells cells;
   GhosttyMouseEncoder mouse_encoder;
   GhosttyMouseEvent mouse_event;
+  GhosttySelectionGesture selection_gesture;
+  GhosttySelectionGestureEvent selection_press;
+  GhosttySelectionGestureEvent selection_drag;
+  GhosttySelectionGestureEvent selection_release;
+  GhosttySelectionGestureEvent selection_autoscroll;
 };
 
 static bool success(GhosttyResult result) { return result == GHOSTTY_SUCCESS; }
@@ -29,7 +34,21 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
       !success(ghostty_render_state_row_iterator_new(NULL, &spike->rows)) ||
       !success(ghostty_render_state_row_cells_new(NULL, &spike->cells)) ||
       !success(ghostty_mouse_encoder_new(NULL, &spike->mouse_encoder)) ||
-      !success(ghostty_mouse_event_new(NULL, &spike->mouse_event))) {
+      !success(ghostty_mouse_event_new(NULL, &spike->mouse_event)) ||
+      !success(ghostty_selection_gesture_new(NULL,
+                                             &spike->selection_gesture)) ||
+      !success(ghostty_selection_gesture_event_new(
+          NULL, &spike->selection_press,
+          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS)) ||
+      !success(ghostty_selection_gesture_event_new(
+          NULL, &spike->selection_drag,
+          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG)) ||
+      !success(ghostty_selection_gesture_event_new(
+          NULL, &spike->selection_release,
+          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE)) ||
+      !success(ghostty_selection_gesture_event_new(
+          NULL, &spike->selection_autoscroll,
+          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_AUTOSCROLL_TICK))) {
     spike_terminal_free(spike);
     return NULL;
   }
@@ -38,6 +57,11 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
 
 void spike_terminal_free(SpikeTerminal* spike) {
   if (spike == NULL) return;
+  ghostty_selection_gesture_event_free(spike->selection_autoscroll);
+  ghostty_selection_gesture_event_free(spike->selection_release);
+  ghostty_selection_gesture_event_free(spike->selection_drag);
+  ghostty_selection_gesture_event_free(spike->selection_press);
+  ghostty_selection_gesture_free(spike->selection_gesture, spike->terminal);
   ghostty_mouse_event_free(spike->mouse_event);
   ghostty_mouse_encoder_free(spike->mouse_encoder);
   ghostty_render_state_row_cells_free(spike->cells);
@@ -140,6 +164,189 @@ int spike_terminal_scroll_to_bottom(SpikeTerminal* spike, bool* changed) {
       spike,
       (GhosttyTerminalScrollViewport){.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM},
       changed);
+}
+
+static GhosttyResult selection_ref_at(SpikeTerminal* spike, uint16_t x,
+                                      uint16_t y, GhosttyGridRef* out_ref) {
+  GhosttyPoint point = {
+      .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+      .value = {.coordinate = {.x = x, .y = y}},
+  };
+  GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  *out_ref = ref;
+  return ghostty_terminal_grid_ref(spike->terminal, point, out_ref);
+}
+
+static GhosttyResult selection_event_set(
+    GhosttySelectionGestureEvent event,
+    GhosttySelectionGestureEventOption option, const void* value) {
+  return ghostty_selection_gesture_event_set(event, option, value);
+}
+
+static GhosttyResult install_selection(SpikeTerminal* spike,
+                                       GhosttyResult result,
+                                       GhosttySelection* selection,
+                                       bool clear_on_no_value) {
+  if (success(result)) {
+    return ghostty_terminal_set(spike->terminal,
+                                GHOSTTY_TERMINAL_OPT_SELECTION, selection);
+  }
+  if (result == GHOSTTY_NO_VALUE && clear_on_no_value) {
+    return ghostty_terminal_set(spike->terminal,
+                                GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  }
+  return result;
+}
+
+int spike_terminal_selection_event(SpikeTerminal* spike,
+                                   const SpikeSelectionInput* input,
+                                   bool* viewport_changed) {
+  if (spike == NULL || input == NULL || viewport_changed == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  *viewport_changed = false;
+  if (input->type == 4) {
+    ghostty_selection_gesture_reset(spike->selection_gesture, spike->terminal);
+    return ghostty_terminal_set(spike->terminal,
+                                GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  }
+
+  if (input->columns == 0 || input->cell_width == 0 ||
+      input->screen_height == 0) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  GhosttySelectionGestureGeometry geometry = {
+      .columns = input->columns,
+      .cell_width = input->cell_width,
+      .padding_left = input->padding_left,
+      .screen_height = input->screen_height,
+  };
+  GhosttySurfacePosition position = {
+      .x = input->pointer_x,
+      .y = input->pointer_y,
+  };
+  GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyResult result = GHOSTTY_INVALID_VALUE;
+
+  if (input->type == 0) {
+    GhosttyGridRef ref;
+    result = selection_ref_at(spike, input->x, input->y, &ref);
+    if (!success(result)) return result;
+    GhosttySelectionGestureBehavior behavior =
+        input->click_count >= 3
+            ? GHOSTTY_SELECTION_GESTURE_BEHAVIOR_LINE
+            : (input->click_count == 2
+                   ? GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD
+                   : GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL);
+    GhosttySelectionGestureBehaviors behaviors = {
+        .single_click = behavior,
+        .double_click = behavior,
+        .triple_click = behavior,
+    };
+    result = selection_event_set(spike->selection_press,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                 &ref);
+    if (!success(result)) return result;
+    result = selection_event_set(spike->selection_press,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                                 &position);
+    if (!success(result)) return result;
+    result = selection_event_set(spike->selection_press,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS,
+                                 &behaviors);
+    if (!success(result)) return result;
+    result = ghostty_selection_gesture_event(
+        spike->selection_gesture, spike->terminal, spike->selection_press,
+        &selection);
+    return install_selection(spike, result, &selection, true);
+  }
+
+  if (input->type == 1) {
+    GhosttyGridRef ref;
+    result = selection_ref_at(spike, input->x, input->y, &ref);
+    if (!success(result)) return result;
+    result = selection_event_set(spike->selection_drag,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                 &ref);
+    if (!success(result)) return result;
+    result = selection_event_set(spike->selection_drag,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                                 &position);
+    if (!success(result)) return result;
+    result = selection_event_set(spike->selection_drag,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
+                                 &geometry);
+    if (!success(result)) return result;
+    result = ghostty_selection_gesture_event(
+        spike->selection_gesture, spike->terminal, spike->selection_drag,
+        &selection);
+    result = install_selection(spike, result, &selection, false);
+    return result == GHOSTTY_NO_VALUE ? GHOSTTY_SUCCESS : result;
+  }
+
+  if (input->type == 2) {
+    GhosttyGridRef ref;
+    result = selection_ref_at(spike, input->x, input->y, &ref);
+    if (!success(result)) return result;
+    result = selection_event_set(spike->selection_release,
+                                 GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                 &ref);
+    if (!success(result)) return result;
+    result = ghostty_selection_gesture_event(
+        spike->selection_gesture, spike->terminal, spike->selection_release,
+        NULL);
+    return result == GHOSTTY_NO_VALUE ? GHOSTTY_SUCCESS : result;
+  }
+
+  if (input->type == 3) {
+    GhosttyTerminalScrollbar before = {0};
+    result = ghostty_terminal_get(spike->terminal,
+                                  GHOSTTY_TERMINAL_DATA_SCROLLBAR, &before);
+    if (!success(result)) return result;
+    GhosttyPointCoordinate viewport = {.x = input->x, .y = input->y};
+    result = selection_event_set(
+        spike->selection_autoscroll,
+        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT, &viewport);
+    if (!success(result)) return result;
+    result = selection_event_set(
+        spike->selection_autoscroll,
+        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &position);
+    if (!success(result)) return result;
+    result = selection_event_set(
+        spike->selection_autoscroll,
+        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &geometry);
+    if (!success(result)) return result;
+    result = ghostty_selection_gesture_event(
+        spike->selection_gesture, spike->terminal,
+        spike->selection_autoscroll, &selection);
+    result = install_selection(spike, result, &selection, false);
+    if (!success(result) && result != GHOSTTY_NO_VALUE) return result;
+    GhosttyTerminalScrollbar after = {0};
+    result = ghostty_terminal_get(spike->terminal,
+                                  GHOSTTY_TERMINAL_DATA_SCROLLBAR, &after);
+    if (!success(result)) return result;
+    *viewport_changed = before.offset != after.offset;
+    return GHOSTTY_SUCCESS;
+  }
+
+  return GHOSTTY_INVALID_VALUE;
+}
+
+int spike_terminal_selection_text(SpikeTerminal* spike, uint8_t* output,
+                                  size_t output_len,
+                                  size_t* output_written) {
+  if (spike == NULL || output_written == NULL ||
+      (output == NULL && output_len > 0)) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  GhosttyTerminalSelectionFormatOptions options =
+      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
+  options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  options.unwrap = true;
+  options.trim = true;
+  options.selection = NULL;
+  return ghostty_terminal_selection_format_buf(
+      spike->terminal, options, output, output_len, output_written);
 }
 
 static GhosttyResult encode_mouse_scroll(SpikeTerminal* spike,
@@ -308,6 +515,12 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
       spike->terminal, GHOSTTY_MODE_ALT_SCREEN_SAVE, &alternate_screen_save);
   if (!success(result)) return result;
   snapshot->alternate_screen = alternate_screen || alternate_screen_save;
+  GhosttySelection active_selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+  result = ghostty_terminal_get(spike->terminal,
+                                GHOSTTY_TERMINAL_DATA_SELECTION,
+                                &active_selection);
+  snapshot->selection_active = success(result);
+  if (!success(result) && result != GHOSTTY_NO_VALUE) return result;
 
   GhosttyString title = {0};
   result = ghostty_terminal_get(spike->terminal, GHOSTTY_TERMINAL_DATA_TITLE,
@@ -348,6 +561,21 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
       continue;
     }
 
+    GhosttyRow raw_row = 0;
+    result = ghostty_render_state_row_get(
+        spike->rows, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row);
+    if (!success(result)) return result;
+    bool soft_wrapped = false;
+    result = ghostty_row_get(raw_row, GHOSTTY_ROW_DATA_WRAP, &soft_wrapped);
+    if (!success(result)) return result;
+    GhosttyRenderStateRowSelection row_selection =
+        GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
+    result = ghostty_render_state_row_get(
+        spike->rows, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
+        &row_selection);
+    const bool row_selected = success(result);
+    if (!row_selected && result != GHOSTTY_NO_VALUE) return result;
+
     result = ghostty_render_state_row_get(
         spike->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &spike->cells);
     if (!success(result)) return result;
@@ -359,6 +587,9 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
         memset(cell, 0, sizeof(*cell));
         cell->x = x;
         cell->y = y;
+        cell->soft_wrapped = soft_wrapped;
+        cell->selected = row_selected && x >= row_selection.start_x &&
+                         x <= row_selection.end_x;
 
         GhosttyBuffer text = {
             .ptr = cell->text,

@@ -186,6 +186,15 @@ impl TerminalSession {
         }
     }
 
+    pub(crate) fn selection_event(
+        &mut self,
+        input: ghostty::SelectionInput,
+    ) -> Result<bool, String> {
+        let _output_changed = self.drain_output()?;
+        self.terminal.selection_event(input)?;
+        Ok(true)
+    }
+
     pub fn paste(&mut self, bytes: &[u8]) -> Result<bool, String> {
         self.process.pause_reader()?;
         let mut changed = match self.drain_until_reader_paused() {

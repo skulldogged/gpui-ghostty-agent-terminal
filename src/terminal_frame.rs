@@ -1,4 +1,4 @@
-use crate::{TerminalSnapshot, terminal_grid::cell_offset};
+use crate::{TerminalSnapshot, terminal_grid::cell_offset, terminal_selection::SelectionRow};
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +167,31 @@ impl TerminalFrame {
             cursor.color = blend_toward(cursor.color, background, contrast);
         }
         self
+    }
+
+    pub(crate) fn apply_selection_foreground(
+        &mut self,
+        selection_rows: &[SelectionRow],
+        foreground: [u8; 3],
+    ) {
+        for selection in selection_rows {
+            let Some(row) = self.rows.get_mut(usize::from(selection.y)) else {
+                continue;
+            };
+            for cell in &mut row.glyph_cells {
+                let end_x = cell
+                    .x
+                    .saturating_add(u16::from(cell.width).saturating_sub(1));
+                if cell.x <= selection.end_x && end_x >= selection.start_x {
+                    cell.color = foreground;
+                }
+            }
+
+            row.runs.clear();
+            for cell in &row.glyph_cells {
+                push_foreground(&mut row.runs, cell.byte_range.len(), cell.color);
+            }
+        }
     }
 }
 
@@ -390,6 +415,7 @@ mod tests {
             cursor,
             default_fg: [0xdd; 3],
             default_bg: [0x11; 3],
+            selection_text: None,
             cells,
         }
     }
@@ -403,6 +429,8 @@ mod tests {
             fg,
             bg: [0x11; 3],
             has_explicit_bg: false,
+            soft_wrapped: false,
+            selected: false,
         }
     }
 }

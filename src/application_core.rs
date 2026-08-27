@@ -73,6 +73,10 @@ enum WorkerRequest {
         terminal_session_id: TerminalSessionId,
         input: ghostty::ScrollInput,
     },
+    Selection {
+        terminal_session_id: TerminalSessionId,
+        input: ghostty::SelectionInput,
+    },
     Resize {
         terminal_session_id: TerminalSessionId,
         size: TerminalSize,
@@ -264,6 +268,17 @@ impl ApplicationCore {
         })
     }
 
+    pub(crate) fn selection_event(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        input: ghostty::SelectionInput,
+    ) -> Result<(), String> {
+        self.expect_ack(WorkerRequest::Selection {
+            terminal_session_id,
+            input,
+        })
+    }
+
     pub fn resize_terminal(
         &self,
         terminal_session_id: TerminalSessionId,
@@ -440,6 +455,22 @@ fn run_terminal_runtime(
                             Ok(WorkerResponse::Ack)
                         }
                     }
+                    WorkerRequest::Selection {
+                        terminal_session_id,
+                        input,
+                    } => {
+                        if runtime.contains_terminal(terminal_session_id) {
+                            let result = runtime.selection_event(terminal_session_id, input);
+                            if result.as_ref().copied().unwrap_or(true)
+                                && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
+                            {
+                                changed_terminals.push((terminal_session_id, revision));
+                            }
+                            result.map(|_| WorkerResponse::Ack)
+                        } else {
+                            Ok(WorkerResponse::Ack)
+                        }
+                    }
                     WorkerRequest::Resize {
                         terminal_session_id,
                         size,
@@ -587,6 +618,7 @@ pub struct TerminalSnapshot {
     pub cursor: Option<(u16, u16)>,
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
+    pub selection_text: Option<String>,
     pub cells: Vec<TerminalCell>,
 }
 
@@ -645,6 +677,7 @@ impl TerminalSnapshot {
             cursor: update.cursor,
             default_fg: update.default_fg,
             default_bg: update.default_bg,
+            selection_text: update.selection_text,
             cells: update.cells,
         }
         .with_refreshed_agent(update.agent_program))
@@ -675,6 +708,7 @@ impl TerminalSnapshot {
         self.cursor = update.cursor;
         self.default_fg = update.default_fg;
         self.default_bg = update.default_bg;
+        self.selection_text = update.selection_text;
         self.refresh_agent(update.agent_program);
         Ok(())
     }
@@ -705,6 +739,7 @@ struct TerminalUpdate {
     cursor: Option<(u16, u16)>,
     default_fg: [u8; 3],
     default_bg: [u8; 3],
+    selection_text: Option<String>,
     dirty_rows: Vec<u16>,
     cells: Vec<TerminalCell>,
 }
@@ -730,6 +765,7 @@ impl TerminalUpdate {
             cursor: snapshot.cursor,
             default_fg: snapshot.default_fg,
             default_bg: snapshot.default_bg,
+            selection_text: snapshot.selection_text,
             dirty_rows: snapshot.dirty_rows,
             cells: snapshot.cells.into_iter().map(TerminalCell::from).collect(),
         }
@@ -750,6 +786,7 @@ impl TerminalUpdate {
             cursor: None,
             default_fg: [0xd8, 0xde, 0xe9],
             default_bg: [0x0b, 0x0e, 0x13],
+            selection_text: None,
             dirty_rows: (0..ROWS).collect(),
             cells: Vec::new(),
         }
@@ -814,6 +851,8 @@ pub struct TerminalCell {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub has_explicit_bg: bool,
+    pub soft_wrapped: bool,
+    pub selected: bool,
 }
 
 impl From<ghostty::Cell> for TerminalCell {
@@ -826,6 +865,8 @@ impl From<ghostty::Cell> for TerminalCell {
             fg: cell.fg,
             bg: cell.bg,
             has_explicit_bg: cell.has_explicit_bg,
+            soft_wrapped: cell.soft_wrapped,
+            selected: cell.selected,
         }
     }
 }
