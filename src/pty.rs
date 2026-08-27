@@ -111,6 +111,16 @@ pub(crate) fn send_or_shutdown<T>(
         .wait()
 }
 
+pub(crate) fn publish_writer_failure(
+    events: &flume::Sender<crate::terminal_session::TerminalEvent>,
+    error: String,
+) {
+    // The writer owns resize/flush acknowledgements. It must be able to exit
+    // and drop queued completion senders even when a coalesced Changed event
+    // already occupies the lifecycle queue.
+    let _ = events.try_send(crate::terminal_session::TerminalEvent::Failed(error));
+}
+
 pub(crate) fn reader_checkpoint(
     control: &flume::Receiver<ReaderControl>,
     output: &flume::Sender<PtyOutput>,
@@ -229,7 +239,7 @@ mod unix {
     use super::{
         PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessInputStatus, ProcessSnapshot, PtyOutput,
         PtySize, ReaderControl, enqueue_process_input, enqueue_process_resize, flush_process_input,
-        reader_checkpoint, receive_or_shutdown, send_or_shutdown,
+        publish_writer_failure, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     };
     use crate::terminal_session::TerminalEvent;
     use portable_pty::{
@@ -327,11 +337,7 @@ mod unix {
                             let _ = completion.send(result.clone());
                         }
                         if let Err(error) = result {
-                            let _ = send_or_shutdown(
-                                &writer_events,
-                                &writer_shutdown,
-                                TerminalEvent::Failed(error),
-                            );
+                            publish_writer_failure(&writer_events, error);
                             break;
                         }
                     }
@@ -603,8 +609,10 @@ pub use unix::PtySession;
 mod tests {
     use super::{
         ProcessInput, ProcessInputStatus, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
-        enqueue_process_input, enqueue_process_resize, flush_process_input, reader_checkpoint,
+        enqueue_process_input, enqueue_process_resize, flush_process_input, publish_writer_failure,
+        reader_checkpoint,
     };
+    use crate::terminal_session::TerminalEvent;
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -652,6 +660,18 @@ mod tests {
         drop(shutdown);
 
         assert!(!super::send_or_shutdown(&events, &shutdown_receiver, ()));
+    }
+
+    #[test]
+    fn writer_failure_publication_never_blocks_on_a_full_event_queue() {
+        let (events, queued) = flume::bounded(1);
+        events
+            .send(TerminalEvent::Changed)
+            .expect("fill terminal event queue");
+
+        publish_writer_failure(&events, "injected writer failure".into());
+
+        assert!(matches!(queued.recv(), Ok(TerminalEvent::Changed)));
     }
 
     #[test]

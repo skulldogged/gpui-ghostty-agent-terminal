@@ -149,7 +149,9 @@ impl TerminalSession {
     ) -> Result<(Self, TerminalEvents), String> {
         let size = size.validate()?;
         let terminal = ghostty::Terminal::new(size.cols, size.rows)?;
-        let (events_tx, events_rx) = flume::bounded(1);
+        // Changed notifications coalesce in the first slot while a second
+        // slot preserves one lifecycle event without blocking a transport.
+        let (events_tx, events_rx) = flume::bounded(2);
         let (process, output) = PtySession::spawn(size.pty_size(), working_directory, events_tx)?;
         Ok((
             Self {

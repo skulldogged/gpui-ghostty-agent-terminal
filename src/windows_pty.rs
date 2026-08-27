@@ -2,7 +2,7 @@ use crate::{
     pty::{
         PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessInputStatus, ProcessSnapshot, PtyOutput,
         PtySize, ReaderControl, enqueue_process_input, enqueue_process_resize, flush_process_input,
-        reader_checkpoint, receive_or_shutdown, send_or_shutdown,
+        publish_writer_failure, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     },
     terminal_session::TerminalEvent,
 };
@@ -151,11 +151,7 @@ impl PtySession {
                         let _ = completion.send(result.clone());
                     }
                     if let Err(error) = result {
-                        let _ = send_or_shutdown(
-                            &writer_events,
-                            &writer_shutdown,
-                            TerminalEvent::Failed(error),
-                        );
+                        publish_writer_failure(&writer_events, error);
                         break;
                     }
                 }
