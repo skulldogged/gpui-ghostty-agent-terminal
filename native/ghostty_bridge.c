@@ -9,6 +9,8 @@ struct SpikeTerminal {
   GhosttyRenderState render;
   GhosttyRenderStateRowIterator rows;
   GhosttyRenderStateRowCells cells;
+  GhosttyMouseEncoder mouse_encoder;
+  GhosttyMouseEvent mouse_event;
 };
 
 static bool success(GhosttyResult result) { return result == GHOSTTY_SUCCESS; }
@@ -25,7 +27,9 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
   if (!success(ghostty_terminal_new(NULL, &spike->terminal, options)) ||
       !success(ghostty_render_state_new(NULL, &spike->render)) ||
       !success(ghostty_render_state_row_iterator_new(NULL, &spike->rows)) ||
-      !success(ghostty_render_state_row_cells_new(NULL, &spike->cells))) {
+      !success(ghostty_render_state_row_cells_new(NULL, &spike->cells)) ||
+      !success(ghostty_mouse_encoder_new(NULL, &spike->mouse_encoder)) ||
+      !success(ghostty_mouse_event_new(NULL, &spike->mouse_event))) {
     spike_terminal_free(spike);
     return NULL;
   }
@@ -34,6 +38,8 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
 
 void spike_terminal_free(SpikeTerminal* spike) {
   if (spike == NULL) return;
+  ghostty_mouse_event_free(spike->mouse_event);
+  ghostty_mouse_encoder_free(spike->mouse_encoder);
   ghostty_render_state_row_cells_free(spike->cells);
   ghostty_render_state_row_iterator_free(spike->rows);
   ghostty_render_state_free(spike->render);
@@ -93,8 +99,8 @@ int spike_terminal_set_theme(SpikeTerminal* spike, const uint8_t* foreground,
 }
 
 int spike_terminal_encode_paste(SpikeTerminal* spike, uint8_t* data,
-                                size_t data_len, uint8_t* output,
-                                size_t output_len, size_t* output_written) {
+                                 size_t data_len, uint8_t* output,
+                                 size_t output_len, size_t* output_written) {
   if (spike == NULL || (data == NULL && data_len > 0) ||
       (output == NULL && output_len > 0) || output_written == NULL) {
     return GHOSTTY_INVALID_VALUE;
@@ -106,7 +112,142 @@ int spike_terminal_encode_paste(SpikeTerminal* spike, uint8_t* data,
   if (!success(result)) return result;
 
   return ghostty_paste_encode((char*)data, data_len, bracketed, (char*)output,
-                              output_len, output_written);
+                               output_len, output_written);
+}
+
+static GhosttyResult scroll_viewport(SpikeTerminal* spike,
+                                     GhosttyTerminalScrollViewport behavior,
+                                     bool* changed) {
+
+  GhosttyTerminalScrollbar before = {0};
+  GhosttyResult result = ghostty_terminal_get(
+      spike->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &before);
+  if (!success(result)) return result;
+
+  ghostty_terminal_scroll_viewport(spike->terminal, behavior);
+
+  GhosttyTerminalScrollbar after = {0};
+  result = ghostty_terminal_get(spike->terminal,
+                                GHOSTTY_TERMINAL_DATA_SCROLLBAR, &after);
+  if (!success(result)) return result;
+  *changed = before.offset != after.offset;
+  return GHOSTTY_SUCCESS;
+}
+
+int spike_terminal_scroll_to_bottom(SpikeTerminal* spike, bool* changed) {
+  if (spike == NULL || changed == NULL) return GHOSTTY_INVALID_VALUE;
+  return scroll_viewport(
+      spike,
+      (GhosttyTerminalScrollViewport){.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM},
+      changed);
+}
+
+static GhosttyResult encode_mouse_scroll(SpikeTerminal* spike,
+                                         intptr_t delta,
+                                         GhosttyMouseButton negative_button,
+                                         GhosttyMouseButton positive_button,
+                                         uint8_t* output, size_t output_len,
+                                         size_t* output_written) {
+  if (delta == 0) return GHOSTTY_SUCCESS;
+  ghostty_mouse_event_set_button(
+      spike->mouse_event, delta < 0 ? negative_button : positive_button);
+  const size_t count =
+      delta < 0 ? (size_t)(-(delta + 1)) + 1 : (size_t)delta;
+  for (size_t index = 0; index < count; index++) {
+    size_t written = 0;
+    GhosttyResult result = ghostty_mouse_encoder_encode(
+        spike->mouse_encoder, spike->mouse_event,
+        (char*)output + *output_written, output_len - *output_written,
+        &written);
+    if (!success(result)) return result;
+    *output_written += written;
+  }
+  return GHOSTTY_SUCCESS;
+}
+
+int spike_terminal_scroll(SpikeTerminal* spike, intptr_t delta_rows,
+                          intptr_t delta_columns,
+                          float pointer_x, float pointer_y,
+                          uint32_t viewport_width, uint32_t viewport_height,
+                          uint32_t cell_width, uint32_t cell_height,
+                          uint16_t modifiers, uint8_t* output,
+                          size_t output_len, size_t* output_written,
+                          bool* viewport_changed) {
+  if (spike == NULL || output_written == NULL || viewport_changed == NULL ||
+      (output == NULL && output_len > 0) || cell_width == 0 ||
+      cell_height == 0) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  *output_written = 0;
+  *viewport_changed = false;
+  if (delta_rows == 0 && delta_columns == 0) return GHOSTTY_SUCCESS;
+
+  bool mouse_tracking = false;
+  GhosttyResult result = ghostty_terminal_get(
+      spike->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_tracking);
+  if (!success(result)) return result;
+
+  if (mouse_tracking) {
+    ghostty_mouse_encoder_setopt_from_terminal(spike->mouse_encoder,
+                                                spike->terminal);
+    GhosttyMouseEncoderSize encoder_size = {
+        .size = sizeof(GhosttyMouseEncoderSize),
+        .screen_width = viewport_width,
+        .screen_height = viewport_height,
+        .cell_width = cell_width,
+        .cell_height = cell_height,
+    };
+    ghostty_mouse_encoder_setopt(spike->mouse_encoder,
+                                 GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &encoder_size);
+    ghostty_mouse_event_set_action(spike->mouse_event,
+                                   GHOSTTY_MOUSE_ACTION_PRESS);
+    ghostty_mouse_event_set_mods(spike->mouse_event, modifiers);
+    ghostty_mouse_event_set_position(
+        spike->mouse_event,
+        (GhosttyMousePosition){.x = pointer_x, .y = pointer_y});
+
+    result = encode_mouse_scroll(
+        spike, delta_rows, GHOSTTY_MOUSE_BUTTON_FOUR,
+        GHOSTTY_MOUSE_BUTTON_FIVE, output, output_len, output_written);
+    if (!success(result)) return result;
+    return encode_mouse_scroll(
+        spike, delta_columns, GHOSTTY_MOUSE_BUTTON_SIX,
+        GHOSTTY_MOUSE_BUTTON_SEVEN, output, output_len, output_written);
+  }
+
+  GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+  result = ghostty_terminal_get(spike->terminal,
+                                GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+  if (!success(result)) return result;
+  bool alternate_scroll = false;
+  result = ghostty_terminal_mode_get(spike->terminal, GHOSTTY_MODE_ALT_SCROLL,
+                                     &alternate_scroll);
+  if (!success(result)) return result;
+  if (screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE && alternate_scroll) {
+    bool application_cursor_keys = false;
+    result = ghostty_terminal_mode_get(spike->terminal, GHOSTTY_MODE_DECCKM,
+                                       &application_cursor_keys);
+    if (!success(result)) return result;
+    const char* sequence = delta_rows < 0
+                               ? (application_cursor_keys ? "\x1bOA" : "\x1b[A")
+                               : (application_cursor_keys ? "\x1bOB" : "\x1b[B");
+    const size_t count = delta_rows < 0 ? (size_t)(-(delta_rows + 1)) + 1
+                                        : (size_t)delta_rows;
+    if (count > output_len / 3) return GHOSTTY_OUT_OF_SPACE;
+    for (size_t index = 0; index < count; index++) {
+      memcpy(output + *output_written, sequence, 3);
+      *output_written += 3;
+    }
+    return GHOSTTY_SUCCESS;
+  }
+
+  return scroll_viewport(
+      spike,
+      (GhosttyTerminalScrollViewport){
+          .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
+          .value = {.delta = delta_rows},
+      },
+      viewport_changed);
 }
 
 static void set_color(uint8_t* r, uint8_t* g, uint8_t* b, GhosttyColorRgb color) {

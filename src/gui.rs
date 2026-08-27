@@ -4,6 +4,7 @@ use crate::{
     TabId, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
     core_model::default_space_name,
+    ghostty,
     settings::{
         AppSettings, KeybindAction, Shortcut, TerminalGlyphOverflow, ThemePreset, adjust_font_size,
     },
@@ -17,12 +18,12 @@ use crate::{
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, Decorations,
     FocusHandle, Font, FontFallbacks, FontId, IntoElement, KeyDownEvent, Keystroke, MouseButton,
-    MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel, Render, ShapedLine, SharedString,
-    Task, TextRun, Transformation, Window, WindowControlArea, canvas, div, ease_out_quint, fill,
-    font, percentage, point, prelude::*, px, rgb, size, svg,
+    MouseMoveEvent, Pixels, Point, PromptButton, PromptLevel, Render, ScrollDelta,
+    ScrollWheelEvent, ShapedLine, SharedString, Task, TextRun, TouchPhase, Transformation, Window,
+    WindowControlArea, canvas, div, ease_out_quint, fill, font, percentage, point, prelude::*, px,
+    rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
-#[cfg(any(windows, target_os = "macos"))]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ const TERMINAL_PADDING_PX: f32 = 10.0;
 const SYMBOL_OVERFLOW_TOLERANCE_CELLS: f32 = 0.25;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
 const INACTIVE_PANE_CONTRAST: f32 = 0.62;
+const WINDOWS_PAGE_SCROLL_SENTINEL_MIN: f32 = u32::MAX as f32 / 2.0;
 const OPENAI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/openai.svg");
 const CLAUDE_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/claude.svg");
 const GEMINI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/gemini.svg");
@@ -77,6 +79,8 @@ pub(crate) fn open_terminal_window(
                 recording_binding: None,
                 available_fonts,
                 requested_sizes: HashMap::new(),
+                terminal_scroll_remainders: HashMap::new(),
+                terminal_bounds: Arc::new(Mutex::new(HashMap::new())),
                 move_source: None,
                 selections_after_commands: HashMap::new(),
                 sidebar_width: WorkspaceShell::SIDEBAR_WIDTH,
@@ -120,6 +124,8 @@ struct MultiplexerView {
     recording_binding: Option<KeybindAction>,
     available_fonts: Vec<String>,
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
+    terminal_scroll_remainders: HashMap<TerminalSessionId, ScrollRemainder>,
+    terminal_bounds: Arc<Mutex<HashMap<PaneId, Bounds<Pixels>>>>,
     move_source: Option<PaneId>,
     selections_after_commands: HashMap<u64, PaneId>,
     sidebar_width: f32,
@@ -148,6 +154,12 @@ struct SplitGeometry {
     length: f32,
     first_extent: f32,
     cell_step: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScrollRemainder {
+    x: f32,
+    y: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -668,6 +680,91 @@ impl MultiplexerView {
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
         self.requested_sizes
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+        self.terminal_scroll_remainders
+            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+    }
+
+    fn on_terminal_scroll(
+        &mut self,
+        pane_id: PaneId,
+        terminal_session_id: TerminalSessionId,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let remainder = self
+            .terminal_scroll_remainders
+            .entry(terminal_session_id)
+            .or_default();
+        match event.touch_phase {
+            TouchPhase::Started => {
+                *remainder = ScrollRemainder::default();
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => return,
+            TouchPhase::Moved => {}
+        }
+
+        let (columns, rows) = match event.delta {
+            ScrollDelta::Lines(delta) => (delta.x, delta.y),
+            ScrollDelta::Pixels(delta) => (
+                delta.x / px(self.terminal_font.cells.width_px()),
+                delta.y / px(self.terminal_font.cells.height_px()),
+            ),
+        };
+        let (page_columns, page_rows) = self
+            .terminals
+            .get(&terminal_session_id)
+            .map_or((1, 1), |snapshot| (snapshot.cols, snapshot.rows));
+        let columns = normalize_page_scroll_delta(columns, page_columns);
+        let rows = normalize_page_scroll_delta(rows, page_rows);
+        let accumulated_x = remainder.x + columns;
+        let accumulated_y = remainder.y + rows;
+        let whole_columns = accumulated_x.trunc() as isize;
+        let whole_rows = accumulated_y.trunc() as isize;
+        remainder.x = accumulated_x.fract();
+        remainder.y = accumulated_y.fract();
+        if whole_rows == 0 && whole_columns == 0 {
+            return;
+        }
+
+        let bounds = self
+            .terminal_bounds
+            .lock()
+            .expect("terminal bounds mutex poisoned")
+            .get(&pane_id)
+            .copied();
+        let (pointer_x, pointer_y, viewport_width, viewport_height) =
+            bounds.map_or((0.0, 0.0, 1, 1), |bounds| {
+                let width = f32::from(bounds.size.width).max(1.0);
+                let height = f32::from(bounds.size.height).max(1.0);
+                (
+                    f32::from(event.position.x - bounds.left()).clamp(0.0, width - 1.0),
+                    f32::from(event.position.y - bounds.top()).clamp(0.0, height - 1.0),
+                    width.ceil() as u32,
+                    height.ceil() as u32,
+                )
+            });
+        let modifiers = u16::from(event.modifiers.shift)
+            | (u16::from(event.modifiers.control) << 1)
+            | (u16::from(event.modifiers.alt) << 2)
+            | (u16::from(event.modifiers.platform) << 3);
+        // GPUI reports positive Y when the wheel moves content toward the
+        // viewport bottom; Ghostty's viewport API uses negative rows for up.
+        let input = ghostty::ScrollInput {
+            delta_rows: -whole_rows,
+            delta_columns: -whole_columns,
+            pointer_x,
+            pointer_y,
+            viewport_width,
+            viewport_height,
+            cell_width: self.terminal_font.cells.width_px().round().max(1.0) as u32,
+            cell_height: self.terminal_font.cells.height_px().round().max(1.0) as u32,
+            modifiers,
+        };
+        if let Err(error) = self.driver.scroll_terminal(terminal_session_id, input) {
+            self.global_error = Some(error);
+            cx.notify();
+        }
+        cx.stop_propagation();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2860,10 +2957,15 @@ impl MultiplexerView {
         let default_bg = self.shell.terminal_background(color(snapshot.default_bg));
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
+        let terminal_bounds = Arc::clone(&self.terminal_bounds);
         let terminal_glyph_overflow = self.settings.terminal_glyph_overflow;
         let shape_frame = frame.clone();
         let terminal_canvas = canvas(
-            move |_bounds, window, _cx| {
+            move |bounds, window, _cx| {
+                terminal_bounds
+                    .lock()
+                    .expect("terminal bounds mutex poisoned")
+                    .insert(pane_id, bounds);
                 shape_frame
                     .rows
                     .iter()
@@ -2949,6 +3051,9 @@ impl MultiplexerView {
             .on_click(
                 cx.listener(move |view, _event, window, cx| view.focus_pane(pane_id, window, cx)),
             )
+            .on_scroll_wheel(cx.listener(move |view, event, _window, cx| {
+                view.on_terminal_scroll(pane_id, terminal_session_id, event, cx)
+            }))
             .child(terminal_canvas)
             .when_some(
                 self.terminal_errors.get(&terminal_session_id).cloned(),
@@ -3995,6 +4100,14 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
     rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
 }
 
+fn normalize_page_scroll_delta(delta: f32, page_cells: u16) -> f32 {
+    if delta.abs() >= WINDOWS_PAGE_SCROLL_SENTINEL_MIN {
+        delta.signum() * f32::from(page_cells.max(1))
+    } else {
+        delta
+    }
+}
+
 fn windows_caption_font_for_build(build: u32) -> &'static str {
     if build >= 22_000 {
         "Segoe Fluent Icons"
@@ -4022,10 +4135,10 @@ mod tests {
         agent_icon_resting_geometry, agent_icon_transition_geometry, first_pane_id,
         fitted_cluster_glyph_position, font_is_terminal_fallback_only,
         installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
-        pane_close_shortcut_for, pane_extents, prioritized_agent_summary, projected_split_extent,
-        row_cell_is_followed_by_space, selection_for_created, selection_for_pane, split_ratio_at,
-        terminal_font_with_fallbacks, terminal_input_bytes, terminal_paste_shortcut_for,
-        windows_caption_font_for_build,
+        normalize_page_scroll_delta, pane_close_shortcut_for, pane_extents,
+        prioritized_agent_summary, projected_split_extent, row_cell_is_followed_by_space,
+        selection_for_created, selection_for_pane, split_ratio_at, terminal_font_with_fallbacks,
+        terminal_input_bytes, terminal_paste_shortcut_for, windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
@@ -4035,6 +4148,13 @@ mod tests {
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn windows_page_scroll_sentinel_becomes_one_visible_page() {
+        assert_eq!(normalize_page_scroll_delta(u32::MAX as f32, 24), 24.0);
+        assert_eq!(normalize_page_scroll_delta(-(u32::MAX as f32), 80), -80.0);
+        assert_eq!(normalize_page_scroll_delta(120.0, 24), 120.0);
+    }
 
     #[test]
     fn terminal_font_fallbacks_use_available_nerd_families_in_priority_order() {

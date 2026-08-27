@@ -69,6 +69,10 @@ enum WorkerRequest {
         terminal_session_id: TerminalSessionId,
         bytes: Vec<u8>,
     },
+    Scroll {
+        terminal_session_id: TerminalSessionId,
+        input: ghostty::ScrollInput,
+    },
     Resize {
         terminal_session_id: TerminalSessionId,
         size: TerminalSize,
@@ -249,6 +253,17 @@ impl ApplicationCore {
         })
     }
 
+    pub(crate) fn scroll_terminal(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        input: ghostty::ScrollInput,
+    ) -> Result<(), String> {
+        self.expect_ack(WorkerRequest::Scroll {
+            terminal_session_id,
+            input,
+        })
+    }
+
     pub fn resize_terminal(
         &self,
         terminal_session_id: TerminalSessionId,
@@ -382,9 +397,13 @@ fn run_terminal_runtime(
                         bytes,
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
-                            runtime
-                                .input(terminal_session_id, &bytes)
-                                .map(|()| WorkerResponse::Ack)
+                            let result = runtime.input(terminal_session_id, &bytes);
+                            if result.as_ref().copied().unwrap_or(true)
+                                && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
+                            {
+                                changed_terminals.push((terminal_session_id, revision));
+                            }
+                            result.map(|_| WorkerResponse::Ack)
                         } else {
                             Ok(WorkerResponse::Ack)
                         }
@@ -394,15 +413,29 @@ fn run_terminal_runtime(
                         bytes,
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
-                            runtime.paste(terminal_session_id, &bytes).map(|changed| {
-                                if changed
-                                    && let Ok(revision) =
-                                        runtime.terminal_revision(terminal_session_id)
-                                {
-                                    changed_terminals.push((terminal_session_id, revision));
-                                }
-                                WorkerResponse::Ack
-                            })
+                            let result = runtime.paste(terminal_session_id, &bytes);
+                            if result.as_ref().copied().unwrap_or(true)
+                                && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
+                            {
+                                changed_terminals.push((terminal_session_id, revision));
+                            }
+                            result.map(|_| WorkerResponse::Ack)
+                        } else {
+                            Ok(WorkerResponse::Ack)
+                        }
+                    }
+                    WorkerRequest::Scroll {
+                        terminal_session_id,
+                        input,
+                    } => {
+                        if runtime.contains_terminal(terminal_session_id) {
+                            let result = runtime.scroll(terminal_session_id, input);
+                            if result.as_ref().copied().unwrap_or(true)
+                                && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
+                            {
+                                changed_terminals.push((terminal_session_id, revision));
+                            }
+                            result.map(|_| WorkerResponse::Ack)
                         } else {
                             Ok(WorkerResponse::Ack)
                         }
