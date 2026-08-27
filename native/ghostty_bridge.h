@@ -64,9 +64,13 @@ typedef struct {
 
 SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollback);
 void spike_terminal_free(SpikeTerminal* terminal);
-void spike_terminal_write(SpikeTerminal* terminal, const uint8_t* data, size_t len);
+// Response bytes remain owned by the terminal and are valid until its next
+// mutation. Callers must copy them before invoking another terminal function.
+int spike_terminal_write(SpikeTerminal* terminal, const uint8_t* data, size_t len,
+                         const uint8_t** response, size_t* response_len);
 int spike_terminal_resize(SpikeTerminal* terminal, uint16_t cols, uint16_t rows,
-                          uint32_t cell_width_px, uint32_t cell_height_px);
+                          uint32_t cell_width_px, uint32_t cell_height_px,
+                          const uint8_t** response, size_t* response_len);
 int spike_terminal_set_theme(SpikeTerminal* terminal, const uint8_t* foreground,
                              const uint8_t* background, const uint8_t* cursor,
                              const uint8_t* ansi_palette);

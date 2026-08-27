@@ -16,9 +16,61 @@ struct SpikeTerminal {
   GhosttySelectionGestureEvent selection_drag;
   GhosttySelectionGestureEvent selection_release;
   GhosttySelectionGestureEvent selection_autoscroll;
+  uint8_t* pty_response;
+  size_t pty_response_len;
+  size_t pty_response_capacity;
+  bool pty_response_failed;
 };
 
 static bool success(GhosttyResult result) { return result == GHOSTTY_SUCCESS; }
+
+static void write_pty(GhosttyTerminal terminal, void* userdata,
+                      const uint8_t* data, size_t len) {
+  (void)terminal;
+  SpikeTerminal* spike = userdata;
+  if (spike == NULL || len == 0 || spike->pty_response_failed) return;
+  if (data == NULL || len > SIZE_MAX - spike->pty_response_len) {
+    spike->pty_response_failed = true;
+    return;
+  }
+
+  const size_t required = spike->pty_response_len + len;
+  if (required > spike->pty_response_capacity) {
+    size_t capacity = spike->pty_response_capacity;
+    if (capacity == 0) capacity = 64;
+    while (capacity < required) {
+      if (capacity > SIZE_MAX / 2) {
+        capacity = required;
+        break;
+      }
+      capacity *= 2;
+    }
+
+    uint8_t* response = realloc(spike->pty_response, capacity);
+    if (response == NULL) {
+      spike->pty_response_failed = true;
+      return;
+    }
+    spike->pty_response = response;
+    spike->pty_response_capacity = capacity;
+  }
+
+  memcpy(spike->pty_response + spike->pty_response_len, data, len);
+  spike->pty_response_len = required;
+}
+
+static void begin_pty_response(SpikeTerminal* spike) {
+  spike->pty_response_len = 0;
+  spike->pty_response_failed = false;
+}
+
+static int finish_pty_response(SpikeTerminal* spike, const uint8_t** response,
+                               size_t* response_len) {
+  if (spike->pty_response_failed) return GHOSTTY_OUT_OF_MEMORY;
+  *response = spike->pty_response;
+  *response_len = spike->pty_response_len;
+  return GHOSTTY_SUCCESS;
+}
 
 SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollback) {
   SpikeTerminal* spike = calloc(1, sizeof(SpikeTerminal));
@@ -30,6 +82,11 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
       .max_scrollback = scrollback,
   };
   if (!success(ghostty_terminal_new(NULL, &spike->terminal, options)) ||
+      !success(ghostty_terminal_set(spike->terminal,
+                                    GHOSTTY_TERMINAL_OPT_USERDATA, spike)) ||
+      !success(ghostty_terminal_set(spike->terminal,
+                                    GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                                    (const void*)write_pty)) ||
       !success(ghostty_render_state_new(NULL, &spike->render)) ||
       !success(ghostty_render_state_row_iterator_new(NULL, &spike->rows)) ||
       !success(ghostty_render_state_row_cells_new(NULL, &spike->cells)) ||
@@ -68,19 +125,33 @@ void spike_terminal_free(SpikeTerminal* spike) {
   ghostty_render_state_row_iterator_free(spike->rows);
   ghostty_render_state_free(spike->render);
   ghostty_terminal_free(spike->terminal);
+  free(spike->pty_response);
   free(spike);
 }
 
-void spike_terminal_write(SpikeTerminal* spike, const uint8_t* data, size_t len) {
-  if (spike == NULL || data == NULL) return;
+int spike_terminal_write(SpikeTerminal* spike, const uint8_t* data, size_t len,
+                         const uint8_t** response, size_t* response_len) {
+  if (spike == NULL || (data == NULL && len > 0) || response == NULL ||
+      response_len == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+
+  begin_pty_response(spike);
   ghostty_terminal_vt_write(spike->terminal, data, len);
+  return finish_pty_response(spike, response, response_len);
 }
 
 int spike_terminal_resize(SpikeTerminal* spike, uint16_t cols, uint16_t rows,
-                          uint32_t cell_width_px, uint32_t cell_height_px) {
-  if (spike == NULL) return GHOSTTY_INVALID_VALUE;
-  return ghostty_terminal_resize(spike->terminal, cols, rows, cell_width_px,
-                                 cell_height_px);
+                          uint32_t cell_width_px, uint32_t cell_height_px,
+                          const uint8_t** response, size_t* response_len) {
+  if (spike == NULL || response == NULL || response_len == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  begin_pty_response(spike);
+  GhosttyResult result = ghostty_terminal_resize(
+      spike->terminal, cols, rows, cell_width_px, cell_height_px);
+  if (!success(result)) return result;
+  return finish_pty_response(spike, response, response_len);
 }
 
 static GhosttyColorRgb color_from_bytes(const uint8_t* color) {

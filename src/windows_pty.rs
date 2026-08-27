@@ -1,8 +1,10 @@
 use crate::{
     pty::{
-        ProcessSnapshot, PtyOutput, PtySize, ReaderControl, reader_checkpoint, send_or_shutdown,
+        PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessInputStatus, ProcessSnapshot, PtyOutput,
+        PtySize, ReaderControl, enqueue_process_input, enqueue_process_resize, flush_process_input,
+        publish_writer_failure, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     },
-    terminal_session::TerminalEvent,
+    terminal_session::{TerminalEvent, TerminalEventSender},
 };
 use std::{
     alloc::{Layout, alloc, dealloc},
@@ -54,7 +56,7 @@ unsafe extern "system" {
 }
 
 pub struct PtySession {
-    input: OwnedHandle,
+    input: flume::Sender<ProcessInput>,
     pseudoconsole: Arc<SharedPseudoConsole>,
     process: OwnedHandle,
     process_id: u32,
@@ -82,7 +84,7 @@ impl PtySession {
     pub fn spawn(
         size: PtySize,
         working_directory: &std::path::Path,
-        events: flume::Sender<TerminalEvent>,
+        events: TerminalEventSender,
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         allow_ctrl_c_in_children();
         let input = Pipe::create()?;
@@ -124,6 +126,42 @@ impl PtySession {
         let (output_tx, output_rx) = flume::bounded(256);
         let (control_tx, control_rx) = flume::bounded(1);
         let (shutdown_tx, shutdown_rx) = flume::bounded(1);
+        let (input_tx, input_rx) = flume::bounded(PROCESS_INPUT_QUEUE_CAPACITY);
+
+        let mut input_handle = input.write;
+        let writer_events = events.clone();
+        let writer_shutdown = shutdown_rx.clone();
+        let writer_pseudoconsole = Arc::clone(&pseudoconsole);
+        if let Err(error) = std::thread::Builder::new()
+            .name("terminal-conpty-writer".into())
+            .spawn(move || {
+                while let Some(command) = receive_or_shutdown(&input_rx, &writer_shutdown) {
+                    let (result, completion) = match command {
+                        ProcessInput::Write(bytes) => (
+                            write_handle(input_handle.raw(), &bytes)
+                                .map_err(|error| format!("write ConPTY: {error}")),
+                            None,
+                        ),
+                        ProcessInput::Resize { size, completed } => {
+                            (writer_pseudoconsole.resize(size), Some(completed))
+                        }
+                        ProcessInput::Flush { completed } => (Ok(()), Some(completed)),
+                    };
+                    if let Some(completion) = completion {
+                        let _ = completion.send(result.clone());
+                    }
+                    if let Err(error) = result {
+                        publish_writer_failure(&writer_events, error);
+                        break;
+                    }
+                }
+                let _ = input_handle.close();
+            })
+        {
+            unsafe { TerminateProcess(process.raw(), 0) };
+            return Err(format!("spawn ConPTY writer thread: {error}"));
+        }
+
         let mut output_handle = output.read;
         let reader_events = events.clone();
         let reader_shutdown = shutdown_rx.clone();
@@ -174,23 +212,15 @@ impl PtySession {
                         waiter_pseudoconsole.close();
                     }
                     WAIT_FAILED => {
-                        let _ = send_or_shutdown(
-                            &events,
-                            &shutdown_rx,
-                            TerminalEvent::Failed(format!(
-                                "wait for ConPTY process: {}",
-                                io::Error::last_os_error()
-                            )),
-                        );
+                        let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                            "wait for ConPTY process: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                     unexpected => {
-                        let _ = send_or_shutdown(
-                            &events,
-                            &shutdown_rx,
-                            TerminalEvent::Failed(format!(
-                                "wait for ConPTY process returned unexpected status {unexpected}"
-                            )),
-                        );
+                        let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                            "wait for ConPTY process returned unexpected status {unexpected}"
+                        )));
                     }
                 }
             })
@@ -201,7 +231,7 @@ impl PtySession {
 
         Ok((
             Self {
-                input: input.write,
+                input: input_tx,
                 pseudoconsole,
                 process,
                 process_id,
@@ -212,12 +242,16 @@ impl PtySession {
         ))
     }
 
-    pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        write_handle(self.input.raw(), bytes).map_err(|error| format!("write ConPTY: {error}"))
+    pub fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
+        enqueue_process_input(&self.input, bytes, "ConPTY")
+    }
+
+    pub fn flush_input(&mut self) -> Result<(), String> {
+        flush_process_input(&self.input, "ConPTY")
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
-        self.pseudoconsole.resize(size)
+        enqueue_process_resize(&self.input, size, "ConPTY")
     }
 
     pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -251,7 +285,7 @@ fn drain_available_output(
     output_handle: &OwnedHandle,
     buffer: &mut [u8],
     output: &flume::Sender<PtyOutput>,
-    events: &flume::Sender<TerminalEvent>,
+    events: &TerminalEventSender,
     shutdown: &flume::Receiver<()>,
 ) -> bool {
     loop {
@@ -259,22 +293,20 @@ fn drain_available_output(
             Ok(0) => return true,
             Ok(available) => available,
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
             }
             Err(error) => {
-                let _ = send_or_shutdown(
-                    events,
-                    shutdown,
-                    TerminalEvent::Failed(format!("inspect ConPTY output: {error}")),
-                );
+                let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                    "inspect ConPTY output: {error}"
+                )));
                 return false;
             }
         };
         let read_len = available.min(buffer.len());
         match read_handle(output_handle.raw(), &mut buffer[..read_len]) {
             Ok(0) => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
             }
             Ok(read)
@@ -286,18 +318,17 @@ fn drain_available_output(
             {
                 return false;
             }
-            Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
-            Ok(_) => {}
+            Ok(_) => {
+                let _ = events.changed();
+            }
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
             }
             Err(error) => {
-                let _ = send_or_shutdown(
-                    events,
-                    shutdown,
-                    TerminalEvent::Failed(format!("ConPTY read stopped: {error}")),
-                );
+                let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                    "ConPTY read stopped: {error}"
+                )));
                 return false;
             }
         }
@@ -319,7 +350,6 @@ impl Drop for PtySession {
         // worker blocked while publishing output or a lifecycle event then
         // cancels its send and releases its pipe handle.
         drop(self.shutdown.take());
-        let _ = self.input.close();
         unsafe {
             TerminateProcess(self.process.raw(), 0);
         }

@@ -1,7 +1,9 @@
 use crate::{
     ghostty,
-    pty::{ProcessSnapshot, PtyOutput, PtySession, PtySize},
+    pty::{ProcessInputStatus, ProcessSnapshot, PtyOutput, PtySession, PtySize},
 };
+
+const MAX_PENDING_TERMINAL_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The complete geometry shared by the VT engine and the platform PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -57,12 +59,38 @@ impl Default for TerminalSize {
 /// or libghostty-vt types; callers only learn that observable session state
 /// changed and can request a fresh snapshot.
 pub struct TerminalEvents {
-    receiver: flume::Receiver<TerminalEvent>,
+    changed: flume::Receiver<()>,
+    lifecycle: flume::Receiver<TerminalEvent>,
 }
 
 impl TerminalEvents {
     pub(crate) fn try_recv(&self) -> Option<TerminalEvent> {
-        self.receiver.try_recv().ok()
+        self.lifecycle.try_recv().ok().or_else(|| {
+            self.changed
+                .try_recv()
+                .ok()
+                .map(|()| TerminalEvent::Changed)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<TerminalEvent, flume::RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(event) = self.try_recv() {
+                return Ok(event);
+            }
+            if self.changed.is_disconnected() && self.lifecycle.is_disconnected() {
+                return Err(flume::RecvTimeoutError::Disconnected);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(flume::RecvTimeoutError::Timeout);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -73,8 +101,44 @@ pub enum TerminalEvent {
     Failed(String),
 }
 
+#[derive(Clone)]
+pub(crate) struct TerminalEventSender {
+    changed: flume::Sender<()>,
+    lifecycle: flume::Sender<TerminalEvent>,
+}
+
+impl TerminalEventSender {
+    pub(crate) fn channel() -> (Self, TerminalEvents) {
+        let (changed_tx, changed_rx) = flume::bounded(1);
+        let (lifecycle_tx, lifecycle_rx) = flume::unbounded();
+        (
+            Self {
+                changed: changed_tx,
+                lifecycle: lifecycle_tx,
+            },
+            TerminalEvents {
+                changed: changed_rx,
+                lifecycle: lifecycle_rx,
+            },
+        )
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        match self.changed.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => true,
+            Err(flume::TrySendError::Disconnected(())) => false,
+        }
+    }
+
+    pub(crate) fn lifecycle(&self, event: TerminalEvent) -> bool {
+        debug_assert!(!matches!(event, TerminalEvent::Changed));
+        self.lifecycle.try_send(event).is_ok()
+    }
+}
+
 trait TerminalTransport: Send {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String>;
+    fn flush_input(&mut self) -> Result<(), String>;
     fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String>;
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
@@ -88,8 +152,12 @@ trait TerminalTransport: Send {
 }
 
 impl TerminalTransport for PtySession {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
         PtySession::write(self, bytes)
+    }
+
+    fn flush_input(&mut self) -> Result<(), String> {
+        PtySession::flush_input(self)
     }
 
     fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -125,6 +193,7 @@ pub struct TerminalSession {
     process: Box<dyn TerminalTransport>,
     output: Option<flume::Receiver<PtyOutput>>,
     size: TerminalSize,
+    pending_response: Vec<u8>,
 }
 
 impl TerminalSession {
@@ -141,7 +210,7 @@ impl TerminalSession {
     ) -> Result<(Self, TerminalEvents), String> {
         let size = size.validate()?;
         let terminal = ghostty::Terminal::new(size.cols, size.rows)?;
-        let (events_tx, events_rx) = flume::bounded(1);
+        let (events_tx, events_rx) = TerminalEventSender::channel();
         let (process, output) = PtySession::spawn(size.pty_size(), working_directory, events_tx)?;
         Ok((
             Self {
@@ -149,16 +218,15 @@ impl TerminalSession {
                 process: Box::new(process),
                 output: Some(output),
                 size,
+                pending_response: Vec::new(),
             },
-            TerminalEvents {
-                receiver: events_rx,
-            },
+            events_rx,
         ))
     }
 
     pub fn input(&mut self, bytes: &[u8]) -> Result<bool, String> {
         let viewport_changed = self.terminal.scroll_to_bottom()?;
-        self.process.write(bytes)?;
+        self.write_process_input(bytes)?;
         Ok(viewport_changed)
     }
 
@@ -175,7 +243,7 @@ impl TerminalSession {
         let scroll_result = self.terminal.scroll(input).and_then(|result| {
             changed |= result.viewport_changed;
             if !result.input.is_empty() {
-                self.process.write(&result.input)?;
+                self.write_process_input(&result.input)?;
             }
             Ok(())
         });
@@ -212,7 +280,7 @@ impl TerminalSession {
                 changed |= viewport_changed;
                 self.terminal
                     .encode_paste(bytes)
-                    .and_then(|encoded| self.process.write(&encoded))
+                    .and_then(|encoded| self.write_process_input(&encoded))
             });
         let resume_error = self.process.resume_reader().err();
         match paste_result {
@@ -238,6 +306,11 @@ impl TerminalSession {
             return Ok(());
         }
 
+        if !self.flush_pending_response()? {
+            return Err("terminal response is waiting for process input capacity".into());
+        }
+        self.process.flush_input()?;
+
         self.process.pause_reader()?;
         if let Err(error) = self.drain_until_reader_paused() {
             let resume_error = self.process.resume_reader().err();
@@ -254,19 +327,22 @@ impl TerminalSession {
 
     fn resize_while_reader_paused(&mut self, size: TerminalSize) -> Result<(), String> {
         let previous_size = self.size;
-        self.terminal.resize(
-            size.cols,
-            size.rows,
-            u32::from(size.cell_width_px),
-            u32::from(size.cell_height_px),
-        )?;
+        let response = match self.resize_terminal_state(size) {
+            Ok(response) => response,
+            Err(error) => {
+                let rollback_error = self.resize_terminal_state(previous_size).err();
+                return Err(combine_errors(error, rollback_error));
+            }
+        };
+        if !self.pending_response.is_empty() {
+            let rollback_error = self.resize_terminal_state(previous_size).err();
+            return Err(combine_errors(
+                "terminal response is waiting for process input capacity".into(),
+                rollback_error,
+            ));
+        }
         if let Err(process_error) = self.process.resize(size.pty_size()) {
-            let rollback = self.terminal.resize(
-                previous_size.cols,
-                previous_size.rows,
-                u32::from(previous_size.cell_width_px),
-                u32::from(previous_size.cell_height_px),
-            );
+            let rollback = self.resize_terminal_state(previous_size).map(|_| ());
             return match rollback {
                 Ok(()) => Err(process_error),
                 Err(rollback_error) => Err(format!(
@@ -275,7 +351,16 @@ impl TerminalSession {
             };
         }
         self.size = size;
-        Ok(())
+        self.queue_terminal_response(&response)
+    }
+
+    fn resize_terminal_state(&mut self, size: TerminalSize) -> Result<Vec<u8>, String> {
+        self.terminal.resize(
+            size.cols,
+            size.rows,
+            u32::from(size.cell_width_px),
+            u32::from(size.cell_height_px),
+        )
     }
 
     #[cfg(test)]
@@ -309,6 +394,9 @@ impl TerminalSession {
 
     fn drain_output(&mut self) -> Result<bool, String> {
         let mut changed = false;
+        if !self.flush_pending_response()? {
+            return Ok(false);
+        }
         loop {
             let message = self
                 .output
@@ -317,8 +405,11 @@ impl TerminalSession {
                 .try_recv();
             match message {
                 Ok(PtyOutput::Bytes(bytes)) => {
-                    self.terminal.feed(&bytes);
+                    self.feed_process_output(&bytes)?;
                     changed = true;
+                    if !self.pending_response.is_empty() {
+                        return Ok(changed);
+                    }
                 }
                 Ok(PtyOutput::Paused) => {
                     return Err("terminal reader paused outside a resize barrier".into());
@@ -341,11 +432,65 @@ impl TerminalSession {
                 .map_err(|_| "pause terminal reader: output stream stopped".to_string())?;
             match message {
                 PtyOutput::Bytes(bytes) => {
-                    self.terminal.feed(&bytes);
+                    self.feed_process_output(&bytes)?;
                     changed = true;
                 }
                 PtyOutput::Paused => return Ok(changed),
             }
+        }
+    }
+
+    fn feed_process_output(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let response = self.terminal.feed(bytes)?;
+        self.queue_terminal_response(&response)
+    }
+
+    fn write_process_input(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if !self.flush_pending_response()? {
+            return Err("terminal response is waiting for process input capacity".into());
+        }
+        match self.process.write(bytes)? {
+            ProcessInputStatus::Accepted => Ok(()),
+            ProcessInputStatus::Backpressured => Err("terminal input queue is full".into()),
+        }
+    }
+
+    fn queue_terminal_response(&mut self, response: &[u8]) -> Result<(), String> {
+        if response.is_empty() {
+            return Ok(());
+        }
+        if !self.pending_response.is_empty() {
+            return self.extend_pending_response(response);
+        }
+        match self.process.write(response)? {
+            ProcessInputStatus::Accepted => Ok(()),
+            ProcessInputStatus::Backpressured => self.extend_pending_response(response),
+        }
+    }
+
+    fn extend_pending_response(&mut self, response: &[u8]) -> Result<(), String> {
+        let next_len = self
+            .pending_response
+            .len()
+            .checked_add(response.len())
+            .filter(|length| *length <= MAX_PENDING_TERMINAL_RESPONSE_BYTES)
+            .ok_or_else(|| "terminal response backlog exceeded 1 MiB".to_string())?;
+        self.pending_response
+            .reserve(next_len - self.pending_response.len());
+        self.pending_response.extend_from_slice(response);
+        Ok(())
+    }
+
+    fn flush_pending_response(&mut self) -> Result<bool, String> {
+        if self.pending_response.is_empty() {
+            return Ok(true);
+        }
+        match self.process.write(&self.pending_response)? {
+            ProcessInputStatus::Accepted => {
+                self.pending_response.clear();
+                Ok(true)
+            }
+            ProcessInputStatus::Backpressured => Ok(false),
         }
     }
 }
@@ -365,7 +510,9 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalEvent, TerminalSession, TerminalSize, TerminalTransport};
+    use super::{
+        ProcessInputStatus, TerminalEvent, TerminalSession, TerminalSize, TerminalTransport,
+    };
     use crate::ghostty::snapshot_text;
     use crate::{
         ghostty,
@@ -393,12 +540,98 @@ mod tests {
         output: flume::Sender<PtyOutput>,
     }
 
+    struct FailingResizeTransport {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        output: flume::Sender<PtyOutput>,
+    }
+
+    struct BackpressuredTransport {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        output: flume::Sender<PtyOutput>,
+        backpressured: Arc<Mutex<bool>>,
+    }
+
     impl TerminalTransport for RecordingTransport {
-        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
             self.bytes
                 .lock()
                 .expect("recording transport mutex poisoned")
                 .extend_from_slice(bytes);
+            Ok(ProcessInputStatus::Accepted)
+        }
+
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Paused)
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl TerminalTransport for FailingResizeTransport {
+        fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(bytes);
+            Ok(ProcessInputStatus::Accepted)
+        }
+
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Paused)
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            Err("injected platform resize failure".into())
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl TerminalTransport for BackpressuredTransport {
+        fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
+            if *self
+                .backpressured
+                .lock()
+                .expect("backpressure marker mutex poisoned")
+            {
+                return Ok(ProcessInputStatus::Backpressured);
+            }
+            self.bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .extend_from_slice(bytes);
+            Ok(ProcessInputStatus::Accepted)
+        }
+
+        fn flush_input(&mut self) -> Result<(), String> {
             Ok(())
         }
 
@@ -422,7 +655,11 @@ mod tests {
     }
 
     impl TerminalTransport for OutputDuringResize {
-        fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+        fn write(&mut self, _bytes: &[u8]) -> Result<ProcessInputStatus, String> {
+            Ok(ProcessInputStatus::Accepted)
+        }
+
+        fn flush_input(&mut self) -> Result<(), String> {
             Ok(())
         }
 
@@ -447,7 +684,7 @@ mod tests {
     }
 
     impl TerminalTransport for OutputBeforeCommand {
-        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
             if self.fail_write {
                 return Err("injected paste write failure".into());
             }
@@ -455,6 +692,10 @@ mod tests {
                 .lock()
                 .expect("recording transport mutex poisoned")
                 .extend_from_slice(bytes);
+            Ok(ProcessInputStatus::Accepted)
+        }
+
+        fn flush_input(&mut self) -> Result<(), String> {
             Ok(())
         }
 
@@ -515,6 +756,7 @@ mod tests {
             process: Box::new(OutputDuringResize { output: output_tx }),
             output: Some(output_rx),
             size: previous_size,
+            pending_response: Vec::new(),
         };
 
         session.resize(next_size).expect("resize terminal session");
@@ -528,13 +770,163 @@ mod tests {
     }
 
     #[test]
+    fn terminal_query_responses_return_to_the_process_transport() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: Vec::new(),
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[0c".to_vec()))
+            .expect("send primary device attributes query");
+        session.snapshot().expect("process terminal query");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[?62;22c"
+        );
+    }
+
+    #[test]
+    fn terminal_query_responses_survive_process_input_backpressure() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let backpressured = Arc::new(Mutex::new(true));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(BackpressuredTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+                backpressured: Arc::clone(&backpressured),
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: Vec::new(),
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[0c".to_vec()))
+            .expect("send primary device attributes query");
+        session
+            .snapshot()
+            .expect("retain backpressured terminal response");
+        assert!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .is_empty()
+        );
+
+        *backpressured
+            .lock()
+            .expect("backpressure marker mutex poisoned") = false;
+        session
+            .snapshot()
+            .expect("flush retained terminal response");
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[?62;22c"
+        );
+    }
+
+    #[test]
+    fn resize_reports_return_to_processes_using_in_band_size_reports() {
+        let size = TerminalSize::default();
+        let next_size = TerminalSize::new(100, 40, 9, 18);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: Vec::new(),
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[?2048h".to_vec()))
+            .expect("enable in-band size reports");
+        session.snapshot().expect("process terminal mode");
+        session.resize(next_size).expect("resize terminal session");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[48;40;100;720;900t"
+        );
+    }
+
+    #[test]
+    fn failed_platform_resize_does_not_emit_uncommitted_size_report() {
+        let size = TerminalSize::default();
+        let next_size = TerminalSize::new(100, 40, 9, 18);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(FailingResizeTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: Vec::new(),
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[?2048h".to_vec()))
+            .expect("enable in-band size reports");
+        session.snapshot().expect("process terminal mode");
+
+        assert_eq!(
+            session.resize(next_size).unwrap_err(),
+            "injected platform resize failure"
+        );
+        assert_eq!(session.size(), size);
+        assert!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .is_empty(),
+            "the failed geometry and rollback reports must both remain internal"
+        );
+    }
+
+    #[test]
     fn input_restores_a_scrolled_viewport_before_writing() {
         let size = TerminalSize::new(8, 3, 10, 20);
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let (output_tx, output_rx) = flume::unbounded();
         let mut terminal =
             ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
-        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal
+            .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .expect("feed terminal output");
         assert!(
             terminal
                 .scroll(ghostty::ScrollInput {
@@ -559,6 +951,7 @@ mod tests {
             }),
             output: Some(output_rx),
             size,
+            pending_response: Vec::new(),
         };
 
         assert!(session.input(b"x").expect("write terminal input"));
@@ -581,7 +974,9 @@ mod tests {
         let (output_tx, output_rx) = flume::unbounded();
         let mut terminal =
             ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
-        terminal.feed(b"\x1b[?2004h");
+        terminal
+            .feed(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
         let mut session = TerminalSession {
             terminal,
             process: Box::new(RecordingTransport {
@@ -590,6 +985,7 @@ mod tests {
             }),
             output: Some(output_rx),
             size,
+            pending_response: Vec::new(),
         };
 
         session
@@ -612,7 +1008,9 @@ mod tests {
         let (output_tx, output_rx) = flume::unbounded();
         let mut terminal =
             ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
-        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal
+            .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .expect("feed terminal output");
         assert!(
             terminal
                 .scroll(ghostty::ScrollInput {
@@ -637,6 +1035,7 @@ mod tests {
             }),
             output: Some(output_rx),
             size,
+            pending_response: Vec::new(),
         };
 
         assert!(session.paste(b"x").expect("paste terminal input"));
@@ -671,6 +1070,7 @@ mod tests {
             }),
             output: Some(output_rx),
             size,
+            pending_response: Vec::new(),
         };
 
         session
@@ -710,6 +1110,7 @@ mod tests {
             }),
             output: Some(output_rx),
             size,
+            pending_response: Vec::new(),
         };
 
         assert!(
@@ -761,6 +1162,7 @@ mod tests {
             }),
             output: Some(output_rx),
             size,
+            pending_response: Vec::new(),
         };
 
         assert!(session.paste(b"payload").is_err());
@@ -780,7 +1182,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+            match events.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Changed) => {
                     let snapshot = session.snapshot().expect("snapshot terminal session");
                     if snapshot_text(&snapshot).contains("TERMINAL_SESSION_RUNTIME_LIVE") {
@@ -822,7 +1224,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut last_screen = String::new();
         while Instant::now() < deadline {
-            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+            match events.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Changed) => {
                     let snapshot = session.snapshot().expect("snapshot terminal session");
                     last_screen = snapshot_text(&snapshot);
@@ -858,7 +1260,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+            match events.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Changed) => {
                     session.snapshot().expect("drain terminal output");
                 }
