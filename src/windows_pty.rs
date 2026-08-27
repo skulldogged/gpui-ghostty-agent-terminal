@@ -4,7 +4,7 @@ use crate::{
         PtySize, ReaderControl, enqueue_process_input, enqueue_process_resize, flush_process_input,
         publish_writer_failure, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     },
-    terminal_session::TerminalEvent,
+    terminal_session::{TerminalEvent, TerminalEventSender},
 };
 use std::{
     alloc::{Layout, alloc, dealloc},
@@ -84,7 +84,7 @@ impl PtySession {
     pub fn spawn(
         size: PtySize,
         working_directory: &std::path::Path,
-        events: flume::Sender<TerminalEvent>,
+        events: TerminalEventSender,
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         allow_ctrl_c_in_children();
         let input = Pipe::create()?;
@@ -212,23 +212,15 @@ impl PtySession {
                         waiter_pseudoconsole.close();
                     }
                     WAIT_FAILED => {
-                        let _ = send_or_shutdown(
-                            &events,
-                            &shutdown_rx,
-                            TerminalEvent::Failed(format!(
-                                "wait for ConPTY process: {}",
-                                io::Error::last_os_error()
-                            )),
-                        );
+                        let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                            "wait for ConPTY process: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                     unexpected => {
-                        let _ = send_or_shutdown(
-                            &events,
-                            &shutdown_rx,
-                            TerminalEvent::Failed(format!(
-                                "wait for ConPTY process returned unexpected status {unexpected}"
-                            )),
-                        );
+                        let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                            "wait for ConPTY process returned unexpected status {unexpected}"
+                        )));
                     }
                 }
             })
@@ -254,7 +246,7 @@ impl PtySession {
         enqueue_process_input(&self.input, bytes, "ConPTY")
     }
 
-    pub fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
+    pub fn flush_input(&mut self) -> Result<(), String> {
         flush_process_input(&self.input, "ConPTY")
     }
 
@@ -293,7 +285,7 @@ fn drain_available_output(
     output_handle: &OwnedHandle,
     buffer: &mut [u8],
     output: &flume::Sender<PtyOutput>,
-    events: &flume::Sender<TerminalEvent>,
+    events: &TerminalEventSender,
     shutdown: &flume::Receiver<()>,
 ) -> bool {
     loop {
@@ -301,22 +293,20 @@ fn drain_available_output(
             Ok(0) => return true,
             Ok(available) => available,
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
             }
             Err(error) => {
-                let _ = send_or_shutdown(
-                    events,
-                    shutdown,
-                    TerminalEvent::Failed(format!("inspect ConPTY output: {error}")),
-                );
+                let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                    "inspect ConPTY output: {error}"
+                )));
                 return false;
             }
         };
         let read_len = available.min(buffer.len());
         match read_handle(output_handle.raw(), &mut buffer[..read_len]) {
             Ok(0) => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
             }
             Ok(read)
@@ -328,18 +318,17 @@ fn drain_available_output(
             {
                 return false;
             }
-            Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => {}
-            Ok(_) => {}
+            Ok(_) => {
+                let _ = events.changed();
+            }
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
             }
             Err(error) => {
-                let _ = send_or_shutdown(
-                    events,
-                    shutdown,
-                    TerminalEvent::Failed(format!("ConPTY read stopped: {error}")),
-                );
+                let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                    "ConPTY read stopped: {error}"
+                )));
                 return false;
             }
         }

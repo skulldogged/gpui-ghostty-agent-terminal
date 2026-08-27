@@ -17,7 +17,10 @@ pub(crate) enum ReaderControl {
     Resume,
 }
 
-pub(crate) const PROCESS_INPUT_QUEUE_CAPACITY: usize = 64;
+pub(crate) const PROCESS_WRITE_QUEUE_CAPACITY: usize = 64;
+// The final slot is reserved for the ordered Flush/Resize barrier used by a
+// viewport resize. Ordinary writes report backpressure before consuming it.
+pub(crate) const PROCESS_INPUT_QUEUE_CAPACITY: usize = PROCESS_WRITE_QUEUE_CAPACITY + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessInputStatus {
@@ -41,6 +44,9 @@ pub(crate) fn enqueue_process_input(
     bytes: &[u8],
     transport: &str,
 ) -> Result<ProcessInputStatus, String> {
+    if input.len() >= PROCESS_WRITE_QUEUE_CAPACITY {
+        return Ok(ProcessInputStatus::Backpressured);
+    }
     match input.try_send(ProcessInput::Write(bytes.to_vec())) {
         Ok(()) => Ok(ProcessInputStatus::Accepted),
         Err(flume::TrySendError::Full(_)) => Ok(ProcessInputStatus::Backpressured),
@@ -65,18 +71,12 @@ pub(crate) fn enqueue_process_resize(
 pub(crate) fn flush_process_input(
     input: &flume::Sender<ProcessInput>,
     transport: &str,
-) -> Result<ProcessInputStatus, String> {
+) -> Result<(), String> {
     let (completed, completion) = flume::bounded(1);
-    match input.try_send(ProcessInput::Flush { completed }) {
-        Ok(()) => completion
-            .recv()
-            .map_err(|_| format!("{transport} input writer stopped before flush completed"))?
-            .map(|_| ProcessInputStatus::Accepted),
-        Err(flume::TrySendError::Full(_)) => Ok(ProcessInputStatus::Backpressured),
-        Err(flume::TrySendError::Disconnected(_)) => {
-            Err(format!("{transport} input writer stopped"))
-        }
-    }
+    enqueue_process_command(input, ProcessInput::Flush { completed }, transport)?;
+    completion
+        .recv()
+        .map_err(|_| format!("{transport} input writer stopped before flush completed"))?
 }
 
 fn enqueue_process_command(
@@ -112,13 +112,13 @@ pub(crate) fn send_or_shutdown<T>(
 }
 
 pub(crate) fn publish_writer_failure(
-    events: &flume::Sender<crate::terminal_session::TerminalEvent>,
+    events: &crate::terminal_session::TerminalEventSender,
     error: String,
 ) {
     // The writer owns resize/flush acknowledgements. It must be able to exit
     // and drop queued completion senders even when a coalesced Changed event
     // already occupies the lifecycle queue.
-    let _ = events.try_send(crate::terminal_session::TerminalEvent::Failed(error));
+    let _ = events.lifecycle(crate::terminal_session::TerminalEvent::Failed(error));
 }
 
 pub(crate) fn reader_checkpoint(
@@ -241,7 +241,7 @@ mod unix {
         PtySize, ReaderControl, enqueue_process_input, enqueue_process_resize, flush_process_input,
         publish_writer_failure, reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     };
-    use crate::terminal_session::TerminalEvent;
+    use crate::terminal_session::{TerminalEvent, TerminalEventSender};
     use portable_pty::{
         Child, CommandBuilder, MasterPty, PtySize as PortablePtySize, native_pty_system,
     };
@@ -263,7 +263,7 @@ mod unix {
         pub fn spawn(
             size: PtySize,
             working_directory: &std::path::Path,
-            events: flume::Sender<TerminalEvent>,
+            events: TerminalEventSender,
         ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
             let pair = native_pty_system()
                 .openpty(size.into())
@@ -377,11 +377,9 @@ mod unix {
                             Ok(false) => continue,
                             Ok(true) => {}
                             Err(error) => {
-                                let _ = send_or_shutdown(
-                                    &events,
-                                    &shutdown_rx,
-                                    TerminalEvent::Failed(format!("wait for PTY output: {error}")),
-                                );
+                                let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                                    "wait for PTY output: {error}"
+                                )));
                                 break;
                             }
                         }
@@ -415,7 +413,7 @@ mod unix {
             enqueue_process_input(&self.input, bytes, "PTY")
         }
 
-        pub fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
+        pub fn flush_input(&mut self) -> Result<(), String> {
             flush_process_input(&self.input, "PTY")
         }
 
@@ -471,7 +469,7 @@ mod unix {
         reader: &mut dyn Read,
         buffer: &mut [u8],
         output: &flume::Sender<PtyOutput>,
-        events: &flume::Sender<TerminalEvent>,
+        events: &TerminalEventSender,
         shutdown: &flume::Receiver<()>,
     ) -> bool {
         loop {
@@ -479,11 +477,9 @@ mod unix {
                 Ok(false) => return true,
                 Ok(true) => {}
                 Err(error) => {
-                    let _ = send_or_shutdown(
-                        events,
-                        shutdown,
-                        TerminalEvent::Failed(format!("wait for PTY output barrier: {error}")),
-                    );
+                    let _ = events.lifecycle(TerminalEvent::Failed(format!(
+                        "wait for PTY output barrier: {error}"
+                    )));
                     return false;
                 }
             }
@@ -497,12 +493,12 @@ mod unix {
         reader: &mut dyn Read,
         buffer: &mut [u8],
         output: &flume::Sender<PtyOutput>,
-        events: &flume::Sender<TerminalEvent>,
+        events: &TerminalEventSender,
         shutdown: &flume::Receiver<()>,
     ) -> bool {
         match reader.read(buffer) {
             Ok(0) => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 false
             }
             Ok(read)
@@ -514,18 +510,14 @@ mod unix {
             {
                 false
             }
-            Ok(_) if events.try_send(TerminalEvent::Changed).is_err() => true,
-            Ok(_) => true,
+            Ok(_) => events.changed(),
             Err(error) if is_normal_pty_exit(&error) => {
-                let _ = send_or_shutdown(events, shutdown, TerminalEvent::Exited);
+                let _ = events.lifecycle(TerminalEvent::Exited);
                 false
             }
             Err(error) => {
-                let _ = send_or_shutdown(
-                    events,
-                    shutdown,
-                    TerminalEvent::Failed(format!("PTY read stopped: {error}")),
-                );
+                let _ =
+                    events.lifecycle(TerminalEvent::Failed(format!("PTY read stopped: {error}")));
                 false
             }
         }
@@ -608,11 +600,12 @@ pub use unix::PtySession;
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessInput, ProcessInputStatus, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
+        PROCESS_INPUT_QUEUE_CAPACITY, PROCESS_WRITE_QUEUE_CAPACITY, ProcessInput,
+        ProcessInputStatus, ProcessSnapshot, PtyOutput, PtySize, ReaderControl,
         enqueue_process_input, enqueue_process_resize, flush_process_input, publish_writer_failure,
         reader_checkpoint,
     };
-    use crate::terminal_session::TerminalEvent;
+    use crate::terminal_session::{TerminalEvent, TerminalEventSender};
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -663,15 +656,21 @@ mod tests {
     }
 
     #[test]
-    fn writer_failure_publication_never_blocks_on_a_full_event_queue() {
-        let (events, queued) = flume::bounded(1);
-        events
-            .send(TerminalEvent::Changed)
-            .expect("fill terminal event queue");
+    fn writer_failure_is_retained_beside_a_coalesced_change() {
+        let (events, queued) = TerminalEventSender::channel();
+        assert!(events.changed());
+        assert!(events.changed(), "duplicate changes should coalesce");
 
         publish_writer_failure(&events, "injected writer failure".into());
 
-        assert!(matches!(queued.recv(), Ok(TerminalEvent::Changed)));
+        assert!(matches!(
+            queued.recv_timeout(Duration::from_secs(1)),
+            Ok(TerminalEvent::Failed(error)) if error == "injected writer failure"
+        ));
+        assert!(matches!(
+            queued.recv_timeout(Duration::from_secs(1)),
+            Ok(TerminalEvent::Changed)
+        ));
     }
 
     #[test]
@@ -741,13 +740,45 @@ mod tests {
             panic!("second transport command must be the flush");
         };
         completed.send(Ok(())).expect("complete flush");
+        flush
+            .join()
+            .expect("join flush sender")
+            .expect("finish ordered flush");
+    }
+
+    #[test]
+    fn process_flush_uses_capacity_reserved_from_ordinary_writes() {
+        let (input, queued) = flume::bounded(PROCESS_INPUT_QUEUE_CAPACITY);
+        for index in 0..PROCESS_WRITE_QUEUE_CAPACITY {
+            assert_eq!(
+                enqueue_process_input(&input, &[index as u8], "test PTY")
+                    .expect("fill ordinary write capacity"),
+                ProcessInputStatus::Accepted
+            );
+        }
         assert_eq!(
-            flush
-                .join()
-                .expect("join flush sender")
-                .expect("finish ordered flush"),
-            ProcessInputStatus::Accepted
+            enqueue_process_input(&input, b"overflow", "test PTY")
+                .expect("reserve control capacity"),
+            ProcessInputStatus::Backpressured
         );
+
+        let flush_input = input.clone();
+        let flush = std::thread::spawn(move || flush_process_input(&flush_input, "test PTY"));
+        for _ in 0..PROCESS_WRITE_QUEUE_CAPACITY {
+            assert!(matches!(
+                queued.recv().expect("receive queued write"),
+                ProcessInput::Write(_)
+            ));
+        }
+        let ProcessInput::Flush { completed } = queued.recv().expect("receive reserved flush")
+        else {
+            panic!("reserved transport command must be the flush");
+        };
+        completed.send(Ok(())).expect("complete reserved flush");
+        flush
+            .join()
+            .expect("join reserved flush sender")
+            .expect("finish reserved flush");
     }
 
     #[test]

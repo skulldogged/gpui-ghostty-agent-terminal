@@ -59,12 +59,38 @@ impl Default for TerminalSize {
 /// or libghostty-vt types; callers only learn that observable session state
 /// changed and can request a fresh snapshot.
 pub struct TerminalEvents {
-    receiver: flume::Receiver<TerminalEvent>,
+    changed: flume::Receiver<()>,
+    lifecycle: flume::Receiver<TerminalEvent>,
 }
 
 impl TerminalEvents {
     pub(crate) fn try_recv(&self) -> Option<TerminalEvent> {
-        self.receiver.try_recv().ok()
+        self.lifecycle.try_recv().ok().or_else(|| {
+            self.changed
+                .try_recv()
+                .ok()
+                .map(|()| TerminalEvent::Changed)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<TerminalEvent, flume::RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(event) = self.try_recv() {
+                return Ok(event);
+            }
+            if self.changed.is_disconnected() && self.lifecycle.is_disconnected() {
+                return Err(flume::RecvTimeoutError::Disconnected);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(flume::RecvTimeoutError::Timeout);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -75,9 +101,44 @@ pub enum TerminalEvent {
     Failed(String),
 }
 
+#[derive(Clone)]
+pub(crate) struct TerminalEventSender {
+    changed: flume::Sender<()>,
+    lifecycle: flume::Sender<TerminalEvent>,
+}
+
+impl TerminalEventSender {
+    pub(crate) fn channel() -> (Self, TerminalEvents) {
+        let (changed_tx, changed_rx) = flume::bounded(1);
+        let (lifecycle_tx, lifecycle_rx) = flume::unbounded();
+        (
+            Self {
+                changed: changed_tx,
+                lifecycle: lifecycle_tx,
+            },
+            TerminalEvents {
+                changed: changed_rx,
+                lifecycle: lifecycle_rx,
+            },
+        )
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        match self.changed.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => true,
+            Err(flume::TrySendError::Disconnected(())) => false,
+        }
+    }
+
+    pub(crate) fn lifecycle(&self, event: TerminalEvent) -> bool {
+        debug_assert!(!matches!(event, TerminalEvent::Changed));
+        self.lifecycle.try_send(event).is_ok()
+    }
+}
+
 trait TerminalTransport: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String>;
-    fn flush_input(&mut self) -> Result<ProcessInputStatus, String>;
+    fn flush_input(&mut self) -> Result<(), String>;
     fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String>;
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
@@ -95,7 +156,7 @@ impl TerminalTransport for PtySession {
         PtySession::write(self, bytes)
     }
 
-    fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
+    fn flush_input(&mut self) -> Result<(), String> {
         PtySession::flush_input(self)
     }
 
@@ -149,9 +210,7 @@ impl TerminalSession {
     ) -> Result<(Self, TerminalEvents), String> {
         let size = size.validate()?;
         let terminal = ghostty::Terminal::new(size.cols, size.rows)?;
-        // Changed notifications coalesce in the first slot while a second
-        // slot preserves one lifecycle event without blocking a transport.
-        let (events_tx, events_rx) = flume::bounded(2);
+        let (events_tx, events_rx) = TerminalEventSender::channel();
         let (process, output) = PtySession::spawn(size.pty_size(), working_directory, events_tx)?;
         Ok((
             Self {
@@ -161,9 +220,7 @@ impl TerminalSession {
                 size,
                 pending_response: Vec::new(),
             },
-            TerminalEvents {
-                receiver: events_rx,
-            },
+            events_rx,
         ))
     }
 
@@ -252,9 +309,7 @@ impl TerminalSession {
         if !self.flush_pending_response()? {
             return Err("terminal response is waiting for process input capacity".into());
         }
-        if self.process.flush_input()? == ProcessInputStatus::Backpressured {
-            return Err("terminal input queue is full before resize".into());
-        }
+        self.process.flush_input()?;
 
         self.process.pause_reader()?;
         if let Err(error) = self.drain_until_reader_paused() {
@@ -505,8 +560,8 @@ mod tests {
             Ok(ProcessInputStatus::Accepted)
         }
 
-        fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
-            Ok(ProcessInputStatus::Accepted)
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
         }
 
         fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -537,8 +592,8 @@ mod tests {
             Ok(ProcessInputStatus::Accepted)
         }
 
-        fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
-            Ok(ProcessInputStatus::Accepted)
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
         }
 
         fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -576,8 +631,8 @@ mod tests {
             Ok(ProcessInputStatus::Accepted)
         }
 
-        fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
-            Ok(ProcessInputStatus::Accepted)
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
         }
 
         fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -604,8 +659,8 @@ mod tests {
             Ok(ProcessInputStatus::Accepted)
         }
 
-        fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
-            Ok(ProcessInputStatus::Accepted)
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
         }
 
         fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -640,8 +695,8 @@ mod tests {
             Ok(ProcessInputStatus::Accepted)
         }
 
-        fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
-            Ok(ProcessInputStatus::Accepted)
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
         }
 
         fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
@@ -1127,7 +1182,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+            match events.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Changed) => {
                     let snapshot = session.snapshot().expect("snapshot terminal session");
                     if snapshot_text(&snapshot).contains("TERMINAL_SESSION_RUNTIME_LIVE") {
@@ -1169,7 +1224,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut last_screen = String::new();
         while Instant::now() < deadline {
-            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+            match events.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Changed) => {
                     let snapshot = session.snapshot().expect("snapshot terminal session");
                     last_screen = snapshot_text(&snapshot);
@@ -1205,7 +1260,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            match events.receiver.recv_timeout(Duration::from_millis(250)) {
+            match events.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Changed) => {
                     session.snapshot().expect("drain terminal output");
                 }
