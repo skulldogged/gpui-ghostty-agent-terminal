@@ -317,7 +317,7 @@ impl TerminalSession {
                 .try_recv();
             match message {
                 Ok(PtyOutput::Bytes(bytes)) => {
-                    self.terminal.feed(&bytes);
+                    self.feed_process_output(&bytes)?;
                     changed = true;
                 }
                 Ok(PtyOutput::Paused) => {
@@ -341,12 +341,22 @@ impl TerminalSession {
                 .map_err(|_| "pause terminal reader: output stream stopped".to_string())?;
             match message {
                 PtyOutput::Bytes(bytes) => {
-                    self.terminal.feed(&bytes);
+                    self.feed_process_output(&bytes)?;
                     changed = true;
                 }
                 PtyOutput::Paused => return Ok(changed),
             }
         }
+    }
+
+    fn feed_process_output(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let response = self.terminal.feed(bytes)?;
+        if response.is_empty() {
+            return Ok(());
+        }
+        self.process
+            .write(&response)
+            .map_err(|error| format!("write terminal query response: {error}"))
     }
 }
 
@@ -528,13 +538,45 @@ mod tests {
     }
 
     #[test]
+    fn terminal_query_responses_return_to_the_process_transport() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(RecordingTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx.clone(),
+            }),
+            output: Some(output_rx),
+            size,
+        };
+
+        output_tx
+            .send(PtyOutput::Bytes(b"\x1b[0c".to_vec()))
+            .expect("send primary device attributes query");
+        session.snapshot().expect("process terminal query");
+
+        assert_eq!(
+            bytes
+                .lock()
+                .expect("recording transport mutex poisoned")
+                .as_slice(),
+            b"\x1b[?62;22c"
+        );
+    }
+
+    #[test]
     fn input_restores_a_scrolled_viewport_before_writing() {
         let size = TerminalSize::new(8, 3, 10, 20);
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let (output_tx, output_rx) = flume::unbounded();
         let mut terminal =
             ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
-        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal
+            .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .expect("feed terminal output");
         assert!(
             terminal
                 .scroll(ghostty::ScrollInput {
@@ -581,7 +623,9 @@ mod tests {
         let (output_tx, output_rx) = flume::unbounded();
         let mut terminal =
             ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
-        terminal.feed(b"\x1b[?2004h");
+        terminal
+            .feed(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
         let mut session = TerminalSession {
             terminal,
             process: Box::new(RecordingTransport {
@@ -612,7 +656,9 @@ mod tests {
         let (output_tx, output_rx) = flume::unbounded();
         let mut terminal =
             ghostty::Terminal::new(size.cols, size.rows).expect("create test terminal");
-        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal
+            .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .expect("feed terminal output");
         assert!(
             terminal
                 .scroll(ghostty::ScrollInput {

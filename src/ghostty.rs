@@ -87,7 +87,13 @@ impl Default for RawSnapshot {
 unsafe extern "C" {
     fn spike_terminal_new(cols: u16, rows: u16, scrollback: usize) -> *mut c_void;
     fn spike_terminal_free(terminal: *mut c_void);
-    fn spike_terminal_write(terminal: *mut c_void, data: *const u8, len: usize);
+    fn spike_terminal_write(
+        terminal: *mut c_void,
+        data: *const u8,
+        len: usize,
+        response: *mut *const u8,
+        response_len: *mut usize,
+    ) -> i32;
     fn spike_terminal_resize(
         terminal: *mut c_void,
         cols: u16,
@@ -258,9 +264,27 @@ impl Terminal {
         })
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) {
-        unsafe { spike_terminal_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let mut response = std::ptr::null();
+        let mut response_len = 0;
+        let result = unsafe {
+            spike_terminal_write(
+                self.raw.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut response,
+                &mut response_len,
+            )
+        };
         self.selection_text_cache = None;
+        result_ok(result, "process terminal output")?;
+        if response_len == 0 {
+            return Ok(Vec::new());
+        }
+        if response.is_null() {
+            return Err("libghostty-vt returned a null PTY response".into());
+        }
+        Ok(unsafe { std::slice::from_raw_parts(response, response_len) }.to_vec())
     }
 
     pub fn resize(
@@ -583,13 +607,33 @@ mod tests {
     #[cfg(feature = "gui")]
     use crate::terminal_theme::ThemePreset;
 
+    #[test]
+    fn terminal_query_responses_are_returned_in_order_and_cleared_after_feed() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+
+        assert_eq!(
+            terminal
+                .feed(b"\x1b[0c\x1b[0c")
+                .expect("process device attribute queries"),
+            b"\x1b[?62;22c\x1b[?62;22c"
+        );
+        assert!(
+            terminal
+                .feed(b"ordinary output")
+                .expect("process ordinary output")
+                .is_empty()
+        );
+    }
+
     #[cfg(feature = "gui")]
     #[test]
     fn terminal_theme_updates_ghostty_defaults_and_ansi_palette() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");
         let theme = ThemePreset::CatppuccinMocha.terminal_theme();
         terminal.set_theme(theme).expect("apply terminal theme");
-        terminal.feed(b"\x1b[31mred\x1b[0m");
+        terminal
+            .feed(b"\x1b[31mred\x1b[0m")
+            .expect("feed styled output");
 
         let snapshot = terminal.snapshot().expect("snapshot terminal");
         assert_eq!(snapshot.default_fg, theme.foreground);
@@ -616,7 +660,7 @@ mod tests {
         assert!(clean.dirty_rows.is_empty());
         assert!(clean.cells.is_empty());
 
-        terminal.feed(b"x");
+        terminal.feed(b"x").expect("feed changed output");
         let changed = terminal.render_update(false).expect("changed update");
         assert!(!changed.full);
         assert_eq!(changed.dirty_rows, vec![0]);
@@ -631,7 +675,9 @@ mod tests {
     #[test]
     fn viewport_scrolling_uses_ghostty_scrollback() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");
-        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal
+            .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .expect("feed scrollback output");
         let bottom = terminal.snapshot().expect("snapshot bottom");
         assert!(super::snapshot_text(&bottom).contains("five"));
 
@@ -663,7 +709,9 @@ mod tests {
     #[test]
     fn alternate_screen_scrolls_as_cursor_keys() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");
-        terminal.feed(b"\x1b[?1049h");
+        terminal
+            .feed(b"\x1b[?1049h")
+            .expect("enter alternate screen");
 
         let scroll = terminal
             .scroll(ScrollInput {
@@ -686,7 +734,9 @@ mod tests {
     #[test]
     fn mouse_tracking_scrolls_as_mouse_reports() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");
-        terminal.feed(b"\x1b[?1000h\x1b[?1006h");
+        terminal
+            .feed(b"\x1b[?1000h\x1b[?1006h")
+            .expect("enable mouse reporting");
 
         let scroll = terminal
             .scroll(ScrollInput {
@@ -730,7 +780,9 @@ mod tests {
     #[test]
     fn snapshots_report_terminal_titles_from_ghostty() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");
-        terminal.feed(b"\x1b]0;Codex Settings\x07");
+        terminal
+            .feed(b"\x1b]0;Codex Settings\x07")
+            .expect("set terminal title");
 
         let snapshot = terminal.snapshot().expect("snapshot terminal title");
         assert_eq!(snapshot.title.as_deref(), Some("Codex Settings"));
@@ -739,7 +791,9 @@ mod tests {
     #[test]
     fn reverse_video_is_reported_as_an_explicit_background() {
         let mut terminal = Terminal::new(4, 1).expect("create terminal");
-        terminal.feed(b"\x1b[7mX\x1b[0mY");
+        terminal
+            .feed(b"\x1b[7mX\x1b[0mY")
+            .expect("feed inverse output");
 
         let snapshot = terminal.snapshot().expect("snapshot terminal");
         let reversed = snapshot
@@ -770,7 +824,9 @@ mod tests {
             "plain\rUnicode: 雪".as_bytes()
         );
 
-        terminal.feed(b"\x1b[?2004h");
+        terminal
+            .feed(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
         assert_eq!(
             terminal
                 .encode_paste("line one\nline two".as_bytes())
@@ -787,12 +843,16 @@ mod tests {
         assert!(!initial.bracketed_paste);
         assert!(!initial.alternate_screen);
 
-        terminal.feed(b"\x1b[?2004h\x1b[?1049h");
+        terminal
+            .feed(b"\x1b[?2004h\x1b[?1049h")
+            .expect("enable terminal modes");
         let active = terminal.snapshot().expect("snapshot enabled modes");
         assert!(active.bracketed_paste);
         assert!(active.alternate_screen);
 
-        terminal.feed(b"\x1b[?2004l\x1b[?1049l");
+        terminal
+            .feed(b"\x1b[?2004l\x1b[?1049l")
+            .expect("disable terminal modes");
         let inactive = terminal.snapshot().expect("snapshot disabled modes");
         assert!(!inactive.bracketed_paste);
         assert!(!inactive.alternate_screen);
@@ -801,7 +861,9 @@ mod tests {
     #[test]
     fn paste_encoding_sanitizes_control_bytes_through_ghostty() {
         let mut terminal = Terminal::new(8, 3).expect("create terminal");
-        terminal.feed(b"\x1b[?2004h");
+        terminal
+            .feed(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
 
         assert_eq!(
             terminal
