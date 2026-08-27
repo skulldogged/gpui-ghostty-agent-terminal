@@ -1,8 +1,8 @@
 use crate::{
     pty::{
-        PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessSnapshot, PtyOutput, PtySize,
-        ReaderControl, enqueue_process_input, enqueue_process_resize, reader_checkpoint,
-        receive_or_shutdown, send_or_shutdown,
+        PROCESS_INPUT_QUEUE_CAPACITY, ProcessInput, ProcessInputStatus, ProcessSnapshot, PtyOutput,
+        PtySize, ReaderControl, enqueue_process_input, enqueue_process_resize, flush_process_input,
+        reader_checkpoint, receive_or_shutdown, send_or_shutdown,
     },
     terminal_session::TerminalEvent,
 };
@@ -142,17 +142,10 @@ impl PtySession {
                                 .map_err(|error| format!("write ConPTY: {error}")),
                             None,
                         ),
-                        ProcessInput::Resize {
-                            size,
-                            response,
-                            completed,
-                        } => (
-                            writer_pseudoconsole.resize(size).and_then(|_| {
-                                write_handle(input_handle.raw(), &response)
-                                    .map_err(|error| format!("write ConPTY: {error}"))
-                            }),
-                            Some(completed),
-                        ),
+                        ProcessInput::Resize { size, completed } => {
+                            (writer_pseudoconsole.resize(size), Some(completed))
+                        }
+                        ProcessInput::Flush { completed } => (Ok(()), Some(completed)),
                     };
                     if let Some(completion) = completion {
                         let _ = completion.send(result.clone());
@@ -261,12 +254,16 @@ impl PtySession {
         ))
     }
 
-    pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
         enqueue_process_input(&self.input, bytes, "ConPTY")
     }
 
-    pub fn resize(&mut self, size: PtySize, response: &[u8]) -> Result<(), String> {
-        enqueue_process_resize(&self.input, size, response, "ConPTY")
+    pub fn flush_input(&mut self) -> Result<ProcessInputStatus, String> {
+        flush_process_input(&self.input, "ConPTY")
+    }
+
+    pub fn resize(&mut self, size: PtySize) -> Result<(), String> {
+        enqueue_process_resize(&self.input, size, "ConPTY")
     }
 
     pub fn has_foreground_process(&self, processes: &ProcessSnapshot) -> Result<bool, String> {
