@@ -1,12 +1,14 @@
 use crate::{
     AgentProgram, AgentSnapshot, AgentState, ApplicationCore, CoreCommand, CoreSnapshot,
     CreatedResource, PaneId, PaneLayout, SpaceId, SplitAxis, SplitId, SplitPlacement, SplitRatio,
-    TabId, TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
+    TabId, TerminalCursorShape, TerminalLifecycle, TerminalSessionId, TerminalSize,
+    TerminalSnapshot,
     core_driver::{CoreDriver, DriverUpdate},
     core_model::default_space_name,
     ghostty,
     settings::{
-        AppSettings, KeybindAction, Shortcut, TerminalGlyphOverflow, ThemePreset, adjust_font_size,
+        AppSettings, KeybindAction, Shortcut, TerminalCursorStyle, TerminalGlyphOverflow,
+        ThemePreset, adjust_font_size,
     },
     terminal_frame::{FrameRow, TerminalFrame},
     terminal_grid::{
@@ -26,9 +28,11 @@ use gpui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TERMINAL_PADDING_PX: f32 = 10.0;
+const CURSOR_STROKE_PX: f32 = 2.0;
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const SYMBOL_OVERFLOW_TOLERANCE_CELLS: f32 = 0.25;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
 const INACTIVE_PANE_CONTRAST: f32 = 0.62;
@@ -48,6 +52,7 @@ pub(crate) fn open_terminal_window(
     let terminal_font = TerminalFont::resolve(&settings, cx)?;
     let available_fonts = installed_monospace_fonts(terminal_font.size, cx);
     core.set_terminal_theme(settings.theme.terminal_theme())?;
+    core.set_terminal_cursor_shape(settings.cursor_style.into())?;
     let (driver, projection) = CoreDriver::start(core)?;
     let shell = WorkspaceShell::from_preferences(settings.theme, settings.effective_opacity());
     let selection = UiSelection::initial(&projection.hierarchy);
@@ -71,6 +76,8 @@ pub(crate) fn open_terminal_window(
                 selection,
                 focus,
                 refresh_task: Task::ready(()),
+                cursor_blink_task: Task::ready(()),
+                cursor_blink: CursorBlinkState::new(Instant::now()),
                 terminal_errors,
                 global_error: settings_warning,
                 terminal_font,
@@ -98,6 +105,7 @@ pub(crate) fn open_terminal_window(
             });
             view.update(cx, |view, cx| {
                 view.start_refresh_task(cx);
+                view.start_cursor_blink_task(cx);
             });
             view
         })
@@ -117,6 +125,8 @@ struct MultiplexerView {
     selection: UiSelection,
     focus: FocusHandle,
     refresh_task: Task<()>,
+    cursor_blink_task: Task<()>,
+    cursor_blink: CursorBlinkState,
     terminal_errors: HashMap<TerminalSessionId, String>,
     global_error: Option<String>,
     terminal_font: TerminalFont,
@@ -170,6 +180,41 @@ struct SplitGeometry {
 struct ScrollRemainder {
     x: f32,
     y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CursorBlinkState {
+    visible: bool,
+    deadline: Instant,
+}
+
+impl CursorBlinkState {
+    fn new(now: Instant) -> Self {
+        Self {
+            visible: true,
+            deadline: now + CURSOR_BLINK_INTERVAL,
+        }
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.visible = true;
+        self.deadline = now + CURSOR_BLINK_INTERVAL;
+    }
+
+    fn update_at(&mut self, now: Instant, blinking: bool) -> bool {
+        if now < self.deadline {
+            return false;
+        }
+        self.deadline = now + CURSOR_BLINK_INTERVAL;
+        if blinking {
+            self.visible = !self.visible;
+            true
+        } else {
+            let changed = !self.visible;
+            self.visible = true;
+            changed
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,7 +644,44 @@ impl MultiplexerView {
         });
     }
 
+    fn start_cursor_blink_task(&mut self, cx: &mut Context<Self>) {
+        self.cursor_blink_task = cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(deadline) = this.update(cx, |view, _cx| view.cursor_blink.deadline) else {
+                    break;
+                };
+                cx.background_executor()
+                    .timer(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                let Ok(()) = this.update(cx, |view, cx| {
+                    let focused_cursor_blinks = view
+                        .focused_terminal_session_id()
+                        .and_then(|terminal_session_id| view.terminals.get(&terminal_session_id))
+                        .is_some_and(|snapshot| {
+                            snapshot.cursor.is_some() && snapshot.cursor_blinking
+                        });
+                    if view
+                        .cursor_blink
+                        .update_at(Instant::now(), focused_cursor_blinks)
+                    {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        });
+    }
+
     fn accept_driver_update(&mut self, update: DriverUpdate) {
+        let focused_before = self.focused_terminal_session_id();
+        let reset_for_terminal = match &update {
+            DriverUpdate::Terminal {
+                terminal_session_id,
+                ..
+            } => cursor_blink_resets_for_terminal(focused_before, *terminal_session_id),
+            _ => false,
+        };
         match update {
             DriverUpdate::Hierarchy(hierarchy) => {
                 self.hierarchy = hierarchy;
@@ -674,6 +756,9 @@ impl MultiplexerView {
                 self.requested_sizes.clear();
                 self.global_error = Some(error);
             }
+        }
+        if reset_for_terminal || self.focused_terminal_session_id() != focused_before {
+            self.cursor_blink.reset(Instant::now());
         }
     }
 
@@ -834,17 +919,21 @@ impl MultiplexerView {
         }
         if terminal_paste_shortcut(&event.keystroke) {
             self.clear_terminal_selection();
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
-                && let Err(error) = self.driver.paste_to(terminal_session_id, text.into_bytes())
-            {
-                self.global_error = Some(error);
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.cursor_blink.reset(Instant::now());
                 cx.notify();
+                if let Err(error) = self.driver.paste_to(terminal_session_id, text.into_bytes()) {
+                    self.global_error = Some(error);
+                    cx.notify();
+                }
             }
             cx.stop_propagation();
             return;
         }
         if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
             self.clear_terminal_selection();
+            self.cursor_blink.reset(Instant::now());
+            cx.notify();
             if let Err(error) = self.driver.input_to(terminal_session_id, bytes) {
                 self.global_error = Some(error);
                 cx.notify();
@@ -957,6 +1046,20 @@ impl MultiplexerView {
         cx: &mut Context<Self>,
     ) {
         self.settings.terminal_glyph_overflow = terminal_glyph_overflow;
+        self.save_settings(cx);
+    }
+
+    fn set_terminal_cursor_style(
+        &mut self,
+        cursor_style: TerminalCursorStyle,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.driver.set_terminal_cursor_shape(cursor_style.into()) {
+            self.global_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.settings.cursor_style = cursor_style;
         self.save_settings(cx);
     }
 
@@ -1183,6 +1286,7 @@ impl MultiplexerView {
     }
 
     fn select_space(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_blink.reset(Instant::now());
         self.clear_terminal_selection();
         self.selection.space_id = Some(space_id);
         self.selection.tab_id = None;
@@ -1193,6 +1297,7 @@ impl MultiplexerView {
     }
 
     fn select_tab(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_blink.reset(Instant::now());
         self.clear_terminal_selection();
         self.selection.tab_id = Some(tab_id);
         self.selection.pane_id = None;
@@ -1202,6 +1307,7 @@ impl MultiplexerView {
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_blink.reset(Instant::now());
         if self.selection.pane_id != Some(pane_id) {
             self.clear_terminal_selection();
         }
@@ -2763,6 +2869,51 @@ impl MultiplexerView {
             );
         }
 
+        let mut cursor_choices = div().flex().flex_row().flex_wrap().gap_2();
+        for (index, cursor_style) in TerminalCursorStyle::ALL.into_iter().enumerate() {
+            let selected = self.settings.cursor_style == cursor_style;
+            cursor_choices = cursor_choices.child(
+                div()
+                    .id(("terminal-cursor-style", index))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w(px(220.))
+                    .min_h(px(66.))
+                    .p_3()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(self.shell.opaque_color(if selected {
+                        ShellColor::Accent
+                    } else {
+                        ShellColor::Border
+                    }))
+                    .bg(self.shell.opaque_color(if selected {
+                        ShellColor::Selected
+                    } else {
+                        ShellColor::Chrome
+                    }))
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::Hover)))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.set_terminal_cursor_style(cursor_style, cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(self.shell.opaque_color(ShellColor::Text))
+                            .child(cursor_style.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.shell.opaque_color(ShellColor::FaintText))
+                            .child(cursor_style.description()),
+                    ),
+            );
+        }
+
         div()
             .flex()
             .flex_col()
@@ -2776,6 +2927,11 @@ impl MultiplexerView {
                 "Font family",
                 "Only fonts that measure as fixed-pitch are shown",
                 font_choices,
+            ))
+            .child(self.settings_group(
+                "Cursor",
+                "The default shape; terminal programs may override it",
+                cursor_choices,
             ))
             .child(self.settings_group(
                 "Symbol overflow",
@@ -3130,11 +3286,16 @@ impl MultiplexerView {
                 .child("Starting terminal…")
                 .into_any_element();
         };
+        let cursor_visible = cursor_should_be_visible(
+            inactive,
+            snapshot.cursor_blinking,
+            self.cursor_blink.visible,
+        );
         let mut frame = if inactive {
-            TerminalFrame::from_snapshot_with_cursor(snapshot, false)
+            TerminalFrame::from_snapshot_with_cursor(snapshot, cursor_visible)
                 .dimmed_toward(snapshot.default_bg, INACTIVE_PANE_CONTRAST)
         } else {
-            TerminalFrame::from_snapshot(snapshot)
+            TerminalFrame::from_snapshot_with_cursor(snapshot, cursor_visible)
         };
         let selection_rows = selection_rows(snapshot);
         let terminal_theme = self.settings.theme.terminal_theme();
@@ -3223,21 +3384,22 @@ impl MultiplexerView {
                     );
                 }
                 if let Some(cursor) = frame.cursor_overlay {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(
-                                bounds.left()
-                                    + px(f32::from(cursor.x) * paint_font.cells.width_px()),
-                                bounds.top()
-                                    + px(f32::from(cursor.y) * paint_font.cells.height_px()),
+                    let cell_width = paint_font.cells.width_px();
+                    let cell_height = paint_font.cells.height_px();
+                    let cursor_width = cell_width * f32::from(cursor.width);
+                    let cursor_origin = point(
+                        bounds.left() + px(f32::from(cursor.x) * cell_width),
+                        bounds.top() + px(f32::from(cursor.y) * cell_height),
+                    );
+                    for rect in cursor_rects(cursor.shape, cursor_width, cell_height) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(cursor_origin.x + px(rect.x), cursor_origin.y + px(rect.y)),
+                                size(px(rect.width), px(rect.height)),
                             ),
-                            size(
-                                px(paint_font.cells.width_px()),
-                                px(paint_font.cells.height_px()),
-                            ),
-                        ),
-                        color(cursor.color),
-                    ));
+                            color(cursor.color),
+                        ));
+                    }
                 }
             },
         )
@@ -3280,6 +3442,75 @@ impl MultiplexerView {
             )
             .into_any_element()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CursorRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+fn cursor_rects(shape: TerminalCursorShape, cell_width: f32, cell_height: f32) -> Vec<CursorRect> {
+    let stroke = CURSOR_STROKE_PX.min(cell_width).min(cell_height);
+    match shape {
+        TerminalCursorShape::Block => vec![CursorRect {
+            x: 0.,
+            y: 0.,
+            width: cell_width,
+            height: cell_height,
+        }],
+        TerminalCursorShape::Bar => vec![CursorRect {
+            x: 0.,
+            y: 0.,
+            width: stroke,
+            height: cell_height,
+        }],
+        TerminalCursorShape::Underline => vec![CursorRect {
+            x: 0.,
+            y: cell_height - stroke,
+            width: cell_width,
+            height: stroke,
+        }],
+        TerminalCursorShape::BlockHollow => vec![
+            CursorRect {
+                x: 0.,
+                y: 0.,
+                width: cell_width,
+                height: stroke,
+            },
+            CursorRect {
+                x: 0.,
+                y: cell_height - stroke,
+                width: cell_width,
+                height: stroke,
+            },
+            CursorRect {
+                x: 0.,
+                y: stroke,
+                width: stroke,
+                height: (cell_height - stroke * 2.).max(0.),
+            },
+            CursorRect {
+                x: cell_width - stroke,
+                y: stroke,
+                width: stroke,
+                height: (cell_height - stroke * 2.).max(0.),
+            },
+        ],
+    }
+}
+
+fn cursor_should_be_visible(inactive: bool, blinking: bool, blink_phase_visible: bool) -> bool {
+    !inactive && (!blinking || blink_phase_visible)
+}
+
+fn cursor_blink_resets_for_terminal(
+    focused: Option<TerminalSessionId>,
+    updated: TerminalSessionId,
+) -> bool {
+    focused == Some(updated)
 }
 
 fn accept_terminal_snapshot(
@@ -4374,7 +4605,7 @@ mod tests {
         CLAUDE_AGENT_ICON, FallbackClusterBounds, GEMINI_AGENT_ICON, OPENAI_AGENT_ICON,
         PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, TERMINAL_PADDING_PX,
         TerminalGlyphOverflow, UiSelection, accept_terminal_snapshot, agent_icon_data,
-        agent_icon_resting_geometry, agent_icon_transition_geometry, first_pane_id,
+        agent_icon_resting_geometry, agent_icon_transition_geometry, cursor_rects, first_pane_id,
         fitted_cluster_glyph_position, font_is_terminal_fallback_only,
         installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
         normalize_page_scroll_delta, pane_close_shortcut_for, pane_extents,
@@ -4385,8 +4616,8 @@ mod tests {
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
-        PaneLayout, SplitAxis, SplitPlacement, SplitRatio, TabId, TerminalLifecycle,
-        TerminalSessionId, TerminalSize, TerminalSnapshot,
+        PaneLayout, SplitAxis, SplitPlacement, SplitRatio, TabId, TerminalCursorShape,
+        TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
         terminal_frame::{FrameRow, GlyphCell},
     };
     use gpui::{Keystroke, Modifiers};
@@ -4397,6 +4628,67 @@ mod tests {
         assert_eq!(normalize_page_scroll_delta(u32::MAX as f32, 24), 24.0);
         assert_eq!(normalize_page_scroll_delta(-(u32::MAX as f32), 80), -80.0);
         assert_eq!(normalize_page_scroll_delta(120.0, 24), 120.0);
+    }
+
+    #[test]
+    fn cursor_shapes_use_fixed_cell_geometry() {
+        assert_eq!(
+            cursor_rects(TerminalCursorShape::Bar, 10., 20.),
+            vec![super::CursorRect {
+                x: 0.,
+                y: 0.,
+                width: 2.,
+                height: 20.,
+            }]
+        );
+        assert_eq!(
+            cursor_rects(TerminalCursorShape::Underline, 10., 20.),
+            vec![super::CursorRect {
+                x: 0.,
+                y: 18.,
+                width: 10.,
+                height: 2.,
+            }]
+        );
+        assert_eq!(
+            cursor_rects(TerminalCursorShape::BlockHollow, 10., 20.).len(),
+            4
+        );
+    }
+
+    #[test]
+    fn cursor_visibility_respects_focus_and_terminal_blink_mode() {
+        assert!(super::cursor_should_be_visible(false, false, false));
+        assert!(super::cursor_should_be_visible(false, true, true));
+        assert!(!super::cursor_should_be_visible(false, true, false));
+        assert!(!super::cursor_should_be_visible(true, false, true));
+    }
+
+    #[test]
+    fn cursor_blink_reset_is_isolated_to_the_focused_terminal() {
+        let focused = TerminalSessionId::from_u64(7);
+        let background = TerminalSessionId::from_u64(8);
+
+        assert!(super::cursor_blink_resets_for_terminal(
+            Some(focused),
+            focused
+        ));
+        assert!(!super::cursor_blink_resets_for_terminal(
+            Some(focused),
+            background
+        ));
+    }
+
+    #[test]
+    fn cursor_blink_reset_restarts_the_full_visible_interval() {
+        let start = std::time::Instant::now();
+        let mut blink = super::CursorBlinkState::new(start);
+        blink.reset(start + std::time::Duration::from_millis(450));
+
+        assert!(!blink.update_at(start + std::time::Duration::from_millis(500), true));
+        assert!(blink.visible);
+        assert!(blink.update_at(start + std::time::Duration::from_millis(950), true));
+        assert!(!blink.visible);
     }
 
     #[test]
@@ -4909,6 +5201,9 @@ mod tests {
                 cols: 1,
                 rows: 1,
                 cursor: None,
+                cursor_shape: TerminalCursorShape::Block,
+                cursor_blinking: false,
+                cursor_wide_tail: false,
                 default_fg: [0xdd; 3],
                 default_bg: [0x11; 3],
                 selection_text: None,
@@ -4943,6 +5238,9 @@ mod tests {
             cols,
             rows: 69,
             cursor: Some((0, 28)),
+            cursor_shape: TerminalCursorShape::Block,
+            cursor_blinking: false,
+            cursor_wide_tail: false,
             default_fg: [0xdd; 3],
             default_bg: [0x11; 3],
             selection_text: None,

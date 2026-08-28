@@ -84,6 +84,9 @@ enum WorkerRequest {
     SetTerminalTheme {
         theme: TerminalTheme,
     },
+    SetTerminalCursorShape {
+        shape: ghostty::CursorShape,
+    },
     Snapshot {
         terminal_session_id: TerminalSessionId,
         since: Option<u64>,
@@ -292,6 +295,13 @@ impl ApplicationCore {
 
     pub(crate) fn set_terminal_theme(&self, theme: TerminalTheme) -> Result<(), String> {
         self.expect_ack(WorkerRequest::SetTerminalTheme { theme })
+    }
+
+    pub(crate) fn set_terminal_cursor_shape(
+        &self,
+        shape: ghostty::CursorShape,
+    ) -> Result<(), String> {
+        self.expect_ack(WorkerRequest::SetTerminalCursorShape { shape })
     }
 
     pub fn terminal_changes(&self) -> flume::Receiver<TerminalChange> {
@@ -514,6 +524,12 @@ fn run_terminal_runtime(
                             WorkerResponse::Ack
                         })
                     }
+                    WorkerRequest::SetTerminalCursorShape { shape } => {
+                        runtime.set_cursor_shape(shape).map(|changes| {
+                            changed_terminals.extend(changes);
+                            WorkerResponse::Ack
+                        })
+                    }
                     WorkerRequest::ApplyCoreCommand {
                         expected_revision,
                         command,
@@ -616,10 +632,33 @@ pub struct TerminalSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub cursor: Option<(u16, u16)>,
+    pub cursor_shape: TerminalCursorShape,
+    pub cursor_blinking: bool,
+    pub cursor_wide_tail: bool,
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
     pub selection_text: Option<String>,
     pub cells: Vec<TerminalCell>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalCursorShape {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+impl From<ghostty::CursorShape> for TerminalCursorShape {
+    fn from(shape: ghostty::CursorShape) -> Self {
+        match shape {
+            ghostty::CursorShape::Bar => Self::Bar,
+            ghostty::CursorShape::Block => Self::Block,
+            ghostty::CursorShape::Underline => Self::Underline,
+            ghostty::CursorShape::BlockHollow => Self::BlockHollow,
+        }
+    }
 }
 
 impl TerminalSnapshot {
@@ -675,6 +714,9 @@ impl TerminalSnapshot {
             cols: update.cols,
             rows: update.rows,
             cursor: update.cursor,
+            cursor_shape: update.cursor_shape,
+            cursor_blinking: update.cursor_blinking,
+            cursor_wide_tail: update.cursor_wide_tail,
             default_fg: update.default_fg,
             default_bg: update.default_bg,
             selection_text: update.selection_text,
@@ -706,6 +748,9 @@ impl TerminalSnapshot {
         self.active_work = update.active_work;
         self.title = update.title;
         self.cursor = update.cursor;
+        self.cursor_shape = update.cursor_shape;
+        self.cursor_blinking = update.cursor_blinking;
+        self.cursor_wide_tail = update.cursor_wide_tail;
         self.default_fg = update.default_fg;
         self.default_bg = update.default_bg;
         self.selection_text = update.selection_text;
@@ -737,6 +782,9 @@ struct TerminalUpdate {
     cols: u16,
     rows: u16,
     cursor: Option<(u16, u16)>,
+    cursor_shape: TerminalCursorShape,
+    cursor_blinking: bool,
+    cursor_wide_tail: bool,
     default_fg: [u8; 3],
     default_bg: [u8; 3],
     selection_text: Option<String>,
@@ -763,6 +811,9 @@ impl TerminalUpdate {
             cols: snapshot.cols,
             rows: snapshot.rows,
             cursor: snapshot.cursor,
+            cursor_shape: snapshot.cursor_shape.into(),
+            cursor_blinking: snapshot.cursor_blinking,
+            cursor_wide_tail: snapshot.cursor_wide_tail,
             default_fg: snapshot.default_fg,
             default_bg: snapshot.default_bg,
             selection_text: snapshot.selection_text,
@@ -784,6 +835,9 @@ impl TerminalUpdate {
             cols: COLS,
             rows: ROWS,
             cursor: None,
+            cursor_shape: TerminalCursorShape::Block,
+            cursor_blinking: false,
+            cursor_wide_tail: false,
             default_fg: [0xd8, 0xde, 0xe9],
             default_bg: [0x0b, 0x0e, 0x13],
             selection_text: None,

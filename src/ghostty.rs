@@ -29,9 +29,12 @@ struct RawSnapshot {
     rows: u16,
     cursor_x: u16,
     cursor_y: u16,
+    cursor_style: i32,
     title: [u8; 512],
     title_len: u16,
     cursor_visible: bool,
+    cursor_blinking: bool,
+    cursor_wide_tail: bool,
     bracketed_paste: bool,
     alternate_screen: bool,
     selection_active: bool,
@@ -66,9 +69,12 @@ impl Default for RawSnapshot {
             rows: 0,
             cursor_x: 0,
             cursor_y: 0,
+            cursor_style: 1,
             title: [0; 512],
             title_len: 0,
             cursor_visible: false,
+            cursor_blinking: false,
+            cursor_wide_tail: false,
             bracketed_paste: false,
             alternate_screen: false,
             selection_active: false,
@@ -110,6 +116,8 @@ unsafe extern "C" {
         cursor: *const u8,
         ansi_palette: *const u8,
     ) -> i32;
+    fn spike_terminal_set_default_cursor_style(terminal: *mut c_void, cursor_style: i32) -> i32;
+    fn spike_terminal_set_default_cursor_blink(terminal: *mut c_void, cursor_blink: bool) -> i32;
     fn spike_terminal_encode_paste(
         terminal: *mut c_void,
         data: *mut u8,
@@ -231,12 +239,39 @@ pub struct Snapshot {
     pub rows: u16,
     pub title: Option<String>,
     pub cursor: Option<(u16, u16)>,
+    pub cursor_shape: CursorShape,
+    pub cursor_blinking: bool,
+    pub cursor_wide_tail: bool,
     pub bracketed_paste: bool,
     pub alternate_screen: bool,
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
     pub selection_text: Option<String>,
     pub cells: Vec<Cell>,
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CursorShape {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+impl TryFrom<i32> for CursorShape {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Bar),
+            1 => Ok(Self::Block),
+            2 => Ok(Self::Underline),
+            3 => Ok(Self::BlockHollow),
+            value => Err(format!("unknown libghostty-vt cursor style {value}")),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -322,6 +357,19 @@ impl Terminal {
             )
         };
         result_ok(result, "set color theme")
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn set_default_cursor_shape(&mut self, shape: CursorShape) -> Result<(), String> {
+        let result =
+            unsafe { spike_terminal_set_default_cursor_style(self.raw.as_ptr(), shape as i32) };
+        result_ok(result, "set default cursor style")
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn set_default_cursor_blink(&mut self, blink: bool) -> Result<(), String> {
+        let result = unsafe { spike_terminal_set_default_cursor_blink(self.raw.as_ptr(), blink) };
+        result_ok(result, "set default cursor blink")
     }
 
     pub fn encode_paste(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -557,6 +605,9 @@ impl Terminal {
             cursor: raw_snapshot
                 .cursor_visible
                 .then_some((raw_snapshot.cursor_x, raw_snapshot.cursor_y)),
+            cursor_shape: CursorShape::try_from(raw_snapshot.cursor_style)?,
+            cursor_blinking: raw_snapshot.cursor_blinking,
+            cursor_wide_tail: raw_snapshot.cursor_wide_tail,
             bracketed_paste: raw_snapshot.bracketed_paste,
             alternate_screen: raw_snapshot.alternate_screen,
             default_fg: [
@@ -620,7 +671,7 @@ pub fn snapshot_text(snapshot: &Snapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScrollInput, Terminal};
+    use super::{CursorShape, ScrollInput, Terminal};
     #[cfg(feature = "gui")]
     use crate::terminal_theme::ThemePreset;
 
@@ -803,6 +854,73 @@ mod tests {
 
         let snapshot = terminal.snapshot().expect("snapshot terminal title");
         assert_eq!(snapshot.title.as_deref(), Some("Codex Settings"));
+    }
+
+    #[test]
+    fn snapshots_report_decscusr_cursor_shapes() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+
+        assert_eq!(
+            terminal
+                .snapshot()
+                .expect("snapshot default cursor")
+                .cursor_shape,
+            CursorShape::Block
+        );
+
+        for (sequence, expected_shape, expected_blinking) in [
+            (b"\x1b[1 q".as_slice(), CursorShape::Block, true),
+            (b"\x1b[2 q".as_slice(), CursorShape::Block, false),
+            (b"\x1b[3 q".as_slice(), CursorShape::Underline, true),
+            (b"\x1b[4 q".as_slice(), CursorShape::Underline, false),
+            (b"\x1b[5 q".as_slice(), CursorShape::Bar, true),
+            (b"\x1b[6 q".as_slice(), CursorShape::Bar, false),
+        ] {
+            terminal.feed(sequence).expect("set cursor shape");
+            let snapshot = terminal.snapshot().expect("snapshot cursor shape");
+            assert_eq!(snapshot.cursor_shape, expected_shape);
+            assert_eq!(snapshot.cursor_blinking, expected_blinking);
+        }
+    }
+
+    #[test]
+    fn snapshots_report_when_the_cursor_is_on_a_wide_glyph_tail() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal
+            .feed("界\x1b[D".as_bytes())
+            .expect("position cursor on wide tail");
+
+        let snapshot = terminal.snapshot().expect("snapshot wide-tail cursor");
+        assert_eq!(snapshot.cursor, Some((1, 0)));
+        assert!(snapshot.cursor_wide_tail);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn configured_cursor_shape_is_the_default_without_overriding_decscusr() {
+        let mut terminal = Terminal::new(8, 3).expect("create terminal");
+        terminal
+            .set_default_cursor_shape(CursorShape::Bar)
+            .expect("set beam default");
+        terminal
+            .set_default_cursor_blink(true)
+            .expect("enable default cursor blink");
+        let default_snapshot = terminal.snapshot().expect("snapshot beam default");
+        assert_eq!(default_snapshot.cursor_shape, CursorShape::Bar);
+        assert!(default_snapshot.cursor_blinking);
+
+        terminal.feed(b"\x1b[2 q").expect("set explicit block");
+        terminal
+            .set_default_cursor_shape(CursorShape::Underline)
+            .expect("change configured default");
+        let explicit_snapshot = terminal.snapshot().expect("snapshot explicit cursor");
+        assert_eq!(explicit_snapshot.cursor_shape, CursorShape::Block);
+        assert!(!explicit_snapshot.cursor_blinking);
+
+        terminal.feed(b"\x1b[0 q").expect("reset cursor style");
+        let reset_snapshot = terminal.snapshot().expect("snapshot reset cursor");
+        assert_eq!(reset_snapshot.cursor_shape, CursorShape::Underline);
+        assert!(reset_snapshot.cursor_blinking);
     }
 
     #[test]

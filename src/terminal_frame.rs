@@ -1,15 +1,18 @@
-use crate::{TerminalSnapshot, terminal_grid::cell_offset, terminal_selection::SelectionRow};
+use crate::{
+    TerminalCursorShape, TerminalSnapshot, terminal_grid::cell_offset,
+    terminal_selection::SelectionRow,
+};
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalFrame {
     pub rows: Vec<FrameRow>,
     // Default-background cells reveal the pane surface. These runs contain only
-    // explicit terminal backgrounds and cursor fills, which must stay opaque
+    // explicit terminal backgrounds and block cursor fills, which must stay opaque
     // when the pane surface becomes translucent.
     pub opaque_backgrounds: Vec<BackgroundRun>,
     pub cursor_cell: Option<(u16, u16)>,
-    pub cursor_overlay: Option<BackgroundRun>,
+    pub cursor_overlay: Option<CursorOverlay>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +61,17 @@ pub(crate) struct BackgroundRun {
     pub color: [u8; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CursorOverlay {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub shape: TerminalCursorShape,
+    pub color: [u8; 3],
+}
+
 impl TerminalFrame {
+    #[cfg(test)]
     pub(crate) fn from_snapshot(snapshot: &TerminalSnapshot) -> Self {
         Self::from_snapshot_with_cursor(snapshot, true)
     }
@@ -67,6 +80,13 @@ impl TerminalFrame {
         snapshot: &TerminalSnapshot,
         cursor_visible: bool,
     ) -> Self {
+        let cursor = snapshot.cursor.map(|(x, y)| {
+            if snapshot.cursor_wide_tail {
+                (x.saturating_sub(1), y)
+            } else {
+                (x, y)
+            }
+        });
         let mut cells = vec![None; usize::from(snapshot.cols) * usize::from(snapshot.rows)];
         for cell in &snapshot.cells {
             if let Some(offset) = offset(snapshot.cols, snapshot.rows, cell.x, cell.y) {
@@ -86,25 +106,27 @@ impl TerminalFrame {
                     .expect("in-bounds terminal coordinate")];
                 let width = cell.map(|cell| cell.width).unwrap_or(1);
                 if width == 0 {
-                    if cursor_visible && snapshot.cursor == Some((x, y)) {
-                        cursor_overlay = Some(BackgroundRun {
-                            x,
-                            y,
-                            width: 1,
-                            color: cell.map(|cell| cell.fg).unwrap_or(snapshot.default_fg),
-                        });
-                    }
                     continue;
                 }
 
                 let mut foreground = cell.map(|cell| cell.fg).unwrap_or(snapshot.default_fg);
-                let cursor_here = cursor_visible && snapshot.cursor == Some((x, y));
+                let cursor_here = cursor_visible && cursor == Some((x, y));
                 let mut background = cell.map(|cell| cell.bg).unwrap_or(snapshot.default_bg);
-                if cursor_here {
+                let block_cursor_here =
+                    cursor_here && snapshot.cursor_shape == TerminalCursorShape::Block;
+                if block_cursor_here {
                     background = foreground;
                     foreground = snapshot.default_bg;
+                } else if cursor_here {
+                    cursor_overlay = Some(CursorOverlay {
+                        x,
+                        y,
+                        width: u16::from(width),
+                        shape: snapshot.cursor_shape,
+                        color: foreground,
+                    });
                 }
-                if cursor_here || cell.is_some_and(|cell| cell.has_explicit_bg) {
+                if block_cursor_here || cell.is_some_and(|cell| cell.has_explicit_bg) {
                     push_background(
                         &mut opaque_backgrounds,
                         BackgroundRun {
@@ -146,7 +168,7 @@ impl TerminalFrame {
         Self {
             rows,
             opaque_backgrounds,
-            cursor_cell: cursor_visible.then_some(snapshot.cursor).flatten(),
+            cursor_cell: cursor_visible.then_some(cursor).flatten(),
             cursor_overlay,
         }
     }
@@ -247,8 +269,8 @@ fn push_background(backgrounds: &mut Vec<BackgroundRun>, next: BackgroundRun) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundRun, GlyphCell, TerminalFrame};
-    use crate::{TerminalCell, TerminalLifecycle, TerminalSnapshot};
+    use super::{BackgroundRun, CursorOverlay, GlyphCell, TerminalFrame};
+    use crate::{TerminalCell, TerminalCursorShape, TerminalLifecycle, TerminalSnapshot};
 
     #[test]
     fn wide_tails_are_not_rendered_as_independent_glyphs() {
@@ -337,9 +359,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_on_a_wide_tail_becomes_a_cell_overlay() {
-        let snapshot = snapshot(
+    fn a_block_cursor_on_a_wide_tail_inverts_the_leading_wide_cell() {
+        let snapshot = snapshot_with_cursor_state(
             Some((1, 0)),
+            TerminalCursorShape::Block,
+            true,
             vec![
                 cell(0, 0, 2, "界", [0xaa, 0xbb, 0xcc]),
                 cell(1, 0, 0, "", [0xaa, 0xbb, 0xcc]),
@@ -348,15 +372,69 @@ mod tests {
 
         let frame = TerminalFrame::from_snapshot(&snapshot);
 
-        assert_eq!(
-            frame.cursor_overlay,
-            Some(BackgroundRun {
-                x: 1,
-                y: 0,
-                width: 1,
-                color: [0xaa, 0xbb, 0xcc],
-            })
-        );
+        assert_eq!(frame.cursor_cell, Some((0, 0)));
+        assert!(frame.cursor_overlay.is_none());
+        assert_eq!(frame.opaque_backgrounds[0].x, 0);
+        assert_eq!(frame.opaque_backgrounds[0].width, 2);
+    }
+
+    #[test]
+    fn a_thin_cursor_on_a_wide_tail_spans_from_the_leading_cell() {
+        let frame = TerminalFrame::from_snapshot(&snapshot_with_cursor_state(
+            Some((1, 0)),
+            TerminalCursorShape::Underline,
+            true,
+            vec![
+                cell(0, 0, 2, "界", [0xaa, 0xbb, 0xcc]),
+                cell(1, 0, 0, "", [0xaa, 0xbb, 0xcc]),
+            ],
+        ));
+
+        let cursor = frame.cursor_overlay.expect("wide cursor overlay");
+        assert_eq!(cursor.x, 0);
+        assert_eq!(cursor.width, 2);
+    }
+
+    #[test]
+    fn non_block_cursors_overlay_without_inverting_cell_content() {
+        for shape in [
+            TerminalCursorShape::Bar,
+            TerminalCursorShape::Underline,
+            TerminalCursorShape::BlockHollow,
+        ] {
+            let frame = TerminalFrame::from_snapshot(&snapshot_with_cursor_shape(
+                Some((0, 0)),
+                shape,
+                vec![cell(0, 0, 1, "x", [0xaa, 0xbb, 0xcc])],
+            ));
+
+            assert!(frame.opaque_backgrounds.is_empty());
+            assert_eq!(frame.rows[0].glyph_cells[0].color, [0xaa, 0xbb, 0xcc]);
+            assert_eq!(
+                frame.cursor_overlay,
+                Some(CursorOverlay {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    shape,
+                    color: [0xaa, 0xbb, 0xcc],
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn an_underline_cursor_spans_the_full_wide_glyph() {
+        let frame = TerminalFrame::from_snapshot(&snapshot_with_cursor_shape(
+            Some((0, 0)),
+            TerminalCursorShape::Underline,
+            vec![
+                cell(0, 0, 2, "界", [0xaa, 0xbb, 0xcc]),
+                cell(1, 0, 0, "", [0xaa, 0xbb, 0xcc]),
+            ],
+        ));
+
+        assert_eq!(frame.cursor_overlay.expect("cursor overlay").width, 2);
     }
 
     #[test]
@@ -404,6 +482,23 @@ mod tests {
     }
 
     fn snapshot(cursor: Option<(u16, u16)>, cells: Vec<TerminalCell>) -> TerminalSnapshot {
+        snapshot_with_cursor_shape(cursor, TerminalCursorShape::Block, cells)
+    }
+
+    fn snapshot_with_cursor_shape(
+        cursor: Option<(u16, u16)>,
+        cursor_shape: TerminalCursorShape,
+        cells: Vec<TerminalCell>,
+    ) -> TerminalSnapshot {
+        snapshot_with_cursor_state(cursor, cursor_shape, false, cells)
+    }
+
+    fn snapshot_with_cursor_state(
+        cursor: Option<(u16, u16)>,
+        cursor_shape: TerminalCursorShape,
+        cursor_wide_tail: bool,
+        cells: Vec<TerminalCell>,
+    ) -> TerminalSnapshot {
         TerminalSnapshot {
             revision: 1,
             lifecycle: TerminalLifecycle::Running,
@@ -413,6 +508,9 @@ mod tests {
             cols: 4,
             rows: 1,
             cursor,
+            cursor_shape,
+            cursor_blinking: false,
+            cursor_wide_tail,
             default_fg: [0xdd; 3],
             default_bg: [0x11; 3],
             selection_text: None,

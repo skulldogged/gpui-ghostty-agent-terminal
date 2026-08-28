@@ -15,6 +15,7 @@ use std::{
 };
 
 const ACTIVE_WORK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_CURSOR_BLINK: bool = true;
 
 pub(super) struct CoreRuntime {
     model: CoreModel,
@@ -22,6 +23,7 @@ pub(super) struct CoreRuntime {
     processes: ProcessSnapshot,
     next_process_refresh: Instant,
     theme: Option<TerminalTheme>,
+    cursor_shape: ghostty::CursorShape,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +81,7 @@ impl CoreRuntime {
             processes: ProcessSnapshot::new(),
             next_process_refresh: Instant::now() + ACTIVE_WORK_POLL_INTERVAL,
             theme: None,
+            cursor_shape: ghostty::CursorShape::Bar,
         };
         runtime.execute_effects(&commit.effects);
         let terminal = runtime
@@ -137,6 +140,22 @@ impl CoreRuntime {
             }
         }
         self.theme = Some(theme);
+        Ok(changes)
+    }
+
+    pub(super) fn set_cursor_shape(
+        &mut self,
+        shape: ghostty::CursorShape,
+    ) -> Result<Vec<(TerminalSessionId, u64)>, String> {
+        let mut changes = Vec::new();
+        for (&terminal_session_id, runtime) in &mut self.terminals {
+            if let Some(session) = runtime.session.as_mut() {
+                session.set_default_cursor_shape(shape)?;
+                runtime.revision = runtime.revision.saturating_add(1);
+                changes.push((terminal_session_id, runtime.revision));
+            }
+        }
+        self.cursor_shape = shape;
         Ok(changes)
     }
 
@@ -405,8 +424,12 @@ impl CoreRuntime {
                     terminal_session_id,
                     launch,
                 } => {
-                    let runtime = RuntimeTerminal::spawn(&launch.working_directory, self.theme)
-                        .unwrap_or_else(RuntimeTerminal::failed);
+                    let runtime = RuntimeTerminal::spawn(
+                        &launch.working_directory,
+                        self.theme,
+                        self.cursor_shape,
+                    )
+                    .unwrap_or_else(RuntimeTerminal::failed);
                     self.terminals.insert(*terminal_session_id, runtime);
                 }
                 CoreEffect::StopTerminal {
@@ -432,12 +455,18 @@ impl CoreRuntime {
 }
 
 impl RuntimeTerminal {
-    fn spawn(working_directory: &Path, theme: Option<TerminalTheme>) -> Result<Self, String> {
+    fn spawn(
+        working_directory: &Path,
+        theme: Option<TerminalTheme>,
+        cursor_shape: ghostty::CursorShape,
+    ) -> Result<Self, String> {
         let (mut session, events) =
             TerminalSession::spawn_in(TerminalSize::default(), working_directory)?;
         if let Some(theme) = theme {
             session.set_theme(theme)?;
         }
+        session.set_default_cursor_shape(cursor_shape)?;
+        session.set_default_cursor_blink(DEFAULT_CURSOR_BLINK)?;
         Ok(Self {
             session: Some(session),
             events: Some(events),

@@ -189,6 +189,50 @@ pub(crate) enum TerminalGlyphOverflow {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalCursorStyle {
+    #[default]
+    #[serde(alias = "bar")]
+    Beam,
+    Block,
+    Underline,
+    HollowBlock,
+}
+
+impl TerminalCursorStyle {
+    pub(crate) const ALL: [Self; 4] = [Self::Beam, Self::Block, Self::Underline, Self::HollowBlock];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Beam => "Beam",
+            Self::Block => "Block",
+            Self::Underline => "Underline",
+            Self::HollowBlock => "Hollow block",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Beam => "A narrow vertical caret",
+            Self::Block => "A filled cell that inverts its text",
+            Self::Underline => "A line along the bottom of the cell",
+            Self::HollowBlock => "An outline around the current cell",
+        }
+    }
+}
+
+impl From<TerminalCursorStyle> for crate::ghostty::CursorShape {
+    fn from(style: TerminalCursorStyle) -> Self {
+        match style {
+            TerminalCursorStyle::Beam => Self::Bar,
+            TerminalCursorStyle::Block => Self::Block,
+            TerminalCursorStyle::Underline => Self::Underline,
+            TerminalCursorStyle::HollowBlock => Self::BlockHollow,
+        }
+    }
+}
+
 impl TerminalGlyphOverflow {
     pub(crate) const ALL: [Self; 3] = [Self::WhenFollowedBySpace, Self::Always, Self::Never];
 
@@ -225,6 +269,7 @@ pub(crate) struct AppSettings {
     pub(crate) font_family: Option<String>,
     pub(crate) font_size: f32,
     pub(crate) terminal_glyph_overflow: TerminalGlyphOverflow,
+    pub(crate) cursor_style: TerminalCursorStyle,
     font_size_unit: FontSizeUnit,
     pub(crate) keybindings: KeybindingSettings,
 }
@@ -237,6 +282,7 @@ impl Default for AppSettings {
             font_family: None,
             font_size: font_pixels_to_points(14.),
             terminal_glyph_overflow: TerminalGlyphOverflow::default(),
+            cursor_style: TerminalCursorStyle::Beam,
             font_size_unit: FontSizeUnit::Points,
             keybindings: KeybindingSettings::default(),
         }
@@ -494,6 +540,7 @@ mod tests {
             partial.terminal_glyph_overflow,
             TerminalGlyphOverflow::WhenFollowedBySpace
         );
+        assert_eq!(partial.cursor_style, TerminalCursorStyle::Beam);
     }
 
     #[test]
@@ -508,6 +555,25 @@ mod tests {
             let decoded: AppSettings = serde_json::from_str(&serialized).unwrap();
 
             assert_eq!(decoded.terminal_glyph_overflow, policy);
+        }
+    }
+
+    #[test]
+    fn cursor_style_defaults_to_beam_and_round_trips_all_supported_values() {
+        assert_eq!(
+            AppSettings::default().cursor_style,
+            TerminalCursorStyle::Beam
+        );
+        for cursor_style in TerminalCursorStyle::ALL {
+            let settings = AppSettings {
+                cursor_style,
+                ..AppSettings::default()
+            };
+
+            let serialized = serde_json::to_string(&settings).unwrap();
+            let decoded: AppSettings = serde_json::from_str(&serialized).unwrap();
+
+            assert_eq!(decoded.cursor_style, cursor_style);
         }
     }
 

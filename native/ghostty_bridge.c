@@ -193,6 +193,42 @@ int spike_terminal_set_theme(SpikeTerminal* spike, const uint8_t* foreground,
                               GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, palette);
 }
 
+int spike_terminal_set_default_cursor_style(SpikeTerminal* spike,
+                                            int32_t cursor_style) {
+  if (spike == NULL) return GHOSTTY_INVALID_VALUE;
+
+  GhosttyTerminalCursorStyle style;
+  switch (cursor_style) {
+    case GHOSTTY_TERMINAL_CURSOR_STYLE_BAR:
+      style = GHOSTTY_TERMINAL_CURSOR_STYLE_BAR;
+      break;
+    case GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK:
+      style = GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK;
+      break;
+    case GHOSTTY_TERMINAL_CURSOR_STYLE_UNDERLINE:
+      style = GHOSTTY_TERMINAL_CURSOR_STYLE_UNDERLINE;
+      break;
+    case GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW:
+      style = GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW;
+      break;
+    default:
+      return GHOSTTY_INVALID_VALUE;
+  }
+
+  return ghostty_terminal_set(spike->terminal,
+                              GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE,
+                              &style);
+}
+
+int spike_terminal_set_default_cursor_blink(SpikeTerminal* spike,
+                                            bool cursor_blink) {
+  if (spike == NULL) return GHOSTTY_INVALID_VALUE;
+
+  return ghostty_terminal_set(spike->terminal,
+                              GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK,
+                              &cursor_blink);
+}
+
 int spike_terminal_encode_paste(SpikeTerminal* spike, uint8_t* data,
                                  size_t data_len, uint8_t* output,
                                  size_t output_len, size_t* output_written) {
@@ -564,6 +600,17 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
                            GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE,
                            &cursor_mode_visible);
   snapshot->cursor_visible = cursor_in_viewport && cursor_mode_visible;
+  result = ghostty_render_state_get(
+      spike->render, GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING,
+      &snapshot->cursor_blinking);
+  if (!success(result)) return result;
+  GhosttyRenderStateCursorVisualStyle cursor_style =
+      GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+  result = ghostty_render_state_get(
+      spike->render, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
+      &cursor_style);
+  if (!success(result)) return result;
+  snapshot->cursor_style = (int32_t)cursor_style;
   if (cursor_in_viewport) {
     ghostty_render_state_get(spike->render,
                              GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X,
@@ -571,6 +618,10 @@ int spike_terminal_snapshot(SpikeTerminal* spike, bool force_full,
     ghostty_render_state_get(spike->render,
                              GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y,
                              &snapshot->cursor_y);
+    result = ghostty_render_state_get(
+        spike->render, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL,
+        &snapshot->cursor_wide_tail);
+    if (!success(result)) return result;
   }
 
   result = ghostty_terminal_mode_get(

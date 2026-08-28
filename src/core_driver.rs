@@ -243,6 +243,9 @@ enum Command {
     SetTerminalTheme {
         theme: TerminalTheme,
     },
+    SetTerminalCursorShape {
+        shape: crate::ghostty::CursorShape,
+    },
 }
 
 impl DriverCommandSender {
@@ -462,6 +465,13 @@ impl CoreDriver {
         self.send(Command::SetTerminalTheme { theme })
     }
 
+    pub(crate) fn set_terminal_cursor_shape(
+        &self,
+        shape: crate::ghostty::CursorShape,
+    ) -> Result<(), String> {
+        self.send(Command::SetTerminalCursorShape { shape })
+    }
+
     pub(crate) fn updates(&self) -> DriverUpdates {
         self.updates.clone()
     }
@@ -565,6 +575,10 @@ fn run_driver(
             }
             DriverEvent::Command(Ok(Command::SetTerminalTheme { theme })) => core
                 .set_terminal_theme(theme)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::SetTerminalCursorShape { shape })) => core
+                .set_terminal_cursor_shape(shape)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
             DriverEvent::TerminalChanged(Ok(change)) => {
