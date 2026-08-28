@@ -48,10 +48,12 @@ not require reconstructing state from a comment stream.
 ## Review and merge
 
 When the implementation and required platform evidence are complete, mark the
-pull request ready and request one `@codex review` using the operator's GitHub
-session. This review request is the sole GitHub mutation made with that session;
-all other agent-authored GitHub writes use `agent-gh`. Request another review
-only when the first review found a material issue that required changes.
+pull request ready. Request a GitHub `@codex review` only when the operator
+explicitly asks for one; that request is the sole GitHub mutation made with the
+operator's session, while all other agent-authored GitHub writes use `agent-gh`.
 
-Merge only after checks, the review, and issue acceptance criteria are green.
-The merged pull request and closed issue become the permanent handoff record.
+Merge after required checks and issue acceptance criteria are green. Treat a
+review as an additional merge gate only when branch protection requires it, the
+operator requests it, or a relevant unresolved risk justifies it under the
+repository's review rules. The merged pull request and closed issue become the
+permanent handoff record.
