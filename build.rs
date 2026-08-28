@@ -5,30 +5,43 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GHOSTTY_REVISION: &str = "4c725242b7dbe8c77c6e227ef1f9540c5ef17921";
+const GHOSTTY_INCLUDE_DIR_ENV: &str = "GHOSTTY_VT_INCLUDE_DIR";
+const GHOSTTY_LIB_DIR_ENV: &str = "GHOSTTY_VT_LIB_DIR";
 
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let ghostty = root.join("vendor/ghostty");
-    assert!(
-        ghostty.join("build.zig").is_file(),
-        "missing Ghostty submodule; run git submodule update --init"
-    );
 
     println!("cargo:rerun-if-env-changed=ZIG");
+    println!("cargo:rerun-if-env-changed={GHOSTTY_INCLUDE_DIR_ENV}");
+    println!("cargo:rerun-if-env-changed={GHOSTTY_LIB_DIR_ENV}");
     println!("cargo:rerun-if-changed=native/ghostty_bridge.c");
     println!("cargo:rerun-if-changed=native/ghostty_bridge.h");
     println!("cargo:rerun-if-changed=vendor/ghostty/include");
 
-    build_ghostty(&ghostty);
-    build_bridge(&root, &ghostty);
+    let target = env::var("TARGET").expect("TARGET");
+    let lib_dir = env::var_os(GHOSTTY_LIB_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            assert!(
+                ghostty.join("build.zig").is_file(),
+                "missing Ghostty submodule; run git submodule update --init"
+            );
+            build_ghostty(&ghostty, &target)
+        });
+    let include_dir = env::var_os(GHOSTTY_INCLUDE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ghostty.join("include"));
+
+    link_ghostty(&lib_dir, &target);
+    build_bridge(&root, &include_dir);
     println!("cargo:rustc-env=GHOSTTY_SOURCE_REVISION={GHOSTTY_REVISION}");
 }
 
-fn build_ghostty(ghostty: &Path) {
+fn build_ghostty(ghostty: &Path, target: &str) -> PathBuf {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let install = out.join("ghostty-install");
     let cache = out.join("ghostty-zig-cache");
-    let target = env::var("TARGET").expect("TARGET");
     let zig = env::var_os("ZIG").unwrap_or_else(|| OsString::from("zig"));
 
     let status = Command::new(zig)
@@ -47,10 +60,14 @@ fn build_ghostty(ghostty: &Path) {
         .expect("launch Zig Ghostty build");
     assert!(status.success(), "Ghostty Zig build failed: {status}");
 
-    let lib_dir = install.join("lib");
+    install.join("lib")
+}
+
+fn link_ghostty(lib_dir: &Path, target: &str) {
     if target.contains("windows") {
         let source = lib_dir.join("ghostty-vt-static.lib");
         assert!(source.is_file(), "missing {}", source.display());
+        let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
         let link_dir = out.join("ghostty-rust-link");
         fs::create_dir_all(&link_dir).expect("create Windows link directory");
         fs::copy(&source, link_dir.join("ghostty-vt.lib")).expect("copy Ghostty static library");
@@ -67,11 +84,16 @@ fn build_ghostty(ghostty: &Path) {
     println!("cargo:rustc-link-lib=static=ghostty-vt");
 }
 
-fn build_bridge(root: &Path, ghostty: &Path) {
+fn build_bridge(root: &Path, ghostty_include: &Path) {
+    assert!(
+        ghostty_include.join("ghostty/vt.h").is_file(),
+        "missing Ghostty headers in {}",
+        ghostty_include.display()
+    );
     cc::Build::new()
         .file(root.join("native/ghostty_bridge.c"))
         .include(root.join("native"))
-        .include(ghostty.join("include"))
+        .include(ghostty_include)
         .define("GHOSTTY_STATIC", None)
         .warnings(true)
         .compile("ghostty_spike_bridge");
