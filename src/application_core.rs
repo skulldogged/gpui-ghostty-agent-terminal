@@ -61,9 +61,9 @@ struct ApplicationCoreInner {
 }
 
 enum WorkerRequest {
-    Input {
+    Key {
         terminal_session_id: TerminalSessionId,
-        bytes: Vec<u8>,
+        input: ghostty::KeyInput,
     },
     Paste {
         terminal_session_id: TerminalSessionId,
@@ -238,14 +238,14 @@ impl ApplicationCore {
         }
     }
 
-    pub fn input_to(
+    pub(crate) fn key_to(
         &self,
         terminal_session_id: TerminalSessionId,
-        bytes: &[u8],
+        input: ghostty::KeyInput,
     ) -> Result<(), String> {
-        self.expect_ack(WorkerRequest::Input {
+        self.expect_ack(WorkerRequest::Key {
             terminal_session_id,
-            bytes: bytes.to_vec(),
+            input,
         })
     }
 
@@ -417,12 +417,12 @@ fn run_terminal_runtime(
                 let stop = matches!(command.request, WorkerRequest::Stop);
                 let mut changed_terminals = Vec::new();
                 let result = match command.request {
-                    WorkerRequest::Input {
+                    WorkerRequest::Key {
                         terminal_session_id,
-                        bytes,
+                        input,
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
-                            let result = runtime.input(terminal_session_id, &bytes);
+                            let result = runtime.key(terminal_session_id, &input);
                             if result.as_ref().copied().unwrap_or(true)
                                 && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
                             {

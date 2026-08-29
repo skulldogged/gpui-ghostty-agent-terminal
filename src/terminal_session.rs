@@ -229,10 +229,21 @@ impl TerminalSession {
         ))
     }
 
+    #[cfg(test)]
     pub fn input(&mut self, bytes: &[u8]) -> Result<bool, String> {
         let viewport_changed = self.terminal.scroll_to_bottom()?;
         self.write_process_input(bytes)?;
         Ok(viewport_changed)
+    }
+
+    pub(crate) fn key(&mut self, input: &ghostty::KeyInput) -> Result<bool, String> {
+        let mut changed = self.drain_output()?;
+        changed |= self.terminal.scroll_to_bottom()?;
+        let bytes = self.terminal.encode_key(input)?;
+        if !bytes.is_empty() {
+            self.write_process_input(&bytes)?;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn scroll(&mut self, input: ghostty::ScrollInput) -> Result<bool, String> {

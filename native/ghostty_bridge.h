@@ -65,6 +65,14 @@ typedef struct {
   uint32_t screen_height;
 } SpikeSelectionInput;
 
+typedef struct {
+  const uint8_t* key;
+  size_t key_len;
+  const uint8_t* text;
+  size_t text_len;
+  uint16_t modifiers;
+} SpikeKeyInput;
+
 SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollback);
 void spike_terminal_free(SpikeTerminal* terminal);
 // Response bytes remain owned by the terminal and are valid until its next
@@ -84,6 +92,9 @@ int spike_terminal_set_default_cursor_blink(SpikeTerminal* terminal,
 int spike_terminal_encode_paste(SpikeTerminal* terminal, uint8_t* data,
                                  size_t data_len, uint8_t* output,
                                  size_t output_len, size_t* output_written);
+int spike_terminal_encode_key(SpikeTerminal* terminal,
+                              const SpikeKeyInput* input, uint8_t* output,
+                              size_t output_len, size_t* output_written);
 int spike_terminal_scroll(SpikeTerminal* terminal, intptr_t delta_rows,
                           intptr_t delta_columns,
                           float pointer_x, float pointer_y,
@@ -96,6 +107,13 @@ int spike_terminal_scroll_to_bottom(SpikeTerminal* terminal, bool* changed);
 int spike_terminal_selection_event(SpikeTerminal* terminal,
                                    const SpikeSelectionInput* input,
                                    bool* viewport_changed);
+int spike_terminal_link_context(SpikeTerminal* terminal, uint16_t x,
+                                uint16_t y, uint8_t* output,
+                                size_t output_len, size_t* output_written,
+                                size_t* click_offset);
+int spike_terminal_select_link(SpikeTerminal* terminal, uint16_t x,
+                               uint16_t y, size_t match_start,
+                               size_t match_end, bool* selected);
 int spike_terminal_selection_text(SpikeTerminal* terminal, uint8_t* output,
                                   size_t output_len, size_t* output_written);
 int spike_terminal_snapshot(SpikeTerminal* terminal, bool force_full,

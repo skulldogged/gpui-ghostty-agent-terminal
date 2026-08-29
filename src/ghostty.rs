@@ -62,6 +62,15 @@ struct RawSelectionInput {
     screen_height: u32,
 }
 
+#[repr(C)]
+struct RawKeyInput {
+    key: *const u8,
+    key_len: usize,
+    text: *const u8,
+    text_len: usize,
+    modifiers: u16,
+}
+
 impl Default for RawSnapshot {
     fn default() -> Self {
         Self {
@@ -126,6 +135,13 @@ unsafe extern "C" {
         output_len: usize,
         output_written: *mut usize,
     ) -> i32;
+    fn spike_terminal_encode_key(
+        terminal: *mut c_void,
+        input: *const RawKeyInput,
+        output: *mut u8,
+        output_len: usize,
+        output_written: *mut usize,
+    ) -> i32;
     fn spike_terminal_scroll(
         terminal: *mut c_void,
         delta_rows: isize,
@@ -147,6 +163,23 @@ unsafe extern "C" {
         terminal: *mut c_void,
         input: *const RawSelectionInput,
         viewport_changed: *mut bool,
+    ) -> i32;
+    fn spike_terminal_link_context(
+        terminal: *mut c_void,
+        x: u16,
+        y: u16,
+        output: *mut u8,
+        output_len: usize,
+        output_written: *mut usize,
+        click_offset: *mut usize,
+    ) -> i32;
+    fn spike_terminal_select_link(
+        terminal: *mut c_void,
+        x: u16,
+        y: u16,
+        match_start: usize,
+        match_end: usize,
+        selected: *mut bool,
     ) -> i32;
     fn spike_terminal_selection_text(
         terminal: *mut c_void,
@@ -184,6 +217,18 @@ pub(crate) struct ScrollInput {
     pub cell_width: u32,
     pub cell_height: u32,
     pub modifiers: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyInput {
+    pub key: String,
+    pub text: Option<String>,
+    pub modifiers: u16,
+}
+
+struct LinkContext {
+    text: String,
+    click_offset: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -402,6 +447,47 @@ impl Terminal {
         Ok(output)
     }
 
+    pub(crate) fn encode_key(&mut self, input: &KeyInput) -> Result<Vec<u8>, String> {
+        const MAX_KEY_OUTPUT_BYTES: usize = 1024 * 1024;
+        let text = input.text.as_deref().unwrap_or_default();
+        let raw = RawKeyInput {
+            key: input.key.as_ptr(),
+            key_len: input.key.len(),
+            text: text.as_ptr(),
+            text_len: text.len(),
+            modifiers: input.modifiers,
+        };
+        let mut output = vec![0; text.len().saturating_mul(2).max(128)];
+        loop {
+            let mut written = 0;
+            let result = unsafe {
+                spike_terminal_encode_key(
+                    self.raw.as_ptr(),
+                    &raw,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &mut written,
+                )
+            };
+            if result == -3 {
+                if written <= output.len() || written > MAX_KEY_OUTPUT_BYTES {
+                    return Err("libghostty-vt key encoding is too large".into());
+                }
+                output.resize(written, 0);
+                continue;
+            }
+            result_ok(result, "encode key")?;
+            if written > output.len() {
+                return Err(format!(
+                    "libghostty-vt key encoding needs {written} bytes, buffer has {}",
+                    output.len()
+                ));
+            }
+            output.truncate(written);
+            return Ok(output);
+        }
+    }
+
     pub(crate) fn scroll(&mut self, input: ScrollInput) -> Result<ScrollResult, String> {
         if input.delta_rows == 0 && input.delta_columns == 0 {
             return Ok(ScrollResult::default());
@@ -483,6 +569,9 @@ impl Terminal {
             spike_terminal_selection_event(self.raw.as_ptr(), &raw, &mut viewport_changed)
         };
         result_ok(result, "update selection")?;
+        if input.event_type == SelectionEventType::Press && input.click_count == 2 {
+            let _ = self.select_link_at(input.x, input.y);
+        }
         match input.event_type {
             SelectionEventType::Press
             | SelectionEventType::Drag
@@ -500,6 +589,91 @@ impl Terminal {
             }
         }
         Ok(viewport_changed)
+    }
+
+    fn select_link_at(&mut self, x: u16, y: u16) -> Result<bool, String> {
+        let Some(context) = self.link_context(x, y)? else {
+            return Ok(false);
+        };
+        let Some(range) = crate::terminal_link::match_at(&context.text, context.click_offset)
+            .map_err(|error| format!("match terminal link: {error}"))?
+        else {
+            return Ok(false);
+        };
+        self.select_link(x, y, range.start, range.end)
+    }
+
+    fn link_context(&mut self, x: u16, y: u16) -> Result<Option<LinkContext>, String> {
+        const MAX_LINK_LINE_BYTES: usize = 1024 * 1024;
+        let mut required = 0;
+        let mut click_offset = 0;
+        let result = unsafe {
+            spike_terminal_link_context(
+                self.raw.as_ptr(),
+                x,
+                y,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+                &mut click_offset,
+            )
+        };
+        if result == -4 {
+            return Ok(None);
+        }
+        if result != -3 {
+            result_ok(result, "measure terminal link context")?;
+        }
+        if required == 0 {
+            return Ok(None);
+        }
+        if required > MAX_LINK_LINE_BYTES {
+            return Err("terminal link line is too large".into());
+        }
+
+        let mut output = vec![0; required];
+        let mut written = 0;
+        let result = unsafe {
+            spike_terminal_link_context(
+                self.raw.as_ptr(),
+                x,
+                y,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+                &mut click_offset,
+            )
+        };
+        result_ok(result, "read terminal link context")?;
+        if written > output.len() || click_offset >= written {
+            return Err("libghostty-vt returned an invalid link context".into());
+        }
+        output.truncate(written);
+        let text = String::from_utf8(output)
+            .map_err(|error| format!("terminal link context is not UTF-8: {error}"))?;
+        Ok(Some(LinkContext { text, click_offset }))
+    }
+
+    fn select_link(
+        &mut self,
+        x: u16,
+        y: u16,
+        match_start: usize,
+        match_end: usize,
+    ) -> Result<bool, String> {
+        let mut selected = false;
+        let result = unsafe {
+            spike_terminal_select_link(
+                self.raw.as_ptr(),
+                x,
+                y,
+                match_start,
+                match_end,
+                &mut selected,
+            )
+        };
+        result_ok(result, "select terminal link")?;
+        Ok(selected)
     }
 
     fn selection_text(&mut self) -> Result<Option<String>, String> {
@@ -671,7 +845,7 @@ pub fn snapshot_text(snapshot: &Snapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorShape, ScrollInput, Terminal};
+    use super::{CursorShape, KeyInput, ScrollInput, SelectionEventType, SelectionInput, Terminal};
     #[cfg(feature = "gui")]
     use crate::terminal_theme::ThemePreset;
 
@@ -967,6 +1141,114 @@ mod tests {
                 .encode_paste("line one\nline two".as_bytes())
                 .expect("encode bracketed paste"),
             b"\x1b[200~line one\nline two\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn key_encoding_uses_ghostty_terminal_modes() {
+        let mut terminal = Terminal::new(80, 24).expect("create terminal");
+        let left = KeyInput {
+            key: "left".into(),
+            text: None,
+            modifiers: 0,
+        };
+
+        assert_eq!(terminal.encode_key(&left).expect("encode left"), b"\x1b[D");
+
+        terminal
+            .feed(b"\x1b[?1h")
+            .expect("enable application cursor keys");
+        assert_eq!(
+            terminal.encode_key(&left).expect("encode application left"),
+            b"\x1bOD"
+        );
+    }
+
+    #[test]
+    fn key_encoding_preserves_alt_word_controls() {
+        let mut terminal = Terminal::new(80, 24).expect("create terminal");
+
+        for (key, expected) in [
+            ("left", b"\x1b[1;3D".as_slice()),
+            ("right", b"\x1b[1;3C".as_slice()),
+            ("backspace", b"\x1b\x7f".as_slice()),
+        ] {
+            assert_eq!(
+                terminal
+                    .encode_key(&KeyInput {
+                        key: key.into(),
+                        text: None,
+                        modifiers: 1 << 2,
+                    })
+                    .expect("encode Alt key"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn double_clicking_a_url_selects_only_the_matched_range() {
+        let mut terminal = Terminal::new(80, 24).expect("create terminal");
+        terminal
+            .feed(b"visit https://google.com: now")
+            .expect("feed URL");
+
+        for event_type in [SelectionEventType::Press, SelectionEventType::Release] {
+            terminal
+                .selection_event(SelectionInput {
+                    event_type,
+                    click_count: 2,
+                    x: 16,
+                    y: 0,
+                    pointer_x: 165.0,
+                    pointer_y: 10.0,
+                    columns: 80,
+                    cell_width: 10,
+                    padding_left: 0,
+                    screen_height: 480,
+                })
+                .expect("select URL");
+        }
+
+        assert_eq!(
+            terminal
+                .snapshot()
+                .expect("snapshot selection")
+                .selection_text,
+            Some("https://google.com".into())
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_soft_wrapped_url_selects_the_logical_link() {
+        let mut terminal = Terminal::new(12, 4).expect("create terminal");
+        terminal
+            .feed(b"go https://google.com: now")
+            .expect("feed wrapped URL");
+
+        for event_type in [SelectionEventType::Press, SelectionEventType::Release] {
+            terminal
+                .selection_event(SelectionInput {
+                    event_type,
+                    click_count: 2,
+                    x: 3,
+                    y: 1,
+                    pointer_x: 35.0,
+                    pointer_y: 30.0,
+                    columns: 12,
+                    cell_width: 10,
+                    padding_left: 0,
+                    screen_height: 80,
+                })
+                .expect("select wrapped URL");
+        }
+
+        assert_eq!(
+            terminal
+                .snapshot()
+                .expect("snapshot wrapped selection")
+                .selection_text,
+            Some("https://google.com".into())
         );
     }
 

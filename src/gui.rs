@@ -1026,11 +1026,11 @@ impl MultiplexerView {
             cx.stop_propagation();
             return;
         }
-        if let Some(bytes) = terminal_input_bytes(&event.keystroke) {
+        if let Some(input) = terminal_key_input(&event.keystroke) {
             self.clear_terminal_selection();
             self.cursor_blink.reset(Instant::now());
             cx.notify();
-            if let Err(error) = self.driver.input_to(terminal_session_id, bytes) {
+            if let Err(error) = self.driver.key_to(terminal_session_id, input) {
                 self.global_error = Some(error);
                 cx.notify();
             }
@@ -4455,26 +4455,23 @@ fn agent_icon_data(program: AgentProgram) -> &'static [u8] {
     }
 }
 
-fn terminal_input_bytes(key: &Keystroke) -> Option<Vec<u8>> {
-    if key.modifiers.control && key.key.len() == 1 {
-        let byte = key.key.as_bytes()[0].to_ascii_uppercase();
-        (b'@'..=b'_').contains(&byte).then(|| vec![byte - b'@'])
-    } else if key.modifiers.platform || key.modifiers.alt {
-        None
-    } else {
-        match key.key.as_str() {
-            "enter" => Some(vec![b'\r']),
-            "space" => Some(vec![b' ']),
-            "backspace" => Some(vec![0x7f]),
-            "tab" => Some(vec![b'\t']),
-            "escape" => Some(vec![0x1b]),
-            "up" => Some(b"\x1b[A".to_vec()),
-            "down" => Some(b"\x1b[B".to_vec()),
-            "right" => Some(b"\x1b[C".to_vec()),
-            "left" => Some(b"\x1b[D".to_vec()),
-            _ => key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
-        }
+fn terminal_key_input(key: &Keystroke) -> Option<ghostty::KeyInput> {
+    if key.key.is_empty() {
+        return None;
     }
+    let text = key.key_char.as_ref().filter(|text| {
+        !text.chars().any(|character| {
+            character.is_control() || ('\u{f700}'..='\u{f8ff}').contains(&character)
+        })
+    });
+    Some(ghostty::KeyInput {
+        key: key.key.clone(),
+        text: text.cloned(),
+        modifiers: u16::from(key.modifiers.shift)
+            | (u16::from(key.modifiers.control) << 1)
+            | (u16::from(key.modifiers.alt) << 2)
+            | (u16::from(key.modifiers.platform) << 3),
+    })
 }
 
 fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
@@ -4783,7 +4780,7 @@ mod tests {
         normalize_page_scroll_delta, pane_close_shortcut_for, pane_extents,
         prioritized_agent_summary, projected_split_extent, row_cell_is_followed_by_space,
         selection_for_created, selection_for_pane, split_ratio_at, terminal_copy_shortcut_for,
-        terminal_font_with_fallbacks, terminal_input_bytes, terminal_paste_shortcut_for,
+        terminal_font_with_fallbacks, terminal_key_input, terminal_paste_shortcut_for,
         windows_caption_font_for_build,
     };
     use crate::{
@@ -5159,14 +5156,21 @@ mod tests {
     }
 
     #[test]
-    fn named_space_key_maps_to_ascii_space_without_a_key_char() {
+    fn named_space_key_is_forwarded_to_ghostty() {
         let key = Keystroke {
             key: "space".into(),
             key_char: None,
             ..Default::default()
         };
 
-        assert_eq!(terminal_input_bytes(&key), Some(vec![b' ']));
+        assert_eq!(
+            terminal_key_input(&key),
+            Some(crate::ghostty::KeyInput {
+                key: "space".into(),
+                text: None,
+                modifiers: 0,
+            })
+        );
     }
 
     #[test]
@@ -5306,7 +5310,37 @@ mod tests {
             },
         };
 
-        assert_eq!(terminal_input_bytes(&key), Some(vec![0x03]));
+        assert_eq!(
+            terminal_key_input(&key),
+            Some(crate::ghostty::KeyInput {
+                key: "c".into(),
+                text: None,
+                modifiers: 1 << 1,
+            })
+        );
+    }
+
+    #[test]
+    fn alt_word_controls_are_forwarded_to_ghostty() {
+        for name in ["left", "backspace"] {
+            let key = Keystroke {
+                key: name.into(),
+                key_char: None,
+                modifiers: Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            };
+
+            assert_eq!(
+                terminal_key_input(&key),
+                Some(crate::ghostty::KeyInput {
+                    key: name.into(),
+                    text: None,
+                    modifiers: 1 << 2,
+                })
+            );
+        }
     }
 
     #[test]

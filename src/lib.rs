@@ -1,5 +1,6 @@
 mod core_model;
 mod ghostty;
+mod terminal_link;
 
 #[cfg(feature = "gui")]
 mod agent_integration;
