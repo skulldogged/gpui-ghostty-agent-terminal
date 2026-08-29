@@ -1729,11 +1729,16 @@ impl MultiplexerView {
                 .size(px(18.))
                 .rounded_md()
                 .cursor_pointer()
+                .bg(self.shell.opaque_color(if selected {
+                    ShellColor::Selected
+                } else {
+                    ShellColor::Hover
+                }))
                 .opacity(if selected { 1. } else { 0. })
                 .when(!selected, |this| {
                     this.group_hover(hover_group.clone(), |this| this.opacity(1.))
                 })
-                .hover(|this| this.bg(self.shell.control_hover()))
+                .hover(|this| this.bg(self.shell.opaque_color(ShellColor::DangerHover)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -1781,30 +1786,16 @@ impl MultiplexerView {
                                 .flex_1()
                                 .min_w_0()
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .h(px(22.))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(px(13.))
-                                                .font_weight(gpui::FontWeight::NORMAL)
-                                                .text_color(self.shell.color(ShellColor::Text))
-                                                .child(space.name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(if selected { 24. } else { 0. }))
-                                                .when(!selected, |this| {
-                                                    this.group_hover(hover_group.clone(), |this| {
-                                                        this.w(px(24.))
-                                                    })
-                                                }),
-                                        ),
+                                    div().flex().items_center().h(px(22.)).child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(13.))
+                                            .font_weight(gpui::FontWeight::NORMAL)
+                                            .text_color(self.shell.color(ShellColor::Text))
+                                            .child(space.name.clone()),
+                                    ),
                                 )
                                 .when_some(agents, |this, agents| {
                                     this.child(self.render_agent_summary(
@@ -2337,6 +2328,9 @@ impl MultiplexerView {
                 let hover_group: SharedString = format!("tab-hover-{}", tab_id.as_u64()).into();
                 let close_button = div()
                     .id(("close-tab", tab_id.as_u64()))
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(6.))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -2344,9 +2338,16 @@ impl MultiplexerView {
                     .size(px(18.))
                     .rounded_md()
                     .cursor_pointer()
-                    .opacity(0.)
-                    .group_hover(hover_group.clone(), |this| this.opacity(1.))
-                    .hover(|this| this.bg(self.shell.color(ShellColor::DangerHover)))
+                    .bg(self.shell.opaque_color(if selected {
+                        ShellColor::Selected
+                    } else {
+                        ShellColor::Hover
+                    }))
+                    .opacity(if selected { 1. } else { 0. })
+                    .when(!selected, |this| {
+                        this.group_hover(hover_group.clone(), |this| this.opacity(1.))
+                    })
+                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::DangerHover)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -2364,6 +2365,7 @@ impl MultiplexerView {
                     div()
                         .id(("tab", tab_id.as_u64()))
                         .group(hover_group)
+                        .relative()
                         .cursor_pointer()
                         .flex()
                         .items_center()
@@ -4771,17 +4773,17 @@ fn windows_caption_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLAUDE_AGENT_ICON, FallbackClusterBounds, GEMINI_AGENT_ICON, OPENAI_AGENT_ICON,
-        PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry, TERMINAL_PADDING_PX,
-        TerminalGlyphOverflow, UiSelection, accept_terminal_snapshot, agent_icon_data,
-        agent_icon_resting_geometry, agent_icon_transition_geometry, cursor_rects, first_pane_id,
-        fitted_cluster_glyph_position, font_is_terminal_fallback_only,
+        CLAUDE_AGENT_ICON, CloseTarget, FallbackClusterBounds, GEMINI_AGENT_ICON,
+        OPENAI_AGENT_ICON, PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry,
+        TERMINAL_PADDING_PX, TerminalGlyphOverflow, UiSelection, accept_terminal_snapshot,
+        agent_icon_data, agent_icon_resting_geometry, agent_icon_transition_geometry, cursor_rects,
+        first_pane_id, fitted_cluster_glyph_position, font_is_terminal_fallback_only,
         installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
         normalize_page_scroll_delta, pane_close_shortcut_for, pane_extents,
         prioritized_agent_summary, projected_split_extent, row_cell_is_followed_by_space,
         selection_for_created, selection_for_pane, split_ratio_at, terminal_copy_shortcut_for,
         terminal_font_with_fallbacks, terminal_key_input, terminal_paste_shortcut_for,
-        windows_caption_font_for_build,
+        terminal_sessions_for_target, windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
@@ -5376,6 +5378,147 @@ mod tests {
         assert_eq!(selected.space_id, Some(second.snapshot.spaces[0].id));
         assert_eq!(selected.tab_id, Some(second.snapshot.spaces[0].tabs[0].id));
         assert!(selected.pane_id.is_some());
+    }
+
+    #[test]
+    fn selection_falls_back_after_closing_the_selected_tab_and_space() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let first = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "First".into(),
+                    directory: directory.clone(),
+                },
+            )
+            .expect("create first Space");
+        let first_space = first.snapshot.spaces[0].id;
+        let first_tab = first.snapshot.spaces[0].tabs[0].id;
+        let second_tab = model
+            .apply(
+                first.revision,
+                CoreCommand::CreateTab {
+                    space_id: first_space,
+                    name: "Second".into(),
+                },
+            )
+            .expect("create second Tab");
+        let CreatedResource::Tab {
+            tab_id: second_tab_id,
+            pane_id: second_tab_pane,
+            ..
+        } = second_tab.created
+        else {
+            panic!("Tab creation must identify its resources");
+        };
+        let selection = UiSelection {
+            space_id: Some(first_space),
+            tab_id: Some(second_tab_id),
+            pane_id: Some(second_tab_pane),
+        };
+        let closed_tab = model
+            .apply(
+                second_tab.revision,
+                CoreCommand::CloseTab {
+                    tab_id: second_tab_id,
+                },
+            )
+            .expect("close selected Tab");
+        let selection = selection.normalized(&closed_tab.snapshot);
+
+        assert_eq!(selection.space_id, Some(first_space));
+        assert_eq!(selection.tab_id, Some(first_tab));
+        assert!(selection.pane_id.is_some());
+
+        let second_space = model
+            .apply(
+                closed_tab.revision,
+                CoreCommand::CreateSpace {
+                    name: "Second".into(),
+                    directory,
+                },
+            )
+            .expect("create second Space");
+        let CreatedResource::Space {
+            space_id: second_space_id,
+            tab_id: second_space_tab,
+            pane_id: second_space_pane,
+            ..
+        } = second_space.created
+        else {
+            panic!("Space creation must identify its resources");
+        };
+        let selection = UiSelection {
+            space_id: Some(second_space_id),
+            tab_id: Some(second_space_tab),
+            pane_id: Some(second_space_pane),
+        };
+        let closed_space = model
+            .apply(
+                second_space.revision,
+                CoreCommand::CloseSpace {
+                    space_id: second_space_id,
+                },
+            )
+            .expect("close selected Space");
+        let selection = selection.normalized(&closed_space.snapshot);
+
+        assert_eq!(selection.space_id, Some(first_space));
+        assert_eq!(selection.tab_id, Some(first_tab));
+        assert!(selection.pane_id.is_some());
+    }
+
+    #[test]
+    fn close_targets_include_every_terminal_in_the_selected_resource() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut model = CoreModel::new();
+        let initial = model
+            .apply(
+                0,
+                CoreCommand::CreateSpace {
+                    name: "Space".into(),
+                    directory,
+                },
+            )
+            .expect("create Space");
+        let space_id = initial.snapshot.spaces[0].id;
+        let tab_id = initial.snapshot.spaces[0].tabs[0].id;
+        let pane_id = first_pane_id(&initial.snapshot.spaces[0].tabs[0].layout)
+            .expect("initial Tab must contain a Pane");
+        let first_terminal = initial.snapshot.terminal_sessions[0].id;
+        let split = model
+            .apply(
+                initial.revision,
+                CoreCommand::SplitPane {
+                    pane_id,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("split Tab");
+        let CreatedResource::Pane {
+            pane_id: second_pane,
+            terminal_session_id: second_terminal,
+            ..
+        } = split.created
+        else {
+            panic!("split must identify its resources");
+        };
+
+        assert_eq!(
+            terminal_sessions_for_target(&split.snapshot, CloseTarget::Pane(second_pane)),
+            vec![second_terminal]
+        );
+        assert_eq!(
+            terminal_sessions_for_target(&split.snapshot, CloseTarget::Tab(tab_id)),
+            vec![first_terminal, second_terminal]
+        );
+        assert_eq!(
+            terminal_sessions_for_target(&split.snapshot, CloseTarget::Space(space_id)),
+            vec![first_terminal, second_terminal]
+        );
     }
 
     #[test]
