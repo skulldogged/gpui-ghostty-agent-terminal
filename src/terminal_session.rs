@@ -143,6 +143,7 @@ trait TerminalTransport: Send {
     fn pause_reader(&mut self) -> Result<(), String>;
     fn resize(&mut self, size: PtySize) -> Result<(), String>;
     fn resume_reader(&mut self) -> Result<(), String>;
+    fn synchronize_reader(&mut self) -> Result<(), String>;
     fn process_id(&self) -> Option<u32> {
         None
     }
@@ -174,6 +175,10 @@ impl TerminalTransport for PtySession {
 
     fn resume_reader(&mut self) -> Result<(), String> {
         PtySession::resume_reader(self)
+    }
+
+    fn synchronize_reader(&mut self) -> Result<(), String> {
+        PtySession::synchronize_reader(self)
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -231,27 +236,14 @@ impl TerminalSession {
     }
 
     pub(crate) fn scroll(&mut self, input: ghostty::ScrollInput) -> Result<bool, String> {
-        self.process.pause_reader()?;
-        let mut changed = match self.drain_until_reader_paused() {
-            Ok(changed) => changed,
-            Err(error) => {
-                let resume_error = self.process.resume_reader().err();
-                return Err(combine_errors(error, resume_error));
-            }
-        };
-
-        let scroll_result = self.terminal.scroll(input).and_then(|result| {
-            changed |= result.viewport_changed;
-            if !result.input.is_empty() {
-                self.write_process_input(&result.input)?;
-            }
-            Ok(())
-        });
-        let resume_error = self.process.resume_reader().err();
-        match scroll_result {
-            Ok(()) => resume_error.map_or(Ok(changed), Err),
-            Err(error) => Err(combine_errors(error, resume_error)),
+        self.process.synchronize_reader()?;
+        let mut changed = self.drain_until_reader_synchronized()?;
+        let result = self.terminal.scroll(input)?;
+        changed |= result.viewport_changed;
+        if !result.input.is_empty() {
+            self.write_process_input(&result.input)?;
         }
+        Ok(changed)
     }
 
     pub(crate) fn selection_event(
@@ -425,6 +417,9 @@ impl TerminalSession {
                 Ok(PtyOutput::Paused) => {
                     return Err("terminal reader paused outside a resize barrier".into());
                 }
+                Ok(PtyOutput::Synchronized) => {
+                    return Err("terminal reader synchronized outside a scroll barrier".into());
+                }
                 Err(flume::TryRecvError::Empty | flume::TryRecvError::Disconnected) => {
                     return Ok(changed);
                 }
@@ -447,6 +442,31 @@ impl TerminalSession {
                     changed = true;
                 }
                 PtyOutput::Paused => return Ok(changed),
+                PtyOutput::Synchronized => {
+                    return Err("terminal reader synchronized outside a scroll barrier".into());
+                }
+            }
+        }
+    }
+
+    fn drain_until_reader_synchronized(&mut self) -> Result<bool, String> {
+        let mut changed = false;
+        loop {
+            let message = self
+                .output
+                .as_ref()
+                .expect("Terminal Session output is available before drop")
+                .recv()
+                .map_err(|_| "synchronize terminal reader: output stream stopped".to_string())?;
+            match message {
+                PtyOutput::Bytes(bytes) => {
+                    self.feed_process_output(&bytes)?;
+                    changed = true;
+                }
+                PtyOutput::Synchronized => return Ok(changed),
+                PtyOutput::Paused => {
+                    return Err("terminal reader paused outside a resize barrier".into());
+                }
             }
         }
     }
@@ -592,6 +612,12 @@ mod tests {
         fn resume_reader(&mut self) -> Result<(), String> {
             Ok(())
         }
+
+        fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Synchronized)
+                .map_err(|error| format!("synchronize test reader: {error}"))
+        }
     }
 
     impl TerminalTransport for FailingResizeTransport {
@@ -623,6 +649,12 @@ mod tests {
 
         fn resume_reader(&mut self) -> Result<(), String> {
             Ok(())
+        }
+
+        fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Synchronized)
+                .map_err(|error| format!("synchronize test reader: {error}"))
         }
     }
 
@@ -663,6 +695,12 @@ mod tests {
         fn resume_reader(&mut self) -> Result<(), String> {
             Ok(())
         }
+
+        fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Synchronized)
+                .map_err(|error| format!("synchronize test reader: {error}"))
+        }
     }
 
     impl TerminalTransport for OutputDuringResize {
@@ -691,6 +729,12 @@ mod tests {
 
         fn resume_reader(&mut self) -> Result<(), String> {
             Ok(())
+        }
+
+        fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Synchronized)
+                .map_err(|error| format!("synchronize test reader: {error}"))
         }
     }
 
@@ -728,6 +772,13 @@ mod tests {
         fn resume_reader(&mut self) -> Result<(), String> {
             *self.resumed.lock().expect("resume marker mutex poisoned") = true;
             Ok(())
+        }
+
+        fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Bytes(self.output_before_pause.clone()))
+                .and_then(|_| self.output.send(PtyOutput::Synchronized))
+                .map_err(|error| format!("synchronize test reader: {error}"))
         }
     }
 
@@ -1103,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_consumes_mode_changes_accepted_before_the_reader_barrier() {
+    fn scroll_synchronizes_mode_changes_without_pausing_the_reader() {
         let size = TerminalSize::default();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let resumed = Arc::new(Mutex::new(false));
@@ -1137,7 +1188,7 @@ mod tests {
                     cell_height: 20,
                     modifiers: 0,
                 })
-                .expect("scroll through ordered terminal session barrier")
+                .expect("scroll after synchronizing terminal output")
         );
 
         assert_eq!(
@@ -1148,10 +1199,7 @@ mod tests {
             b"\x1b[A",
             "scroll routing must observe preceding alternate-screen mode changes"
         );
-        assert!(
-            *resumed.lock().expect("resume marker mutex poisoned"),
-            "the reader must resume after an ordered scroll"
-        );
+        assert!(!*resumed.lock().expect("resume marker mutex poisoned"));
     }
 
     #[test]

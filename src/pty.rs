@@ -9,12 +9,14 @@ pub struct PtySize {
 pub(crate) enum PtyOutput {
     Bytes(Vec<u8>),
     Paused,
+    Synchronized,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum ReaderControl {
     Pause,
     Resume,
+    Synchronize,
 }
 
 pub(crate) const PROCESS_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -128,6 +130,9 @@ pub(crate) fn reader_checkpoint(
     drain_pending: impl FnOnce() -> bool,
 ) -> bool {
     match control.try_recv() {
+        Ok(ReaderControl::Synchronize) => {
+            drain_pending() && send_or_shutdown(output, shutdown, PtyOutput::Synchronized)
+        }
         Ok(ReaderControl::Pause) => {
             // The marker is an ordering guarantee, not merely an acknowledgement:
             // every byte already readable from the platform PTY must be published first.
@@ -447,6 +452,12 @@ mod unix {
             self.control
                 .send(ReaderControl::Resume)
                 .map_err(|_| "resume PTY reader: reader stopped".to_string())
+        }
+
+        pub fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.control
+                .send(ReaderControl::Synchronize)
+                .map_err(|_| "synchronize PTY reader: reader stopped".to_string())
         }
 
         pub fn process_id(&self) -> Option<u32> {
@@ -802,6 +813,30 @@ mod tests {
         assert!(matches!(
             outputs.recv().expect("receive pause marker"),
             PtyOutput::Paused
+        ));
+    }
+
+    #[test]
+    fn synchronization_drains_platform_output_without_pausing() {
+        let (control, controls) = flume::unbounded();
+        control
+            .send(ReaderControl::Synchronize)
+            .expect("queue synchronization");
+        let (output, outputs) = flume::unbounded();
+        let (_shutdown, shutdown) = flume::bounded::<()>(1);
+
+        assert!(reader_checkpoint(&controls, &output, &shutdown, || {
+            output
+                .send(PtyOutput::Bytes(b"\x1b[?1049h".to_vec()))
+                .is_ok()
+        }));
+        assert!(matches!(
+            outputs.recv().expect("receive buffered platform bytes"),
+            PtyOutput::Bytes(bytes) if bytes == b"\x1b[?1049h"
+        ));
+        assert!(matches!(
+            outputs.recv().expect("receive synchronization marker"),
+            PtyOutput::Synchronized
         ));
     }
 }
