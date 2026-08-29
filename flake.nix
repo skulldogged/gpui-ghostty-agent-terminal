@@ -48,7 +48,10 @@
           version = "0.0.0";
 
           src = self;
-          cargoHash = "sha256-yJpzOC6yG/7aYAL+vPUS8CTmV+a8hB0vckL0/jPD4N0=";
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            allowBuiltinFetchGit = true;
+          };
 
           GHOSTTY_VT_INCLUDE_DIR = "${libghosttyVt.dev}/include";
           GHOSTTY_VT_LIB_DIR = "${libghosttyVt.dev}/lib";
