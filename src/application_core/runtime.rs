@@ -717,6 +717,76 @@ mod tests {
         wait_for_text(&mut runtime, source_terminal, "MOVED_RUNTIME_SESSION");
     }
 
+    #[test]
+    fn closing_tabs_and_spaces_removes_only_their_runtime_terminals() {
+        let directory = std::env::current_dir().expect("current directory");
+        let mut runtime = CoreRuntime::start(&directory, 1).expect("start Core runtime");
+        let initial = runtime.model_snapshot();
+        let source_tab = initial.spaces[0].tabs[0].id;
+        let source_pane = match &initial.spaces[0].tabs[0].layout {
+            PaneLayout::Pane(pane) => pane.id,
+            PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+        };
+        let first_terminal = runtime.default_terminal();
+        let split = runtime
+            .apply(
+                initial.revision,
+                CoreCommand::SplitPane {
+                    pane_id: source_pane,
+                    axis: SplitAxis::Horizontal,
+                    placement: SplitPlacement::After,
+                    ratio: SplitRatio::EQUAL,
+                },
+            )
+            .expect("split source Tab");
+        let CreatedResource::Pane {
+            terminal_session_id: second_terminal,
+            ..
+        } = split.created
+        else {
+            panic!("split must identify its Terminal Session");
+        };
+        let destination = runtime
+            .apply(
+                split.revision,
+                CoreCommand::CreateSpace {
+                    name: "Destination".into(),
+                    directory,
+                },
+            )
+            .expect("create destination Space");
+        let CreatedResource::Space {
+            space_id: destination_space,
+            terminal_session_id: destination_terminal,
+            ..
+        } = destination.created
+        else {
+            panic!("Space creation must identify its resources");
+        };
+
+        let closed_tab = runtime
+            .apply(
+                destination.revision,
+                CoreCommand::CloseTab { tab_id: source_tab },
+            )
+            .expect("close source Tab");
+
+        assert!(!runtime.contains_terminal(first_terminal));
+        assert!(!runtime.contains_terminal(second_terminal));
+        assert!(runtime.contains_terminal(destination_terminal));
+
+        runtime
+            .apply(
+                closed_tab.revision,
+                CoreCommand::CloseSpace {
+                    space_id: destination_space,
+                },
+            )
+            .expect("close destination Space");
+
+        assert!(!runtime.contains_terminal(destination_terminal));
+    }
+
     fn wait_for_text(runtime: &mut CoreRuntime, terminal: TerminalSessionId, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
