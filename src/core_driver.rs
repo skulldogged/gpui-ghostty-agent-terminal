@@ -221,9 +221,9 @@ enum Command {
         command_id: u64,
         command: CoreCommand,
     },
-    Input {
+    Key {
         terminal_session_id: TerminalSessionId,
-        bytes: Vec<u8>,
+        input: crate::ghostty::KeyInput,
     },
     Paste {
         terminal_session_id: TerminalSessionId,
@@ -400,14 +400,14 @@ impl CoreDriver {
         ))
     }
 
-    pub(crate) fn input_to(
+    pub(crate) fn key_to(
         &self,
         terminal_session_id: TerminalSessionId,
-        bytes: Vec<u8>,
+        input: crate::ghostty::KeyInput,
     ) -> Result<(), String> {
-        self.send(Command::Input {
+        self.send(Command::Key {
             terminal_session_id,
-            bytes,
+            input,
         })
     }
 
@@ -538,11 +538,11 @@ fn run_driver(
                 }),
                 Err(error) => Ok(vec![DriverUpdate::CommandRejected { command_id, error }]),
             },
-            DriverEvent::Command(Ok(Command::Input {
+            DriverEvent::Command(Ok(Command::Key {
                 terminal_session_id,
-                bytes,
+                input,
             })) => core
-                .input_to(terminal_session_id, &bytes)
+                .key_to(terminal_session_id, input)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
             DriverEvent::Command(Ok(Command::Paste {
@@ -945,47 +945,51 @@ mod tests {
     }
 
     #[test]
-    fn input_command_is_a_barrier_between_resize_batches() {
+    fn key_command_is_a_barrier_between_resize_batches() {
         let (queue, commands) = flume::unbounded();
         let sender = DriverCommandSender::new(queue);
         let terminal_session_id = TerminalSessionId::from_u64(7);
-        let before_input = TerminalSize::new(80, 24, 9, 20);
-        let after_input = TerminalSize::new(120, 36, 9, 20);
+        let before_key = TerminalSize::new(80, 24, 9, 20);
+        let after_key = TerminalSize::new(120, 36, 9, 20);
 
         sender
-            .resize(terminal_session_id, before_input)
-            .expect("queue resize before input");
+            .resize(terminal_session_id, before_key)
+            .expect("queue resize before key");
         sender
-            .send(Command::Input {
+            .send(Command::Key {
                 terminal_session_id,
-                bytes: vec![b'x'],
+                input: crate::ghostty::KeyInput {
+                    key: "x".into(),
+                    text: Some("x".into()),
+                    modifiers: 0,
+                },
             })
-            .expect("queue input barrier");
+            .expect("queue key barrier");
         sender
-            .resize(terminal_session_id, after_input)
-            .expect("queue resize after input");
+            .resize(terminal_session_id, after_key)
+            .expect("queue resize after key");
 
         let first_batch_id = match commands.recv().expect("first command") {
             Command::ResizeBatch { batch_id } => batch_id,
-            _ => panic!("first command must be the pre-input resize"),
+            _ => panic!("first command must be the pre-key resize"),
         };
         assert!(matches!(
             commands.recv().expect("second command"),
-            Command::Input { .. }
+            Command::Key { .. }
         ));
         let second_batch_id = match commands.recv().expect("third command") {
             Command::ResizeBatch { batch_id } => batch_id,
-            _ => panic!("third command must be the post-input resize"),
+            _ => panic!("third command must be the post-key resize"),
         };
         let mut batches = sender.resize_batches.lock().expect("resize mutex");
 
         assert_eq!(
             batches.take_batch(first_batch_id).expect("first batch"),
-            vec![(terminal_session_id, before_input)]
+            vec![(terminal_session_id, before_key)]
         );
         assert_eq!(
             batches.take_batch(second_batch_id).expect("second batch"),
-            vec![(terminal_session_id, after_input)]
+            vec![(terminal_session_id, after_key)]
         );
     }
 }

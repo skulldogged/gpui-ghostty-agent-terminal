@@ -11,6 +11,8 @@ struct SpikeTerminal {
   GhosttyRenderStateRowCells cells;
   GhosttyMouseEncoder mouse_encoder;
   GhosttyMouseEvent mouse_event;
+  GhosttyKeyEncoder key_encoder;
+  GhosttyKeyEvent key_event;
   GhosttySelectionGesture selection_gesture;
   GhosttySelectionGestureEvent selection_press;
   GhosttySelectionGestureEvent selection_drag;
@@ -92,6 +94,8 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
       !success(ghostty_render_state_row_cells_new(NULL, &spike->cells)) ||
       !success(ghostty_mouse_encoder_new(NULL, &spike->mouse_encoder)) ||
       !success(ghostty_mouse_event_new(NULL, &spike->mouse_event)) ||
+      !success(ghostty_key_encoder_new(NULL, &spike->key_encoder)) ||
+      !success(ghostty_key_event_new(NULL, &spike->key_event)) ||
       !success(ghostty_selection_gesture_new(NULL,
                                              &spike->selection_gesture)) ||
       !success(ghostty_selection_gesture_event_new(
@@ -119,6 +123,8 @@ void spike_terminal_free(SpikeTerminal* spike) {
   ghostty_selection_gesture_event_free(spike->selection_drag);
   ghostty_selection_gesture_event_free(spike->selection_press);
   ghostty_selection_gesture_free(spike->selection_gesture, spike->terminal);
+  ghostty_key_event_free(spike->key_event);
+  ghostty_key_encoder_free(spike->key_encoder);
   ghostty_mouse_event_free(spike->mouse_event);
   ghostty_mouse_encoder_free(spike->mouse_encoder);
   ghostty_render_state_row_cells_free(spike->cells);
@@ -244,6 +250,143 @@ int spike_terminal_encode_paste(SpikeTerminal* spike, uint8_t* data,
 
   return ghostty_paste_encode((char*)data, data_len, bracketed, (char*)output,
                                output_len, output_written);
+}
+
+static bool key_name_is(const SpikeKeyInput* input, const char* name) {
+  size_t len = strlen(name);
+  return input->key_len == len && memcmp(input->key, name, len) == 0;
+}
+
+static GhosttyKey spike_key(const SpikeKeyInput* input,
+                            uint32_t* unshifted_codepoint) {
+  *unshifted_codepoint = 0;
+  if (input->key_len == 1) {
+    uint8_t key = input->key[0];
+    if (key >= 'A' && key <= 'Z') key = (uint8_t)(key - 'A' + 'a');
+    if (key >= 'a' && key <= 'z') {
+      *unshifted_codepoint = key;
+      return (GhosttyKey)(GHOSTTY_KEY_A + key - 'a');
+    }
+    if (key >= '0' && key <= '9') {
+      *unshifted_codepoint = key;
+      return (GhosttyKey)(GHOSTTY_KEY_DIGIT_0 + key - '0');
+    }
+
+    struct SymbolKey {
+      const char* symbols;
+      GhosttyKey key;
+      uint32_t codepoint;
+    };
+    static const struct SymbolKey symbols[] = {
+        {"`~", GHOSTTY_KEY_BACKQUOTE, '`'},
+        {"\\|", GHOSTTY_KEY_BACKSLASH, '\\'},
+        {"[{", GHOSTTY_KEY_BRACKET_LEFT, '['},
+        {"]}", GHOSTTY_KEY_BRACKET_RIGHT, ']'},
+        {",<", GHOSTTY_KEY_COMMA, ','},
+        {"=+", GHOSTTY_KEY_EQUAL, '='},
+        {"-_", GHOSTTY_KEY_MINUS, '-'},
+        {".>", GHOSTTY_KEY_PERIOD, '.'},
+        {"'\"", GHOSTTY_KEY_QUOTE, '\''},
+        {";:", GHOSTTY_KEY_SEMICOLON, ';'},
+        {"/?", GHOSTTY_KEY_SLASH, '/'},
+        {")", GHOSTTY_KEY_DIGIT_0, '0'},
+        {"!", GHOSTTY_KEY_DIGIT_1, '1'},
+        {"@", GHOSTTY_KEY_DIGIT_2, '2'},
+        {"#", GHOSTTY_KEY_DIGIT_3, '3'},
+        {"$", GHOSTTY_KEY_DIGIT_4, '4'},
+        {"%", GHOSTTY_KEY_DIGIT_5, '5'},
+        {"^", GHOSTTY_KEY_DIGIT_6, '6'},
+        {"&", GHOSTTY_KEY_DIGIT_7, '7'},
+        {"*", GHOSTTY_KEY_DIGIT_8, '8'},
+        {"(", GHOSTTY_KEY_DIGIT_9, '9'},
+    };
+    for (size_t i = 0; i < sizeof(symbols) / sizeof(symbols[0]); ++i) {
+      if (strchr(symbols[i].symbols, key) != NULL) {
+        *unshifted_codepoint = symbols[i].codepoint;
+        return symbols[i].key;
+      }
+    }
+  }
+
+  struct NamedKey {
+    const char* name;
+    GhosttyKey key;
+    uint32_t codepoint;
+  };
+  static const struct NamedKey names[] = {
+      {"backspace", GHOSTTY_KEY_BACKSPACE, 0x08},
+      {"delete", GHOSTTY_KEY_DELETE, 0x7f},
+      {"down", GHOSTTY_KEY_ARROW_DOWN, 0},
+      {"end", GHOSTTY_KEY_END, 0},
+      {"enter", GHOSTTY_KEY_ENTER, '\r'},
+      {"escape", GHOSTTY_KEY_ESCAPE, 0x1b},
+      {"home", GHOSTTY_KEY_HOME, 0},
+      {"insert", GHOSTTY_KEY_INSERT, 0},
+      {"left", GHOSTTY_KEY_ARROW_LEFT, 0},
+      {"pagedown", GHOSTTY_KEY_PAGE_DOWN, 0},
+      {"pageup", GHOSTTY_KEY_PAGE_UP, 0},
+      {"right", GHOSTTY_KEY_ARROW_RIGHT, 0},
+      {"space", GHOSTTY_KEY_SPACE, ' '},
+      {"tab", GHOSTTY_KEY_TAB, '\t'},
+      {"up", GHOSTTY_KEY_ARROW_UP, 0},
+      {"back", GHOSTTY_KEY_BROWSER_BACK, 0},
+      {"forward", GHOSTTY_KEY_BROWSER_FORWARD, 0},
+      {"copy", GHOSTTY_KEY_COPY, 0},
+      {"cut", GHOSTTY_KEY_CUT, 0},
+      {"paste", GHOSTTY_KEY_PASTE, 0},
+  };
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    if (key_name_is(input, names[i].name)) {
+      *unshifted_codepoint = names[i].codepoint;
+      return names[i].key;
+    }
+  }
+
+  if (input->key_len >= 2 && input->key_len <= 3 && input->key[0] == 'f') {
+    unsigned int number = 0;
+    for (size_t i = 1; i < input->key_len; ++i) {
+      if (input->key[i] < '0' || input->key[i] > '9') {
+        return GHOSTTY_KEY_UNIDENTIFIED;
+      }
+      number = number * 10 + (unsigned int)(input->key[i] - '0');
+    }
+    if (number >= 1 && number <= 25) {
+      return (GhosttyKey)(GHOSTTY_KEY_F1 + number - 1);
+    }
+  }
+  return GHOSTTY_KEY_UNIDENTIFIED;
+}
+
+int spike_terminal_encode_key(SpikeTerminal* spike,
+                              const SpikeKeyInput* input, uint8_t* output,
+                              size_t output_len, size_t* output_written) {
+  if (spike == NULL || input == NULL || input->key == NULL ||
+      (input->text == NULL && input->text_len > 0) ||
+      (output == NULL && output_len > 0) || output_written == NULL) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+
+  uint32_t unshifted_codepoint = 0;
+  GhosttyKey key = spike_key(input, &unshifted_codepoint);
+  ghostty_key_event_set_action(spike->key_event, GHOSTTY_KEY_ACTION_PRESS);
+  ghostty_key_event_set_key(spike->key_event, key);
+  ghostty_key_event_set_mods(spike->key_event, input->modifiers);
+  ghostty_key_event_set_consumed_mods(
+      spike->key_event,
+      input->text_len > 0 ? input->modifiers & GHOSTTY_MODS_SHIFT : 0);
+  ghostty_key_event_set_composing(spike->key_event, false);
+  ghostty_key_event_set_utf8(spike->key_event, (const char*)input->text,
+                             input->text_len);
+  ghostty_key_event_set_unshifted_codepoint(spike->key_event,
+                                            unshifted_codepoint);
+
+  ghostty_key_encoder_setopt_from_terminal(spike->key_encoder, spike->terminal);
+  GhosttyOptionAsAlt option_as_alt = GHOSTTY_OPTION_AS_ALT_TRUE;
+  ghostty_key_encoder_setopt(spike->key_encoder,
+                             GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT,
+                             &option_as_alt);
+  return ghostty_key_encoder_encode(spike->key_encoder, spike->key_event,
+                                    (char*)output, output_len, output_written);
 }
 
 static GhosttyResult scroll_viewport(SpikeTerminal* spike,
@@ -437,6 +580,126 @@ int spike_terminal_selection_event(SpikeTerminal* spike,
   }
 
   return GHOSTTY_INVALID_VALUE;
+}
+
+static GhosttyResult line_selection_at(SpikeTerminal* spike,
+                                       GhosttyGridRef ref,
+                                       GhosttySelection* out_selection) {
+  static const uint32_t no_whitespace[] = {0};
+  GhosttyTerminalSelectLineOptions options =
+      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+  options.ref = ref;
+  options.whitespace = no_whitespace;
+  options.whitespace_len = 1;
+  options.semantic_prompt_boundary = true;
+
+  GhosttySelection line = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyResult result =
+      ghostty_terminal_select_line(spike->terminal, &options, &line);
+  if (!success(result)) return result;
+  return ghostty_terminal_selection_ordered(
+      spike->terminal, &line, GHOSTTY_SELECTION_ORDER_FORWARD, out_selection);
+}
+
+static GhosttyResult format_selection(SpikeTerminal* spike,
+                                      const GhosttySelection* selection,
+                                      uint8_t* output, size_t output_len,
+                                      size_t* output_written) {
+  GhosttyTerminalSelectionFormatOptions options =
+      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
+  options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  options.unwrap = true;
+  options.trim = false;
+  options.selection = selection;
+  return ghostty_terminal_selection_format_buf(
+      spike->terminal, options, output, output_len, output_written);
+}
+
+static GhosttyResult selection_length(SpikeTerminal* spike,
+                                      const GhosttySelection* selection,
+                                      size_t* length) {
+  GhosttyResult result = format_selection(spike, selection, NULL, 0, length);
+  return result == GHOSTTY_OUT_OF_SPACE ? GHOSTTY_SUCCESS : result;
+}
+
+int spike_terminal_link_context(SpikeTerminal* spike, uint16_t x, uint16_t y,
+                                uint8_t* output, size_t output_len,
+                                size_t* output_written,
+                                size_t* click_offset) {
+  if (spike == NULL || output_written == NULL || click_offset == NULL ||
+      (output == NULL && output_len > 0)) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+
+  GhosttyGridRef ref;
+  GhosttyResult result = selection_ref_at(spike, x, y, &ref);
+  if (!success(result)) return result;
+  GhosttySelection line = GHOSTTY_INIT_SIZED(GhosttySelection);
+  result = line_selection_at(spike, ref, &line);
+  if (!success(result)) return result;
+
+  GhosttySelection prefix = line;
+  prefix.end = ref;
+  size_t prefix_len = 0;
+  result = selection_length(spike, &prefix, &prefix_len);
+  if (!success(result)) return result;
+  *click_offset = prefix_len == 0 ? 0 : prefix_len - 1;
+  return format_selection(spike, &line, output, output_len, output_written);
+}
+
+int spike_terminal_select_link(SpikeTerminal* spike, uint16_t x, uint16_t y,
+                               size_t match_start, size_t match_end,
+                               bool* selected) {
+  if (spike == NULL || selected == NULL || match_start >= match_end) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  *selected = false;
+
+  GhosttyGridRef ref;
+  GhosttyResult result = selection_ref_at(spike, x, y, &ref);
+  if (!success(result)) return result;
+  GhosttySelection line = GHOSTTY_INIT_SIZED(GhosttySelection);
+  result = line_selection_at(spike, ref, &line);
+  if (!success(result)) return result;
+  size_t line_len = 0;
+  result = selection_length(spike, &line, &line_len);
+  if (!success(result)) return result;
+  if (match_end > line_len) return GHOSTTY_INVALID_VALUE;
+
+  GhosttySelection prefix = GHOSTTY_INIT_SIZED(GhosttySelection);
+  prefix.start = line.start;
+  prefix.end = line.start;
+  GhosttyGridRef match_start_ref;
+  bool found_start = false;
+  for (size_t index = 0; index <= line_len; ++index) {
+    size_t prefix_len = 0;
+    result = selection_length(spike, &prefix, &prefix_len);
+    if (!success(result)) return result;
+    if (!found_start && match_start < prefix_len) {
+      match_start_ref = prefix.end;
+      found_start = true;
+    }
+    if (found_start && match_end <= prefix_len) {
+      GhosttySelection link = GHOSTTY_INIT_SIZED(GhosttySelection);
+      link.start = match_start_ref;
+      link.end = prefix.end;
+      result = ghostty_terminal_set(
+          spike->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &link);
+      if (!success(result)) return result;
+      *selected = true;
+      return GHOSTTY_SUCCESS;
+    }
+
+    bool at_end = false;
+    result = ghostty_terminal_selection_equal(
+        spike->terminal, &prefix, &line, &at_end);
+    if (!success(result)) return result;
+    if (at_end) return GHOSTTY_SUCCESS;
+    result = ghostty_terminal_selection_adjust(
+        spike->terminal, &prefix, GHOSTTY_SELECTION_ADJUST_RIGHT);
+    if (!success(result)) return result;
+  }
+  return GHOSTTY_SUCCESS;
 }
 
 int spike_terminal_selection_text(SpikeTerminal* spike, uint8_t* output,
