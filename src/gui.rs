@@ -15,7 +15,7 @@ use crate::{
         CellMetrics, GridDimensions, fixed_cell_glyph_x, font_points_to_pixels,
         measured_cell_height, measured_cell_width,
     },
-    terminal_selection::{point_for_position, selection_rows},
+    terminal_selection::{SelectionRow, point_for_position, selection_rows},
     ui_shell::{ShellColor, ShellIcon, WorkspaceShell},
 };
 use gpui::{
@@ -88,6 +88,9 @@ pub(crate) fn open_terminal_window(
                 available_fonts,
                 requested_sizes: HashMap::new(),
                 terminal_scroll_remainders: HashMap::new(),
+                pending_terminal_scrolls: HashMap::new(),
+                terminal_scroll_flush_scheduled: false,
+                terminal_render_cache: HashMap::new(),
                 terminal_bounds: Arc::new(Mutex::new(HashMap::new())),
                 terminal_selection_drag: None,
                 move_source: None,
@@ -137,6 +140,9 @@ struct MultiplexerView {
     available_fonts: Vec<String>,
     requested_sizes: HashMap<TerminalSessionId, TerminalSize>,
     terminal_scroll_remainders: HashMap<TerminalSessionId, ScrollRemainder>,
+    pending_terminal_scrolls: HashMap<TerminalSessionId, Vec<ghostty::ScrollInput>>,
+    terminal_scroll_flush_scheduled: bool,
+    terminal_render_cache: HashMap<TerminalSessionId, CachedTerminalRender>,
     terminal_bounds: Arc<Mutex<HashMap<PaneId, Bounds<Pixels>>>>,
     terminal_selection_drag: Option<TerminalSelectionDrag>,
     move_source: Option<PaneId>,
@@ -180,6 +186,21 @@ struct SplitGeometry {
 struct ScrollRemainder {
     x: f32,
     y: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalRenderKey {
+    revision: u64,
+    inactive: bool,
+    cursor_visible: bool,
+    selection_foreground: [u8; 3],
+}
+
+struct CachedTerminalRender {
+    key: TerminalRenderKey,
+    frame: Arc<TerminalFrame>,
+    shaped_rows: Arc<Vec<ShapedLine>>,
+    selection_rows: Arc<Vec<SelectionRow>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -437,6 +458,46 @@ fn terminal_text_runs(
     }
 
     runs
+}
+
+fn shape_terminal_rows(
+    rows: &[FrameRow],
+    previous: Option<&CachedTerminalRender>,
+    terminal_font: &TerminalFont,
+    window: &Window,
+) -> Vec<ShapedLine> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            if let Some(previous) = previous
+                && let Some(previous_index) =
+                    reusable_shaped_row_index(&previous.frame.rows, row, row_index)
+                && let Some(shaped) = previous.shaped_rows.get(previous_index)
+            {
+                return shaped.clone();
+            }
+
+            let runs = terminal_text_runs(row, terminal_font, window);
+            window.text_system().shape_line(
+                row.text.clone().into(),
+                terminal_font.size,
+                &runs,
+                None,
+            )
+        })
+        .collect()
+}
+
+fn reusable_shaped_row_index(
+    previous_rows: &[FrameRow],
+    row: &FrameRow,
+    preferred_index: usize,
+) -> Option<usize> {
+    previous_rows
+        .get(preferred_index)
+        .filter(|previous| *previous == row)
+        .map(|_| preferred_index)
+        .or_else(|| previous_rows.iter().position(|previous| previous == row))
 }
 
 impl TerminalFont {
@@ -777,6 +838,10 @@ impl MultiplexerView {
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
         self.terminal_scroll_remainders
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+        self.pending_terminal_scrolls
+            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+        self.terminal_render_cache
+            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
     }
 
     fn on_terminal_scroll(
@@ -784,6 +849,7 @@ impl MultiplexerView {
         pane_id: PaneId,
         terminal_session_id: TerminalSessionId,
         event: &ScrollWheelEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let remainder = self
@@ -855,11 +921,37 @@ impl MultiplexerView {
             cell_height: self.terminal_font.cells.height_px().round().max(1.0) as u32,
             modifiers,
         };
-        if let Err(error) = self.driver.scroll_terminal(terminal_session_id, input) {
-            self.global_error = Some(error);
-            cx.notify();
+        coalesce_scroll_input(
+            self.pending_terminal_scrolls
+                .entry(terminal_session_id)
+                .or_default(),
+            input,
+        );
+        if !self.terminal_scroll_flush_scheduled {
+            self.terminal_scroll_flush_scheduled = true;
+            cx.on_next_frame(window, |view, _window, cx| {
+                view.flush_terminal_scrolls(cx);
+            });
         }
         cx.stop_propagation();
+    }
+
+    fn flush_terminal_scrolls(&mut self, cx: &mut Context<Self>) -> bool {
+        self.terminal_scroll_flush_scheduled = false;
+        let mut pending = std::mem::take(&mut self.pending_terminal_scrolls)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending.sort_unstable_by_key(|(terminal_session_id, _)| *terminal_session_id);
+        for (terminal_session_id, inputs) in pending {
+            for input in inputs {
+                if let Err(error) = self.driver.scroll_terminal(terminal_session_id, input) {
+                    self.global_error = Some(error);
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -890,6 +982,10 @@ impl MultiplexerView {
             self.settings_open = false;
             self.focus.focus(window, cx);
             cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !self.flush_terminal_scrolls(cx) {
             cx.stop_propagation();
             return;
         }
@@ -1028,6 +1124,7 @@ impl MultiplexerView {
         match TerminalFont::resolve(&self.settings, cx) {
             Ok(font) => {
                 self.terminal_font = font;
+                self.terminal_render_cache.clear();
                 self.requested_sizes.clear();
                 self.save_settings(cx);
             }
@@ -1128,6 +1225,9 @@ impl MultiplexerView {
             self.terminal_selection_drag = None;
             return;
         }
+        if !self.flush_terminal_scrolls(cx) {
+            return;
+        }
         let Some((terminal_session_id, input, _)) = self.terminal_selection_input_at(
             pane_id,
             event.position,
@@ -1149,6 +1249,9 @@ impl MultiplexerView {
     }
 
     fn update_terminal_selection_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.flush_terminal_scrolls(cx) {
+            return;
+        }
         let Some(drag) = self.terminal_selection_drag else {
             return;
         };
@@ -1187,6 +1290,9 @@ impl MultiplexerView {
     }
 
     fn finish_terminal_selection(&mut self, _position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.flush_terminal_scrolls(cx) {
+            return;
+        }
         let Some(drag) = self.terminal_selection_drag.take() else {
             return;
         };
@@ -1414,6 +1520,9 @@ impl MultiplexerView {
     }
 
     fn close_target(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_terminal_scrolls(cx) {
+            return;
+        }
         if !self.close_target_exists(target) {
             return;
         }
@@ -3141,9 +3250,14 @@ impl MultiplexerView {
             .child(label)
     }
 
-    fn render_selected_layout(&self, cx: &mut Context<Self>) -> AnyElement {
-        match self.selected_tab() {
-            Some(tab) => self.render_pane_layout(&tab.layout, cx),
+    fn render_selected_layout(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let layout = self.selected_tab().map(|tab| tab.layout.clone());
+        match layout.as_ref() {
+            Some(layout) => self.render_pane_layout(layout, window, cx),
             None => div()
                 .size_full()
                 .flex()
@@ -3198,12 +3312,17 @@ impl MultiplexerView {
             .into_any_element()
     }
 
-    fn render_pane_layout(&self, layout: &PaneLayout, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pane_layout(
+        &mut self,
+        layout: &PaneLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match layout {
-            PaneLayout::Pane(pane) => self.render_terminal_pane(pane, cx),
+            PaneLayout::Pane(pane) => self.render_terminal_pane(pane, window, cx),
             PaneLayout::Split(split) => {
-                let first = self.render_pane_layout(&split.first, cx);
-                let second = self.render_pane_layout(&split.second, cx);
+                let first = self.render_pane_layout(&split.first, window, cx);
+                let second = self.render_pane_layout(&split.second, window, cx);
                 let projected_extent = self
                     .split_geometries
                     .get(&split.id)
@@ -3264,8 +3383,9 @@ impl MultiplexerView {
     }
 
     fn render_terminal_pane(
-        &self,
+        &mut self,
         pane: &crate::PaneSnapshot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pane_id = pane.id;
@@ -3291,41 +3411,63 @@ impl MultiplexerView {
             snapshot.cursor_blinking,
             self.cursor_blink.visible,
         );
-        let mut frame = if inactive {
-            TerminalFrame::from_snapshot_with_cursor(snapshot, cursor_visible)
-                .dimmed_toward(snapshot.default_bg, INACTIVE_PANE_CONTRAST)
-        } else {
-            TerminalFrame::from_snapshot_with_cursor(snapshot, cursor_visible)
-        };
-        let selection_rows = selection_rows(snapshot);
         let terminal_theme = self.settings.theme.terminal_theme();
-        frame.apply_selection_foreground(&selection_rows, terminal_theme.selection_foreground);
         let selection_background = color(terminal_theme.selection_background);
         let default_bg = self.shell.terminal_background(color(snapshot.default_bg));
+        let render_key = TerminalRenderKey {
+            revision: snapshot.revision,
+            inactive,
+            cursor_visible,
+            selection_foreground: terminal_theme.selection_foreground,
+        };
+        let next_render = (self
+            .terminal_render_cache
+            .get(&terminal_session_id)
+            .is_none_or(|cached| cached.key != render_key))
+        .then(|| {
+            let mut frame = if inactive {
+                TerminalFrame::from_snapshot_with_cursor(snapshot, cursor_visible)
+                    .dimmed_toward(snapshot.default_bg, INACTIVE_PANE_CONTRAST)
+            } else {
+                TerminalFrame::from_snapshot_with_cursor(snapshot, cursor_visible)
+            };
+            let selection_rows = selection_rows(snapshot);
+            frame.apply_selection_foreground(&selection_rows, terminal_theme.selection_foreground);
+            (frame, selection_rows)
+        });
+
+        if let Some((frame, selection_rows)) = next_render {
+            let previous = self.terminal_render_cache.remove(&terminal_session_id);
+            let shaped_rows =
+                shape_terminal_rows(&frame.rows, previous.as_ref(), &self.terminal_font, window);
+            self.terminal_render_cache.insert(
+                terminal_session_id,
+                CachedTerminalRender {
+                    key: render_key,
+                    frame: Arc::new(frame),
+                    shaped_rows: Arc::new(shaped_rows),
+                    selection_rows: Arc::new(selection_rows),
+                },
+            );
+        }
+        let cached = self
+            .terminal_render_cache
+            .get(&terminal_session_id)
+            .expect("terminal render cache is populated before painting");
+        let frame = Arc::clone(&cached.frame);
+        let shaped_rows = Arc::clone(&cached.shaped_rows);
+        let selection_rows = Arc::clone(&cached.selection_rows);
         let terminal_font = self.terminal_font.clone();
         let paint_font = terminal_font.clone();
         let terminal_bounds = Arc::clone(&self.terminal_bounds);
         let terminal_glyph_overflow = self.settings.terminal_glyph_overflow;
-        let shape_frame = frame.clone();
         let terminal_canvas = canvas(
-            move |bounds, window, _cx| {
+            move |bounds, _window, _cx| {
                 terminal_bounds
                     .lock()
                     .expect("terminal bounds mutex poisoned")
                     .insert(pane_id, bounds);
-                shape_frame
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        let runs = terminal_text_runs(row, &terminal_font, window);
-                        window.text_system().shape_line(
-                            row.text.clone().into(),
-                            terminal_font.size,
-                            &runs,
-                            None,
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                shaped_rows.as_ref().clone()
             },
             move |bounds, lines, window, _cx| {
                 for background in &frame.opaque_backgrounds {
@@ -3345,7 +3487,7 @@ impl MultiplexerView {
                         color(background.color),
                     ));
                 }
-                for selection in &selection_rows {
+                for selection in selection_rows.iter() {
                     window.paint_quad(fill(
                         Bounds::new(
                             point(
@@ -3423,8 +3565,8 @@ impl MultiplexerView {
                     view.start_terminal_selection(pane_id, event, window, cx)
                 }),
             )
-            .on_scroll_wheel(cx.listener(move |view, event, _window, cx| {
-                view.on_terminal_scroll(pane_id, terminal_session_id, event, cx)
+            .on_scroll_wheel(cx.listener(move |view, event, window, cx| {
+                view.on_terminal_scroll(pane_id, terminal_session_id, event, window, cx)
             }))
             .child(terminal_canvas)
             .when_some(
@@ -3614,7 +3756,7 @@ impl Render for MultiplexerView {
                             .min_h_0()
                             .min_w_0()
                             .w_full()
-                            .child(self.render_selected_layout(cx)),
+                            .child(self.render_selected_layout(window, cx)),
                     )
                     .into_any_element()
             })
@@ -4573,6 +4715,36 @@ fn color(rgb_bytes: [u8; 3]) -> gpui::Rgba {
     rgb((u32::from(rgb_bytes[0]) << 16) | (u32::from(rgb_bytes[1]) << 8) | u32::from(rgb_bytes[2]))
 }
 
+fn coalesce_scroll_input(pending: &mut Vec<ghostty::ScrollInput>, input: ghostty::ScrollInput) {
+    if let Some(previous) = pending.last_mut()
+        && scroll_inputs_are_compatible(*previous, input)
+    {
+        previous.delta_rows = previous.delta_rows.saturating_add(input.delta_rows);
+        previous.delta_columns = previous.delta_columns.saturating_add(input.delta_columns);
+        return;
+    }
+    pending.push(input);
+}
+
+fn scroll_inputs_are_compatible(
+    previous: ghostty::ScrollInput,
+    next: ghostty::ScrollInput,
+) -> bool {
+    same_scroll_direction(previous.delta_rows, next.delta_rows)
+        && same_scroll_direction(previous.delta_columns, next.delta_columns)
+        && previous.pointer_x.to_bits() == next.pointer_x.to_bits()
+        && previous.pointer_y.to_bits() == next.pointer_y.to_bits()
+        && previous.viewport_width == next.viewport_width
+        && previous.viewport_height == next.viewport_height
+        && previous.cell_width == next.cell_width
+        && previous.cell_height == next.cell_height
+        && previous.modifiers == next.modifiers
+}
+
+fn same_scroll_direction(previous: isize, next: isize) -> bool {
+    previous == 0 || next == 0 || previous.signum() == next.signum()
+}
+
 fn normalize_page_scroll_delta(delta: f32, page_cells: u16) -> f32 {
     if delta.abs() >= WINDOWS_PAGE_SCROLL_SENTINEL_MIN {
         delta.signum() * f32::from(page_cells.max(1))
@@ -4618,6 +4790,7 @@ mod tests {
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
         PaneLayout, SplitAxis, SplitPlacement, SplitRatio, TabId, TerminalCursorShape,
         TerminalLifecycle, TerminalSessionId, TerminalSize, TerminalSnapshot,
+        ghostty::ScrollInput,
         terminal_frame::{FrameRow, GlyphCell},
     };
     use gpui::{Keystroke, Modifiers};
@@ -4628,6 +4801,76 @@ mod tests {
         assert_eq!(normalize_page_scroll_delta(u32::MAX as f32, 24), 24.0);
         assert_eq!(normalize_page_scroll_delta(-(u32::MAX as f32), 80), -80.0);
         assert_eq!(normalize_page_scroll_delta(120.0, 24), 120.0);
+    }
+
+    #[test]
+    fn precision_scroll_burst_coalesces_to_one_terminal_operation() {
+        let mut pending = Vec::new();
+        for _ in 0..128 {
+            super::coalesce_scroll_input(&mut pending, scroll_input(-1, 0, 0));
+        }
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delta_rows, -128);
+    }
+
+    #[test]
+    fn scroll_direction_and_modifier_changes_remain_ordering_boundaries() {
+        let mut pending = Vec::new();
+        super::coalesce_scroll_input(&mut pending, scroll_input(-2, 0, 0));
+        super::coalesce_scroll_input(&mut pending, scroll_input(1, 0, 0));
+        super::coalesce_scroll_input(&mut pending, scroll_input(1, 0, 1));
+
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].delta_rows, -2);
+        assert_eq!(pending[1].delta_rows, 1);
+        assert_eq!(pending[2].modifiers, 1);
+    }
+
+    #[test]
+    fn shaped_rows_are_reused_when_scrollback_moves_them() {
+        let first = FrameRow {
+            text: "first".into(),
+            runs: Vec::new(),
+            glyph_cells: Vec::new(),
+        };
+        let second = FrameRow {
+            text: "second".into(),
+            runs: Vec::new(),
+            glyph_cells: Vec::new(),
+        };
+        let previous = vec![first, second.clone()];
+
+        assert_eq!(
+            super::reusable_shaped_row_index(&previous, &second, 0),
+            Some(1)
+        );
+        assert_eq!(
+            super::reusable_shaped_row_index(
+                &previous,
+                &FrameRow {
+                    text: "new".into(),
+                    runs: Vec::new(),
+                    glyph_cells: Vec::new(),
+                },
+                0,
+            ),
+            None
+        );
+    }
+
+    fn scroll_input(delta_rows: isize, delta_columns: isize, modifiers: u16) -> ScrollInput {
+        ScrollInput {
+            delta_rows,
+            delta_columns,
+            pointer_x: 12.,
+            pointer_y: 18.,
+            viewport_width: 800,
+            viewport_height: 480,
+            cell_width: 10,
+            cell_height: 20,
+            modifiers,
+        }
     }
 
     #[test]
