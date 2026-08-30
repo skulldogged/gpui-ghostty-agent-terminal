@@ -341,29 +341,17 @@ impl TerminalSession {
 
     fn resize_while_reader_paused(&mut self, size: TerminalSize) -> Result<(), String> {
         let previous_size = self.size;
+        if !self.pending_response.is_empty() {
+            return Err("terminal response is waiting for process input capacity".into());
+        }
+        self.process.resize(size.pty_size())?;
         let response = match self.resize_terminal_state(size) {
             Ok(response) => response,
             Err(error) => {
-                let rollback_error = self.resize_terminal_state(previous_size).err();
+                let rollback_error = self.process.resize(previous_size.pty_size()).err();
                 return Err(combine_errors(error, rollback_error));
             }
         };
-        if !self.pending_response.is_empty() {
-            let rollback_error = self.resize_terminal_state(previous_size).err();
-            return Err(combine_errors(
-                "terminal response is waiting for process input capacity".into(),
-                rollback_error,
-            ));
-        }
-        if let Err(process_error) = self.process.resize(size.pty_size()) {
-            let rollback = self.resize_terminal_state(previous_size).map(|_| ());
-            return match rollback {
-                Ok(()) => Err(process_error),
-                Err(rollback_error) => Err(format!(
-                    "{process_error}; also failed to restore terminal geometry: {rollback_error}"
-                )),
-            };
-        }
         self.size = size;
         self.queue_terminal_response(&response)
     }
@@ -569,6 +557,10 @@ mod tests {
         output: flume::Sender<PtyOutput>,
     }
 
+    struct OutputFromResize {
+        output: flume::Sender<PtyOutput>,
+    }
+
     struct OutputBeforeCommand {
         output: flume::Sender<PtyOutput>,
         output_before_pause: Vec<u8>,
@@ -749,6 +741,42 @@ mod tests {
         }
     }
 
+    impl TerminalTransport for OutputFromResize {
+        fn write(&mut self, _bytes: &[u8]) -> Result<ProcessInputStatus, String> {
+            Ok(ProcessInputStatus::Accepted)
+        }
+
+        fn flush_input(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn has_foreground_process(&self, _processes: &ProcessSnapshot) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn pause_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Paused)
+                .map_err(|error| format!("pause test reader: {error}"))
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Bytes(b"\x1b[H\x1b[999C".to_vec()))
+                .map_err(|error| format!("emit test resize output: {error}"))
+        }
+
+        fn resume_reader(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn synchronize_reader(&mut self) -> Result<(), String> {
+            self.output
+                .send(PtyOutput::Synchronized)
+                .map_err(|error| format!("synchronize test reader: {error}"))
+        }
+    }
+
     impl TerminalTransport for OutputBeforeCommand {
         fn write(&mut self, bytes: &[u8]) -> Result<ProcessInputStatus, String> {
             if self.fail_write {
@@ -839,6 +867,31 @@ mod tests {
             snapshot.cursor,
             Some((previous_size.cols - 1, 0)),
             "bytes accepted before the transport resize must use the previous grid"
+        );
+    }
+
+    #[test]
+    fn resize_consumes_transport_resize_output_at_new_geometry() {
+        let previous_size = TerminalSize::new(4, 4, 10, 20);
+        let next_size = TerminalSize::new(8, 4, 10, 20);
+        let (output_tx, output_rx) = flume::unbounded();
+        let terminal = ghostty::Terminal::new(previous_size.cols, previous_size.rows)
+            .expect("create test terminal");
+        let mut session = TerminalSession {
+            terminal,
+            process: Box::new(OutputFromResize { output: output_tx }),
+            output: Some(output_rx),
+            size: previous_size,
+            pending_response: Vec::new(),
+        };
+
+        session.resize(next_size).expect("resize terminal session");
+
+        let snapshot = session.snapshot().expect("snapshot resized terminal");
+        assert_eq!(
+            snapshot.cursor,
+            Some((next_size.cols - 1, 0)),
+            "bytes emitted by the platform resize must use the new grid"
         );
     }
 
