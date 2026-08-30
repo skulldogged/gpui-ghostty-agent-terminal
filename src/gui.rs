@@ -741,6 +741,11 @@ impl MultiplexerView {
                 terminal_session_id,
                 ..
             } => cursor_blink_resets_for_terminal(focused_before, *terminal_session_id),
+            DriverUpdate::TerminalBatch { snapshots } => {
+                snapshots.iter().any(|(terminal_session_id, _)| {
+                    cursor_blink_resets_for_terminal(focused_before, *terminal_session_id)
+                })
+            }
             _ => false,
         };
         match update {
@@ -805,6 +810,18 @@ impl MultiplexerView {
                 self.requested_sizes.get(&terminal_session_id).copied(),
                 snapshot,
             ),
+            DriverUpdate::TerminalBatch { snapshots } => {
+                for (terminal_session_id, snapshot) in snapshots {
+                    accept_terminal_snapshot(
+                        &self.hierarchy,
+                        &mut self.terminals,
+                        &mut self.terminal_errors,
+                        terminal_session_id,
+                        self.requested_sizes.get(&terminal_session_id).copied(),
+                        snapshot,
+                    );
+                }
+            }
             DriverUpdate::Error(error) => {
                 self.selections_after_commands.clear();
                 self.pending_split_resizes.clear();
@@ -1623,17 +1640,21 @@ impl MultiplexerView {
             &mut split_geometries,
         );
         self.split_geometries = split_geometries;
+        let mut resize_batch = Vec::new();
         for (terminal_session_id, width, height) in panes {
             let dimensions =
                 GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
             let size = self.terminal_font.cells.terminal_size(dimensions);
             if self.requested_sizes.get(&terminal_session_id) != Some(&size) {
-                match self.driver.resize_terminal(terminal_session_id, size) {
-                    Ok(()) => {
-                        self.requested_sizes.insert(terminal_session_id, size);
-                    }
-                    Err(error) => self.global_error = Some(error),
+                resize_batch.push((terminal_session_id, size));
+            }
+        }
+        if !resize_batch.is_empty() {
+            match self.driver.resize_terminals(resize_batch.iter().copied()) {
+                Ok(()) => {
+                    self.requested_sizes.extend(resize_batch);
                 }
+                Err(error) => self.global_error = Some(error),
             }
         }
     }

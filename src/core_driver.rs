@@ -53,6 +53,9 @@ pub(crate) enum DriverUpdate {
         terminal_session_id: TerminalSessionId,
         snapshot: TerminalSnapshot,
     },
+    TerminalBatch {
+        snapshots: Vec<(TerminalSessionId, TerminalSnapshot)>,
+    },
     Error(String),
 }
 
@@ -81,6 +84,7 @@ pub(crate) struct DriverUpdates {
 struct DriverUpdateState {
     hierarchy: Option<CoreSnapshot>,
     command_results: VecDeque<DriverCommandResult>,
+    terminal_batch_pending: bool,
     terminals: HashMap<TerminalSessionId, TerminalSnapshot>,
     error: Option<String>,
     stopped: bool,
@@ -139,6 +143,11 @@ impl DriverUpdates {
             })
         } else if let Some(error) = state.error.take() {
             Some(DriverUpdate::Error(error))
+        } else if state.terminal_batch_pending {
+            state.terminal_batch_pending = false;
+            let mut snapshots = state.terminals.drain().collect::<Vec<_>>();
+            snapshots.sort_unstable_by_key(|(terminal_session_id, _)| *terminal_session_id);
+            Some(DriverUpdate::TerminalBatch { snapshots })
         } else {
             let terminal_session_id = state.terminals.keys().copied().min()?;
             let snapshot = state
@@ -168,6 +177,7 @@ impl DriverUpdateState {
     fn has_pending(&self) -> bool {
         self.hierarchy.is_some()
             || !self.command_results.is_empty()
+            || self.terminal_batch_pending
             || !self.terminals.is_empty()
             || self.error.is_some()
     }
@@ -198,6 +208,13 @@ impl DriverUpdatePublisher {
                 snapshot,
             } => {
                 state.terminals.insert(terminal_session_id, snapshot);
+            }
+            // Keep at most one pending atomic terminal projection. Newer resize batches and
+            // ordinary output updates replace snapshots in it instead of reintroducing an
+            // intermediate geometry that the GUI could paint separately.
+            DriverUpdate::TerminalBatch { snapshots } => {
+                state.terminals.extend(snapshots);
+                state.terminal_batch_pending = true;
             }
             DriverUpdate::Error(error) => state.error = Some(error),
         }
@@ -269,19 +286,22 @@ impl DriverCommandSender {
         self.queue.try_send(command).map_err(command_send_error)
     }
 
-    fn resize(
+    fn resize_batch(
         &self,
-        terminal_session_id: TerminalSessionId,
-        size: TerminalSize,
+        batch: impl IntoIterator<Item = (TerminalSessionId, TerminalSize)>,
     ) -> Result<(), String> {
+        let batch = batch.into_iter().collect::<HashMap<_, _>>();
+        if batch.is_empty() {
+            return Ok(());
+        }
         let mut resize_batches = self
             .resize_batches
             .lock()
             .expect("window driver resize mutex poisoned");
         if let Some(batch_id) = resize_batches.trailing_batch
-            && let Some(batch) = resize_batches.batches.get_mut(&batch_id)
+            && let Some(pending) = resize_batches.batches.get_mut(&batch_id)
         {
-            batch.insert(terminal_session_id, size);
+            pending.extend(batch);
             return Ok(());
         }
 
@@ -290,9 +310,7 @@ impl DriverCommandSender {
             .next_batch_id
             .checked_add(1)
             .expect("window driver resize batch identifiers exhausted");
-        resize_batches
-            .batches
-            .insert(batch_id, HashMap::from([(terminal_session_id, size)]));
+        resize_batches.batches.insert(batch_id, batch);
         match self.queue.try_send(Command::ResizeBatch { batch_id }) {
             Ok(()) => {
                 resize_batches.trailing_batch = Some(batch_id);
@@ -453,12 +471,11 @@ impl CoreDriver {
         Ok(command_id)
     }
 
-    pub(crate) fn resize_terminal(
+    pub(crate) fn resize_terminals(
         &self,
-        terminal_session_id: TerminalSessionId,
-        size: TerminalSize,
+        batch: impl IntoIterator<Item = (TerminalSessionId, TerminalSize)>,
     ) -> Result<(), String> {
-        self.commands.resize(terminal_session_id, size)
+        self.commands.resize_batch(batch)
     }
 
     pub(crate) fn set_terminal_theme(&self, theme: TerminalTheme) -> Result<(), String> {
@@ -571,7 +588,7 @@ fn run_driver(
                     .lock()
                     .expect("window driver resize mutex poisoned")
                     .take_batch(batch_id);
-                batch.and_then(|batch| apply_resize_batch(&core, batch))
+                batch.and_then(|batch| apply_resize_batch(&core, batch, &mut revisions, &counters))
             }
             DriverEvent::Command(Ok(Command::SetTerminalTheme { theme })) => core
                 .set_terminal_theme(theme)
@@ -644,19 +661,43 @@ fn run_driver(
 fn apply_resize_batch(
     core: &ApplicationCore,
     batch: Vec<(TerminalSessionId, TerminalSize)>,
+    revisions: &mut HashMap<TerminalSessionId, u64>,
+    counters: &DriverCounters,
 ) -> Result<Vec<DriverUpdate>, String> {
     let mut first_error = None;
-    for (terminal_session_id, size) in batch {
+    for &(terminal_session_id, size) in &batch {
         if let Err(error) = core.resize_terminal(terminal_session_id, size)
             && first_error.is_none()
         {
             first_error = Some(error);
         }
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(Vec::new()),
+    if let Some(error) = first_error {
+        return Err(error);
     }
+
+    // Resize announcements are queued while this command is running. Capture every affected
+    // projection now and advance their revisions together so those announcements cannot expose
+    // one half of a split resize to the GUI before the other half.
+    let mut snapshots = Vec::with_capacity(batch.len());
+    for (terminal_session_id, _) in batch {
+        if !revisions.contains_key(&terminal_session_id) {
+            continue;
+        }
+        counters.snapshot_requests.fetch_add(1, Ordering::Relaxed);
+        let snapshot = core.terminal_snapshot(terminal_session_id)?;
+        snapshots.push((terminal_session_id, snapshot));
+    }
+    for (terminal_session_id, snapshot) in &snapshots {
+        revisions.insert(*terminal_session_id, snapshot.revision);
+    }
+    counters
+        .snapshots_published
+        .fetch_add(snapshots.len() as u64, Ordering::Relaxed);
+    Ok((!snapshots.is_empty())
+        .then_some(DriverUpdate::TerminalBatch { snapshots })
+        .into_iter()
+        .collect())
 }
 
 fn load_projection(core: &ApplicationCore) -> Result<CoreProjection, String> {
@@ -799,7 +840,10 @@ fn refresh_terminal(
 #[cfg(test)]
 mod tests {
     use super::{Command, DriverCommandSender, DriverUpdate, load_projection};
-    use crate::{ApplicationCore, TerminalSessionId, TerminalSize, core_driver::CoreDriver};
+    use crate::{
+        ApplicationCore, CoreCommand, PaneLayout, SplitAxis, SplitPlacement, SplitRatio,
+        TerminalSessionId, TerminalSize, core_driver::CoreDriver,
+    };
     use std::{
         thread,
         time::{Duration, Instant},
@@ -824,7 +868,7 @@ mod tests {
 
         for step in 0..512_u16 {
             final_size = TerminalSize::new(80 + step % 40, 24 + step % 10, 9, 20);
-            if let Err(error) = driver.resize_terminal(terminal_session_id, final_size) {
+            if let Err(error) = driver.resize_terminals([(terminal_session_id, final_size)]) {
                 panic!("interactive resize request {step} filled the driver queue: {error}");
             }
         }
@@ -851,12 +895,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match updates.take_pending() {
-                Some(DriverUpdate::Terminal {
-                    terminal_session_id: updated_terminal_session_id,
-                    snapshot,
-                }) if updated_terminal_session_id == terminal_session_id
-                    && snapshot.cols == final_size.cols
-                    && snapshot.rows == final_size.rows =>
+                Some(DriverUpdate::TerminalBatch { snapshots })
+                    if snapshots
+                        .iter()
+                        .any(|(updated_terminal_session_id, snapshot)| {
+                            *updated_terminal_session_id == terminal_session_id
+                                && snapshot.cols == final_size.cols
+                                && snapshot.rows == final_size.rows
+                        }) =>
                 {
                     break;
                 }
@@ -882,15 +928,19 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 match updates.take_pending() {
-                    Some(DriverUpdate::Terminal {
-                        terminal_session_id: updated_terminal_session_id,
-                        snapshot,
-                    }) if updated_terminal_session_id == terminal_session_id
-                        && snapshot.cols == size.cols
-                        && snapshot.rows == size.rows
-                        && snapshot.revision > minimum_revision =>
-                    {
-                        return snapshot.revision;
+                    Some(DriverUpdate::TerminalBatch { snapshots }) => {
+                        if let Some((_, snapshot)) =
+                            snapshots
+                                .iter()
+                                .find(|(updated_terminal_session_id, snapshot)| {
+                                    *updated_terminal_session_id == terminal_session_id
+                                        && snapshot.cols == size.cols
+                                        && snapshot.rows == size.rows
+                                        && snapshot.revision > minimum_revision
+                                })
+                        {
+                            return snapshot.revision;
+                        }
                     }
                     Some(_) => {}
                     None => thread::sleep(Duration::from_millis(5)),
@@ -903,16 +953,79 @@ mod tests {
         };
 
         driver
-            .resize_terminal(terminal_session_id, size)
+            .resize_terminals([(terminal_session_id, size)])
             .expect("apply initial resize");
         let initial_revision = receive_matching_projection(0);
 
         driver
-            .resize_terminal(terminal_session_id, size)
+            .resize_terminals([(terminal_session_id, size)])
             .expect("repeat current resize");
         let repeated_revision = receive_matching_projection(initial_revision);
 
         assert!(repeated_revision > initial_revision);
+    }
+
+    #[test]
+    fn resize_batch_publishes_all_terminal_geometries_atomically() {
+        let core = ApplicationCore::start().expect("start application core");
+        let initial = core.core_snapshot();
+        let pane_id = match &initial.spaces[0].tabs[0].layout {
+            PaneLayout::Pane(pane) => pane.id,
+            PaneLayout::Split(_) => panic!("initial Tab must contain one Pane"),
+        };
+        core.apply_core_command(CoreCommand::SplitPane {
+            pane_id,
+            axis: SplitAxis::Horizontal,
+            placement: SplitPlacement::After,
+            ratio: SplitRatio::EQUAL,
+        })
+        .expect("split initial Pane");
+
+        let (driver, projection) = CoreDriver::start(core).expect("start window driver");
+        let updates = driver.updates();
+        let mut terminal_session_ids = projection
+            .hierarchy
+            .terminal_sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        terminal_session_ids.sort_unstable();
+        assert_eq!(terminal_session_ids.len(), 2);
+        let sizes = [
+            TerminalSize::new(91, 24, 9, 20),
+            TerminalSize::new(73, 24, 9, 20),
+        ];
+
+        driver
+            .resize_terminals(terminal_session_ids.iter().copied().zip(sizes))
+            .expect("queue atomic resize batch");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match updates.take_pending() {
+                Some(DriverUpdate::TerminalBatch { snapshots }) => {
+                    for (terminal_session_id, size) in
+                        terminal_session_ids.iter().copied().zip(sizes)
+                    {
+                        let snapshot = snapshots
+                            .iter()
+                            .find_map(|(updated_terminal_session_id, snapshot)| {
+                                (*updated_terminal_session_id == terminal_session_id)
+                                    .then_some(snapshot)
+                            })
+                            .expect("batch contains every resized Terminal Session");
+                        assert_eq!((snapshot.cols, snapshot.rows), (size.cols, size.rows));
+                    }
+                    break;
+                }
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resized Terminal Sessions were not published as one update"
+            );
+        }
     }
 
     #[test]
@@ -925,7 +1038,7 @@ mod tests {
         for step in 0..512_u16 {
             final_size = TerminalSize::new(80 + step % 40, 24 + step % 10, 9, 20);
             sender
-                .resize(terminal_session_id, final_size)
+                .resize_batch([(terminal_session_id, final_size)])
                 .expect("coalesce pending resize");
         }
 
@@ -953,7 +1066,7 @@ mod tests {
         let after_key = TerminalSize::new(120, 36, 9, 20);
 
         sender
-            .resize(terminal_session_id, before_key)
+            .resize_batch([(terminal_session_id, before_key)])
             .expect("queue resize before key");
         sender
             .send(Command::Key {
@@ -966,7 +1079,7 @@ mod tests {
             })
             .expect("queue key barrier");
         sender
-            .resize(terminal_session_id, after_key)
+            .resize_batch([(terminal_session_id, after_key)])
             .expect("queue resize after key");
 
         let first_batch_id = match commands.recv().expect("first command") {
