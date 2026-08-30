@@ -20,6 +20,16 @@ Triage uses the five default Matt Pocock skill labels. See `docs/agents/triage-l
 
 This is a single-context repository. See `docs/agents/domain.md`.
 
+## GitHub communication
+
+Write issues, pull-request descriptions, reviews, and comments for a human reader. Lead with the conclusion or user-visible result, use short prose paragraphs, and include only the evidence needed to support the decision.
+
+Keep routine updates compact: state what was learned, what it means, and the next step. Do not publish a chronological lab notebook, raw trace narration, or unexplained implementation detail.
+
+Never publish machine-specific or private information such as usernames, hostnames, absolute paths, shell-profile contents, personally installed programs, credentials, or local repository locations. Generalize those details unless they are essential to reproduction and the operator explicitly approves publishing them.
+
+Prefer project-relative paths and portable commands when technical detail is necessary. Summarize long logs and test matrices; link or attach full evidence only when it materially helps review.
+
 ## Code Review Rules
 
 ### Domain invariants
