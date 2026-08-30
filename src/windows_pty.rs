@@ -9,27 +9,36 @@ use crate::{
 use std::{
     alloc::{Layout, alloc, dealloc},
     ffi::{OsStr, OsString, c_void},
-    io,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
     ptr::null_mut,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK,
-        WAIT_FAILED, WAIT_OBJECT_0,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FreeLibrary, HANDLE, HMODULE,
+        INVALID_HANDLE_VALUE, S_OK, WAIT_FAILED, WAIT_OBJECT_0,
     },
-    Security::SECURITY_ATTRIBUTES,
+    Security::{
+        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    },
+    Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW},
     System::{
-        Console::{
-            COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
-            SetConsoleCtrlHandler,
+        Console::{COORD, HPCON, SetConsoleCtrlHandler},
+        LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+            LoadLibraryExW,
         },
         Pipes::{CreatePipe, PeekNamedPipe},
         Threading::{
             CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
             EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
-            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
             STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
             WaitForSingleObject,
@@ -55,6 +64,388 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+const CONPTY_RUNTIME_VERSION: &str = env!("AGENT_TERMINAL_CONPTY_VERSION");
+const CONPTY_PACKAGE_HASH_PREFIX: &str = "9382ad7becb7e4d8";
+const CONPTY_DLL: &str = "conpty.dll";
+const CONPTY_X64_HOST: &str = "x64/OpenConsole.exe";
+const CONPTY_ARM64_HOST: &str = "arm64/OpenConsole.exe";
+const CONPTY_LICENSE: &str = "LICENSE.txt";
+
+struct EmbeddedRuntimeFile {
+    relative: &'static str,
+    bytes: &'static [u8],
+}
+
+static EMBEDDED_CONPTY_RUNTIME: &[EmbeddedRuntimeFile] = &[
+    EmbeddedRuntimeFile {
+        relative: CONPTY_DLL,
+        bytes: include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/microsoft-conpty/",
+            env!("AGENT_TERMINAL_CONPTY_VERSION"),
+            "/conpty.dll"
+        )),
+    },
+    EmbeddedRuntimeFile {
+        relative: CONPTY_X64_HOST,
+        bytes: include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/microsoft-conpty/",
+            env!("AGENT_TERMINAL_CONPTY_VERSION"),
+            "/x64/OpenConsole.exe"
+        )),
+    },
+    EmbeddedRuntimeFile {
+        relative: CONPTY_ARM64_HOST,
+        bytes: include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/microsoft-conpty/",
+            env!("AGENT_TERMINAL_CONPTY_VERSION"),
+            "/arm64/OpenConsole.exe"
+        )),
+    },
+    EmbeddedRuntimeFile {
+        relative: CONPTY_LICENSE,
+        bytes: include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/microsoft-conpty/",
+            env!("AGENT_TERMINAL_CONPTY_VERSION"),
+            "/LICENSE.txt"
+        )),
+    },
+];
+
+type CreatePseudoConsoleFn =
+    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
+type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
+type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
+
+static CONPTY_API: OnceLock<Result<ConptyApi, String>> = OnceLock::new();
+static RUNTIME_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct ConptyApi {
+    create: CreatePseudoConsoleFn,
+    resize: ResizePseudoConsoleFn,
+    close: ClosePseudoConsoleFn,
+    module: Option<usize>,
+}
+
+impl ConptyApi {
+    fn global() -> Result<&'static Self, String> {
+        CONPTY_API
+            .get_or_init(Self::load)
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    fn load() -> Result<Self, String> {
+        ensure_unelevated()?;
+        let cache_root = runtime_cache_root()?;
+        let api = Self::load_bundled_from_cache_root(&cache_root)?;
+        eprintln!("Using bundled Microsoft ConPTY {CONPTY_RUNTIME_VERSION} runtime");
+        Ok(api)
+    }
+
+    #[cfg(test)]
+    fn load_from_cache_root(cache_root: &Path) -> Result<Self, String> {
+        Self::load_bundled_from_cache_root(cache_root)
+    }
+
+    fn load_bundled_from_cache_root(cache_root: &Path) -> Result<Self, String> {
+        let runtime_directory = runtime_directory(cache_root);
+        materialize_bundled_runtime(&runtime_directory)?;
+        Self::load_bundled(&runtime_directory)
+    }
+
+    fn load_bundled(runtime_directory: &Path) -> Result<Self, String> {
+        validate_bundled_runtime(runtime_directory)?;
+        let library = runtime_directory.join(CONPTY_DLL);
+        let library = nul_terminated(library.as_os_str(), "bundled ConPTY library")?;
+        let module = unsafe {
+            LoadLibraryExW(
+                library.as_ptr(),
+                null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return Err(last_error("load bundled ConPTY library"));
+        }
+
+        let symbols = unsafe {
+            (
+                GetProcAddress(module, c"ConptyCreatePseudoConsole".as_ptr().cast()),
+                GetProcAddress(module, c"ConptyResizePseudoConsole".as_ptr().cast()),
+                GetProcAddress(module, c"ConptyClosePseudoConsole".as_ptr().cast()),
+            )
+        };
+        let (Some(create), Some(resize), Some(close)) = symbols else {
+            unsafe { FreeLibrary(module) };
+            return Err("bundled ConPTY library is missing required exports".into());
+        };
+
+        Ok(Self {
+            create: unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, CreatePseudoConsoleFn>(
+                    create,
+                )
+            },
+            resize: unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, ResizePseudoConsoleFn>(
+                    resize,
+                )
+            },
+            close: unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, ClosePseudoConsoleFn>(
+                    close,
+                )
+            },
+            // The global table keeps this loader reference alive for every
+            // HPCON created through these function pointers.
+            module: Some(module as usize),
+        })
+    }
+}
+
+impl Drop for ConptyApi {
+    fn drop(&mut self) {
+        if let Some(module) = self.module.take() {
+            unsafe { FreeLibrary(module as HMODULE) };
+        }
+    }
+}
+
+pub(crate) fn ensure_unelevated() -> Result<(), String> {
+    ensure_unelevated_from(process_is_elevated())
+}
+
+fn ensure_unelevated_from(elevated: Result<bool, String>) -> Result<(), String> {
+    if elevated? {
+        Err(
+            "Agent Terminal must run as an unelevated per-user application; elevated launches are not supported"
+                .into(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn process_is_elevated() -> Result<bool, String> {
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(last_error("open the Agent Terminal process token"));
+    }
+    let token = OwnedHandle(token);
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0;
+    let size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(last_error("read the Agent Terminal process elevation"));
+    }
+    if returned < size {
+        return Err("Windows returned an incomplete process-elevation result".into());
+    }
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+fn runtime_cache_root() -> Result<PathBuf, String> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is unavailable".to_owned())?;
+    if !local_app_data.is_absolute() {
+        return Err("LOCALAPPDATA is not an absolute path".into());
+    }
+    Ok(local_app_data
+        .join("agent-terminal")
+        .join("runtime")
+        .join("conpty"))
+}
+
+fn runtime_directory(cache_root: &Path) -> PathBuf {
+    cache_root.join(format!(
+        "{CONPTY_RUNTIME_VERSION}-{CONPTY_PACKAGE_HASH_PREFIX}"
+    ))
+}
+
+fn materialize_bundled_runtime(runtime_directory: &Path) -> Result<(), String> {
+    for embedded in EMBEDDED_CONPTY_RUNTIME {
+        materialize_runtime_file(runtime_directory, embedded)?;
+    }
+    validate_bundled_runtime(runtime_directory)
+}
+
+fn materialize_runtime_file(
+    runtime_directory: &Path,
+    embedded: &EmbeddedRuntimeFile,
+) -> Result<(), String> {
+    let destination = runtime_directory.join(embedded.relative);
+    if runtime_file_matches(&destination, embedded.bytes)? {
+        return Ok(());
+    }
+
+    fs::create_dir_all(destination.parent().expect("ConPTY runtime file parent")).map_err(
+        |error| {
+            format!(
+                "create bundled ConPTY runtime directory {}: {error}",
+                destination
+                    .parent()
+                    .expect("ConPTY runtime file parent")
+                    .display()
+            )
+        },
+    )?;
+    let temporary = write_runtime_temporary(&destination, embedded.bytes)?;
+    if let Err(error) = replace_runtime_file(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        if runtime_file_matches(&destination, embedded.bytes)? {
+            return Ok(());
+        }
+        return Err(format!(
+            "publish bundled ConPTY runtime file {}: {error}",
+            destination.display()
+        ));
+    }
+
+    if runtime_file_matches(&destination, embedded.bytes)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "bundled ConPTY runtime file {} differs after publication",
+            destination.display()
+        ))
+    }
+}
+
+fn write_runtime_temporary(destination: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let file_name = destination
+        .file_name()
+        .expect("ConPTY runtime file name")
+        .to_string_lossy();
+    for _ in 0..64 {
+        let sequence = RUNTIME_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = destination.with_file_name(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "create temporary bundled ConPTY runtime file {}: {error}",
+                    temporary.display()
+                ));
+            }
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "write temporary bundled ConPTY runtime file {}: {error}",
+                temporary.display()
+            ));
+        }
+        drop(file);
+        return Ok(temporary);
+    }
+
+    Err(format!(
+        "allocate a unique temporary file beside {}",
+        destination.display()
+    ))
+}
+
+fn replace_runtime_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    if !destination.exists() {
+        return fs::rename(temporary, destination);
+    }
+
+    let destination = nul_terminated(destination.as_os_str(), "ConPTY destination")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let temporary = nul_terminated(temporary.as_os_str(), "ConPTY temporary file")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            temporary.as_ptr(),
+            null_mut(),
+            REPLACEFILE_WRITE_THROUGH,
+            null_mut(),
+            null_mut(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_bundled_runtime(runtime_directory: &Path) -> Result<(), String> {
+    for embedded in EMBEDDED_CONPTY_RUNTIME {
+        let path = runtime_directory.join(embedded.relative);
+        if !runtime_file_matches(&path, embedded.bytes)? {
+            return Err(format!(
+                "bundled ConPTY runtime file {} is missing or differs from the embedded input",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn runtime_file_matches(path: &Path, expected: &[u8]) -> Result<bool, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "open bundled ConPTY runtime file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect bundled ConPTY runtime file {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+
+    let maximum = expected
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "embedded ConPTY runtime file is too large".to_owned())?;
+    let mut actual = Vec::with_capacity(maximum);
+    file.take(maximum as u64)
+        .read_to_end(&mut actual)
+        .map_err(|error| {
+            format!(
+                "read bundled ConPTY runtime file {}: {error}",
+                path.display()
+            )
+        })?;
+    Ok(actual == expected)
+}
+
 pub struct PtySession {
     input: flume::Sender<ProcessInput>,
     pseudoconsole: Arc<SharedPseudoConsole>,
@@ -71,7 +462,10 @@ struct Pipe {
 
 struct OwnedHandle(HANDLE);
 
-struct SharedPseudoConsole(Mutex<Option<HPCON>>);
+struct SharedPseudoConsole {
+    handle: Mutex<Option<HPCON>>,
+    api: &'static ConptyApi,
+}
 
 // Each wrapper uniquely owns its handle and may move to the reader thread.
 unsafe impl Send for OwnedHandle {}
@@ -86,12 +480,25 @@ impl PtySession {
         working_directory: &std::path::Path,
         events: TerminalEventSender,
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
+        let executable = shell();
+        let arguments = shell_arguments(&executable);
+        Self::spawn_process(size, working_directory, events, &executable, &arguments)
+    }
+
+    fn spawn_process(
+        size: PtySize,
+        working_directory: &Path,
+        events: TerminalEventSender,
+        executable: &Path,
+        arguments: &[OsString],
+    ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         allow_ctrl_c_in_children();
         let input = Pipe::create()?;
         let output = Pipe::create()?;
+        let api = ConptyApi::global()?;
         let mut pseudoconsole: HPCON = 0;
         let result = unsafe {
-            CreatePseudoConsole(
+            (api.create)(
                 size.coord(),
                 input.read.raw(),
                 output.write.raw(),
@@ -103,8 +510,13 @@ impl PtySession {
             return Err(hresult_error("create ConPTY", result));
         }
 
-        let pseudoconsole = Arc::new(SharedPseudoConsole::new(pseudoconsole));
-        let spawned_process = spawn_shell(pseudoconsole.raw()?, working_directory)?;
+        let pseudoconsole = Arc::new(SharedPseudoConsole::new(pseudoconsole, api));
+        let spawned_process = spawn_process(
+            pseudoconsole.raw()?,
+            working_directory,
+            executable,
+            arguments,
+        )?;
         let process_id = spawned_process.id;
         let process = spawned_process.handle;
 
@@ -438,12 +850,15 @@ impl Drop for OwnedHandle {
 }
 
 impl SharedPseudoConsole {
-    fn new(handle: HPCON) -> Self {
-        Self(Mutex::new(Some(handle)))
+    fn new(handle: HPCON, api: &'static ConptyApi) -> Self {
+        Self {
+            handle: Mutex::new(Some(handle)),
+            api,
+        }
     }
 
     fn raw(&self) -> Result<HPCON, String> {
-        self.0
+        self.handle
             .lock()
             .map_err(|_| "lock ConPTY handle".to_string())?
             .as_ref()
@@ -452,22 +867,22 @@ impl SharedPseudoConsole {
     }
 
     fn close(&self) {
-        let handle = self.0.lock().ok().and_then(|mut handle| handle.take());
+        let handle = self.handle.lock().ok().and_then(|mut handle| handle.take());
         if let Some(handle) = handle {
-            unsafe { ClosePseudoConsole(handle) };
+            unsafe { (self.api.close)(handle) };
         }
     }
 
     fn resize(&self, size: PtySize) -> Result<(), String> {
         let handle = self
-            .0
+            .handle
             .lock()
             .map_err(|_| "lock ConPTY handle".to_string())?;
         let handle = handle
             .as_ref()
             .copied()
             .ok_or_else(|| "ConPTY process has exited".to_string())?;
-        let result = unsafe { ResizePseudoConsole(handle, size.coord()) };
+        let result = unsafe { (self.api.resize)(handle, size.coord()) };
         if result == S_OK {
             Ok(())
         } else {
@@ -478,30 +893,21 @@ impl SharedPseudoConsole {
 
 impl Drop for SharedPseudoConsole {
     fn drop(&mut self) {
-        let handle = self.0.get_mut().ok().and_then(Option::take);
+        let handle = self.handle.get_mut().ok().and_then(Option::take);
         if let Some(handle) = handle {
-            unsafe { ClosePseudoConsole(handle) };
+            unsafe { (self.api.close)(handle) };
         }
     }
 }
 
-fn spawn_shell(
+fn spawn_process(
     pseudoconsole: HPCON,
-    working_directory: &std::path::Path,
+    working_directory: &Path,
+    executable: &Path,
+    arguments: &[OsString],
 ) -> Result<SpawnedProcess, String> {
-    let shell = shell();
-    let mut arguments = Vec::new();
-    if shell
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case("pwsh.exe") || name.eq_ignore_ascii_case("powershell.exe")
-        })
-    {
-        arguments.push(OsString::from("-NoLogo"));
-    }
-    let mut command_line = command_line(shell.as_os_str(), &arguments)?;
-    let application = nul_terminated(shell.as_os_str(), "shell executable")?;
+    let mut command_line = command_line(executable.as_os_str(), arguments)?;
+    let application = nul_terminated(executable.as_os_str(), "process executable")?;
     let working_directory =
         nul_terminated(working_directory.as_os_str(), "terminal working directory")?;
     let environment = environment_block()?;
@@ -570,7 +976,7 @@ fn spawn_shell(
         dealloc(attributes.cast(), layout);
     }
     if !created {
-        return Err(last_error("spawn ConPTY shell"));
+        return Err(last_error("spawn ConPTY process"));
     }
 
     let thread = OwnedHandle(process.hThread);
@@ -588,16 +994,40 @@ struct SpawnedProcess {
     id: u32,
 }
 
-fn shell() -> std::path::PathBuf {
+fn shell_arguments(executable: &Path) -> Vec<OsString> {
+    let name = executable.file_name().and_then(OsStr::to_str);
+    #[cfg(test)]
+    if name.is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe")) {
+        // Unit tests exercise transport and lifecycle behavior, not the
+        // operator's shell configuration. Disable cmd.exe AutoRun hooks and
+        // command echo so tests cannot load or persist user shell state.
+        return vec![
+            OsString::from("/d"),
+            OsString::from("/q"),
+            OsString::from("/k"),
+        ];
+    }
+
+    if name.is_some_and(|name| {
+        name.eq_ignore_ascii_case("pwsh.exe") || name.eq_ignore_ascii_case("powershell.exe")
+    }) {
+        vec![OsString::from("-NoLogo")]
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(not(test))]
+fn shell() -> PathBuf {
     for candidate in [
         std::env::var_os("PROGRAMFILES")
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
             .map(|root| root.join("PowerShell\\7\\pwsh.exe")),
-        Some(std::path::PathBuf::from(
+        Some(PathBuf::from(
             "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
         )),
-        std::env::var_os("COMSPEC").map(std::path::PathBuf::from),
-        Some(std::path::PathBuf::from("C:\\Windows\\System32\\cmd.exe")),
+        std::env::var_os("COMSPEC").map(PathBuf::from),
+        Some(PathBuf::from("C:\\Windows\\System32\\cmd.exe")),
     ]
     .into_iter()
     .flatten()
@@ -606,7 +1036,18 @@ fn shell() -> std::path::PathBuf {
             return candidate;
         }
     }
-    std::path::PathBuf::from("cmd.exe")
+    PathBuf::from("cmd.exe")
+}
+
+#[cfg(test)]
+fn shell() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .map(|root| root.join("System32\\cmd.exe"))
+        .filter(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows\\System32\\cmd.exe"))
 }
 
 fn command_line(executable: &OsStr, arguments: &[OsString]) -> Result<Vec<u16>, String> {
@@ -764,4 +1205,242 @@ fn last_error(operation: &str) -> String {
 
 fn hresult_error(operation: &str, result: i32) -> String {
     format!("{operation}: HRESULT 0x{:08X}", result as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONPTY_DLL, CONPTY_LICENSE, ConptyApi, EMBEDDED_CONPTY_RUNTIME, PtySession,
+        ensure_unelevated_from, materialize_bundled_runtime, runtime_directory, shell,
+        shell_arguments, validate_bundled_runtime,
+    };
+    use crate::{
+        pty::{ProcessInputStatus, PtyOutput, PtySize},
+        terminal_session::TerminalEventSender,
+    };
+    use std::{
+        ffi::OsString,
+        fs,
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    const PROMPT: &[u8] = b"__CONPTY_PROMPT__";
+    const VISIBLE_FRAME: &[u8] = b"__VISIBLE_FRAME_SENTINEL__";
+    const POST_RESIZE_BARRIER: &[u8] = b"__POST_RESIZE_BARRIER__";
+
+    #[test]
+    fn integration_shell_disables_user_configuration_and_persistent_history() {
+        let executable = shell();
+        assert!(executable.is_absolute());
+        assert_eq!(
+            executable.file_name().and_then(|name| name.to_str()),
+            Some("cmd.exe")
+        );
+        assert_eq!(
+            shell_arguments(&executable),
+            [
+                OsString::from("/d"),
+                OsString::from("/q"),
+                OsString::from("/k")
+            ]
+        );
+    }
+
+    #[test]
+    fn elevated_and_unverifiable_processes_are_rejected() {
+        assert!(ensure_unelevated_from(Ok(false)).is_ok());
+        assert!(ensure_unelevated_from(Ok(true)).is_err());
+        assert!(ensure_unelevated_from(Err("token query failed".into())).is_err());
+    }
+
+    #[test]
+    fn embedded_conpty_runtime_materializes_repairs_and_is_selected() {
+        let cache_root = temporary_cache_root("materialize");
+        let runtime = runtime_directory(&cache_root);
+
+        materialize_bundled_runtime(&runtime).expect("materialize embedded ConPTY runtime");
+        for embedded in EMBEDDED_CONPTY_RUNTIME {
+            assert_eq!(
+                fs::read(runtime.join(embedded.relative)).expect("read materialized runtime file"),
+                embedded.bytes,
+                "materialized {} must equal its embedded input",
+                embedded.relative
+            );
+        }
+        assert!(runtime.join(CONPTY_LICENSE).is_file());
+        drop(ConptyApi::load_bundled(&runtime).expect("load materialized ConPTY runtime"));
+
+        fs::write(runtime.join(CONPTY_DLL), b"corrupt").expect("corrupt cached ConPTY library");
+        materialize_bundled_runtime(&runtime).expect("repair cached ConPTY runtime");
+        validate_bundled_runtime(&runtime).expect("validate repaired ConPTY runtime");
+
+        fs::remove_dir_all(&cache_root).expect("remove temporary ConPTY runtime cache");
+        ConptyApi::global().expect("load the process-global bundled ConPTY runtime");
+    }
+
+    #[test]
+    fn concurrent_materialization_publishes_one_complete_runtime() {
+        let cache_root = temporary_cache_root("concurrent");
+        let runtime = Arc::new(runtime_directory(&cache_root));
+        let workers = (0..4)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                std::thread::spawn(move || materialize_bundled_runtime(&runtime))
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker
+                .join()
+                .expect("materialization worker panicked")
+                .expect("materialization worker failed");
+        }
+
+        validate_bundled_runtime(&runtime).expect("validate concurrently materialized runtime");
+        fs::remove_dir_all(&cache_root).expect("remove temporary ConPTY runtime cache");
+    }
+
+    #[test]
+    fn unavailable_runtime_cache_is_an_error() {
+        let blocked = temporary_cache_root("blocked");
+        fs::write(&blocked, b"not a directory").expect("create blocked runtime cache root");
+
+        assert!(ConptyApi::load_from_cache_root(&blocked).is_err());
+        fs::remove_file(blocked).expect("remove blocked runtime cache root");
+    }
+
+    #[test]
+    fn bundled_conpty_resize_does_not_replay_the_visible_screen() {
+        ConptyApi::global().expect("the resize regression must exercise the pinned runtime");
+        let command_processor = shell();
+        let arguments = [
+            OsString::from("/d"),
+            OsString::from("/q"),
+            OsString::from("/k"),
+            OsString::from("prompt __CONPTY_PROMPT__$G"),
+        ];
+        let working_directory = std::env::current_dir().expect("resolve test working directory");
+        let (events, _event_receiver) = TerminalEventSender::channel();
+        let (mut session, output) = PtySession::spawn_process(
+            pty_size(80),
+            &working_directory,
+            events,
+            &command_processor,
+            &arguments,
+        )
+        .expect("spawn deterministic ConPTY command processor");
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        collect_until(&output, deadline, |bytes| contains(bytes, PROMPT));
+        assert_eq!(
+            session
+                .write(b"echo __VISIBLE_FRAME_SENTINEL__\r")
+                .expect("write visible frame marker"),
+            ProcessInputStatus::Accepted
+        );
+        session.flush_input().expect("flush visible frame marker");
+        collect_until(&output, deadline, |bytes| {
+            marker_followed_by_prompt(bytes, VISIBLE_FRAME)
+        });
+
+        session.pause_reader().expect("pause ConPTY reader");
+        collect_until_paused(&output, deadline);
+        session.resize(pty_size(60)).expect("resize ConPTY");
+        session.resume_reader().expect("resume ConPTY reader");
+
+        assert_eq!(
+            session
+                .write(b"echo __POST_RESIZE_BARRIER__\r")
+                .expect("write post-resize barrier"),
+            ProcessInputStatus::Accepted
+        );
+        session.flush_input().expect("flush post-resize barrier");
+        let post_resize = collect_until(&output, deadline, |bytes| {
+            marker_followed_by_prompt(bytes, POST_RESIZE_BARRIER)
+        });
+
+        assert!(
+            !contains(&post_resize, VISIBLE_FRAME),
+            "resize replayed the visible frame into raw PTY output:\n{}",
+            String::from_utf8_lossy(&post_resize)
+        );
+    }
+
+    fn pty_size(cols: u16) -> PtySize {
+        PtySize {
+            rows: 24,
+            cols,
+            pixel_width: cols.saturating_mul(8),
+            pixel_height: 24 * 16,
+        }
+    }
+
+    fn temporary_cache_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "agent-terminal-conpty-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn collect_until(
+        output: &flume::Receiver<PtyOutput>,
+        deadline: Instant,
+        complete: impl Fn(&[u8]) -> bool,
+    ) -> Vec<u8> {
+        let mut collected = Vec::new();
+        while !complete(&collected) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for ConPTY output");
+            match output.recv_timeout(remaining.min(Duration::from_millis(250))) {
+                Ok(PtyOutput::Bytes(bytes)) => collected.extend(bytes),
+                Ok(PtyOutput::Paused) => panic!("unexpected ConPTY reader pause marker"),
+                Ok(PtyOutput::Synchronized) => {
+                    panic!("unexpected ConPTY reader synchronization marker")
+                }
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    panic!("ConPTY output disconnected before the expected marker")
+                }
+            }
+        }
+        collected
+    }
+
+    fn collect_until_paused(output: &flume::Receiver<PtyOutput>, deadline: Instant) -> Vec<u8> {
+        let mut collected = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for reader pause");
+            match output.recv_timeout(remaining.min(Duration::from_millis(250))) {
+                Ok(PtyOutput::Bytes(bytes)) => collected.extend(bytes),
+                Ok(PtyOutput::Paused) => return collected,
+                Ok(PtyOutput::Synchronized) => {
+                    panic!("unexpected ConPTY reader synchronization marker")
+                }
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    panic!("ConPTY output disconnected before the reader paused")
+                }
+            }
+        }
+    }
+
+    fn marker_followed_by_prompt(bytes: &[u8], marker: &[u8]) -> bool {
+        find(bytes, marker).is_some_and(|index| contains(&bytes[index + marker.len()..], PROMPT))
+    }
+
+    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+        find(bytes, needle).is_some()
+    }
+
+    fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+        bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
 }

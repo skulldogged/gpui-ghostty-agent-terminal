@@ -7,6 +7,13 @@ use std::process::Command;
 const GHOSTTY_REVISION: &str = "4c725242b7dbe8c77c6e227ef1f9540c5ef17921";
 const GHOSTTY_INCLUDE_DIR_ENV: &str = "GHOSTTY_VT_INCLUDE_DIR";
 const GHOSTTY_LIB_DIR_ENV: &str = "GHOSTTY_VT_LIB_DIR";
+const CONPTY_VERSION: &str = "1.24.260710001";
+const CONPTY_FILES: &[&str] = &[
+    "conpty.dll",
+    "x64/OpenConsole.exe",
+    "arm64/OpenConsole.exe",
+    "LICENSE.txt",
+];
 
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
@@ -18,6 +25,16 @@ fn main() {
     println!("cargo:rerun-if-changed=native/ghostty_bridge.c");
     println!("cargo:rerun-if-changed=native/ghostty_bridge.h");
     println!("cargo:rerun-if-changed=vendor/ghostty/include");
+    println!("cargo:rustc-env=AGENT_TERMINAL_CONPTY_VERSION={CONPTY_VERSION}");
+    for relative in CONPTY_FILES {
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join("vendor/microsoft-conpty")
+                .join(CONPTY_VERSION)
+                .join(relative)
+                .display()
+        );
+    }
 
     let target = env::var("TARGET").expect("TARGET");
     let lib_dir = env::var_os(GHOSTTY_LIB_DIR_ENV)
@@ -54,7 +71,7 @@ fn build_ghostty(ghostty: &Path, target: &str) -> PathBuf {
         .arg(&install)
         .arg("--cache-dir")
         .arg(&cache)
-        .arg(format!("-Dtarget={}", zig_target(&target)))
+        .arg(format!("-Dtarget={}", zig_target(target)))
         .current_dir(ghostty)
         .status()
         .expect("launch Zig Ghostty build");
