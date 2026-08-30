@@ -24,7 +24,8 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton,
     PromptLevel, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Task, TextRun,
     TouchPhase, Transformation, Window, WindowControlArea, canvas, div, ease_out_quint, fill, font,
-    percentage, point, prelude::*, px, rgb, size, svg,
+    linear_color_stop, linear_gradient, percentage, point, prelude::*, px, relative, rgb, size,
+    svg,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,9 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const SYMBOL_OVERFLOW_TOLERANCE_CELLS: f32 = 0.25;
 const SPLIT_DIVIDER_PX: f32 = 5.0;
 const INACTIVE_PANE_CONTRAST: f32 = 0.62;
+const RESOURCE_CLOSE_SIZE_PX: f32 = 16.0;
+const RESOURCE_CLOSE_RESERVATION_PX: f32 = 20.0;
+const RESOURCE_TITLE_FADE_WIDTH_PX: f32 = 20.0;
 const WINDOWS_PAGE_SCROLL_SENTINEL_MIN: f32 = u32::MAX as f32 / 2.0;
 const OPENAI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/openai.svg");
 const CLAUDE_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/claude.svg");
@@ -1340,6 +1344,46 @@ impl MultiplexerView {
             .unwrap_or_else(|| self.shell.terminal_background(rgb(0x0b0e13)))
     }
 
+    fn resource_title_fade(
+        &self,
+        mut surface: gpui::Rgba,
+        visible: bool,
+        hover_group: SharedString,
+    ) -> gpui::Div {
+        surface.a = 1.;
+        let mut transparent = surface;
+        transparent.a = 0.;
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            // Chromium's FADE_TAIL uses about three average characters, capped
+            // at one third of the available title width.
+            .w(relative(1. / 3.))
+            .max_w(px(RESOURCE_TITLE_FADE_WIDTH_PX))
+            .bg(linear_gradient(
+                90.,
+                linear_color_stop(transparent, 0.),
+                linear_color_stop(surface, 1.),
+            ))
+            .opacity(if visible { 1. } else { 0. })
+            .when(!visible, |this| {
+                this.group_hover(hover_group, |this| this.opacity(1.))
+            })
+    }
+
+    fn tab_title_surface(&self, selected: bool) -> gpui::Rgba {
+        let mut surface = self.selected_terminal_background();
+        surface.a = 1.;
+        surface.blend(self.shell.color(if selected {
+            ShellColor::Selected
+        } else {
+            ShellColor::Hover
+        }))
+    }
+
     fn selected_space(&self) -> Option<&crate::SpaceSnapshot> {
         let space_id = self.selection.space_id?;
         self.hierarchy
@@ -1721,24 +1765,19 @@ impl MultiplexerView {
             let close_button = div()
                 .id(("close-space", space_id.as_u64()))
                 .absolute()
-                .top(px(10.))
+                .top(px(11.))
                 .right(px(7.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(18.))
+                .size(px(RESOURCE_CLOSE_SIZE_PX))
                 .rounded_md()
                 .cursor_pointer()
-                .bg(self.shell.opaque_color(if selected {
-                    ShellColor::Selected
-                } else {
-                    ShellColor::Hover
-                }))
                 .opacity(if selected { 1. } else { 0. })
                 .when(!selected, |this| {
                     this.group_hover(hover_group.clone(), |this| this.opacity(1.))
                 })
-                .hover(|this| this.bg(self.shell.opaque_color(ShellColor::DangerHover)))
+                .hover(|this| this.bg(self.shell.control_hover()))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -1786,16 +1825,45 @@ impl MultiplexerView {
                                 .flex_1()
                                 .min_w_0()
                                 .child(
-                                    div().flex().items_center().h(px(22.)).child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(px(13.))
-                                            .font_weight(gpui::FontWeight::NORMAL)
-                                            .text_color(self.shell.color(ShellColor::Text))
-                                            .child(space.name.clone()),
-                                    ),
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .h(px(22.))
+                                        .child(
+                                            div()
+                                                .relative()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_size(px(13.))
+                                                .font_weight(gpui::FontWeight::NORMAL)
+                                                .text_color(self.shell.color(ShellColor::Text))
+                                                .child(space.name.clone())
+                                                .child(self.resource_title_fade(
+                                                    self.shell.opaque_color(if selected {
+                                                        ShellColor::Selected
+                                                    } else {
+                                                        ShellColor::Hover
+                                                    }),
+                                                    selected,
+                                                    hover_group.clone(),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(if selected {
+                                                    RESOURCE_CLOSE_RESERVATION_PX
+                                                } else {
+                                                    0.
+                                                }))
+                                                .when(!selected, |this| {
+                                                    this.group_hover(hover_group.clone(), |this| {
+                                                        this.w(px(RESOURCE_CLOSE_RESERVATION_PX))
+                                                    })
+                                                }),
+                                        ),
                                 )
                                 .when_some(agents, |this, agents| {
                                     this.child(self.render_agent_summary(
@@ -2329,25 +2397,20 @@ impl MultiplexerView {
                 let close_button = div()
                     .id(("close-tab", tab_id.as_u64()))
                     .absolute()
-                    .top(px(6.))
-                    .right(px(6.))
+                    .top(px(7.))
+                    .right(px(7.))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(18.))
+                    .size(px(RESOURCE_CLOSE_SIZE_PX))
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(self.shell.opaque_color(if selected {
-                        ShellColor::Selected
-                    } else {
-                        ShellColor::Hover
-                    }))
                     .opacity(if selected { 1. } else { 0. })
                     .when(!selected, |this| {
                         this.group_hover(hover_group.clone(), |this| this.opacity(1.))
                     })
-                    .hover(|this| this.bg(self.shell.opaque_color(ShellColor::DangerHover)))
+                    .hover(|this| this.bg(self.shell.control_hover()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_view, _event, _window, cx| cx.stop_propagation()),
@@ -2364,12 +2427,11 @@ impl MultiplexerView {
                 tabs = tabs.child(
                     div()
                         .id(("tab", tab_id.as_u64()))
-                        .group(hover_group)
+                        .group(hover_group.clone())
                         .relative()
                         .cursor_pointer()
                         .flex()
                         .items_center()
-                        .gap_1()
                         .h(px(WorkspaceShell::TAB_HEIGHT))
                         .max_w(px(180.))
                         .px_2()
@@ -2399,16 +2461,51 @@ impl MultiplexerView {
                         .on_click(cx.listener(move |view, _event, window, cx| {
                             view.select_tab(tab_id, window, cx)
                         }))
-                        .child(self.shell.icon(
-                            ShellIcon::AppMark,
-                            self.shell.color(if selected {
-                                ShellColor::Accent
-                            } else {
-                                ShellColor::FaintText
-                            }),
-                            11.,
-                        ))
-                        .child(div().flex_1().min_w_0().truncate().child(tab_name))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .flex_1()
+                                .min_w_0()
+                                .child(self.shell.icon(
+                                    ShellIcon::AppMark,
+                                    self.shell.color(if selected {
+                                        ShellColor::Accent
+                                    } else {
+                                        ShellColor::FaintText
+                                    }),
+                                    11.,
+                                ))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .child(tab_name)
+                                        .child(self.resource_title_fade(
+                                            self.tab_title_surface(selected),
+                                            selected,
+                                            hover_group.clone(),
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(if selected {
+                                    RESOURCE_CLOSE_RESERVATION_PX
+                                } else {
+                                    0.
+                                }))
+                                .when(!selected, |this| {
+                                    this.group_hover(hover_group.clone(), |this| {
+                                        this.w(px(RESOURCE_CLOSE_RESERVATION_PX))
+                                    })
+                                }),
+                        )
                         .child(close_button),
                 );
             }
