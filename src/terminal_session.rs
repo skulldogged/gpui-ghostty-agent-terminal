@@ -541,7 +541,8 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessInputStatus, TerminalEvent, TerminalSession, TerminalSize, TerminalTransport,
+        ProcessInputStatus, TerminalEvent, TerminalEvents, TerminalSession, TerminalSize,
+        TerminalTransport,
     };
     use crate::ghostty::snapshot_text;
     use crate::{
@@ -1333,13 +1334,9 @@ mod tests {
             .input(b"ping -t 127.0.0.1\r")
             .expect("start foreground ping process");
 
-        // Give the shell time to start ping. The command's own echo is not a
-        // sufficient readiness signal because it precedes process creation.
-        std::thread::sleep(Duration::from_secs(1));
+        wait_for_windows_foreground_process(&mut session, &events, true);
         session.input(&[0x03]).expect("send Ctrl+C through ConPTY");
-        // Console control handlers run asynchronously. Do not let the
-        // foreground process consume the marker before it handles Ctrl+C.
-        std::thread::sleep(Duration::from_secs(1));
+        wait_for_windows_foreground_process(&mut session, &events, false);
         session
             .input(b"cmd /d /c echo CONPTY_^CONTROL_C_RETURNED\r")
             .expect("write marker after Ctrl+C");
@@ -1371,14 +1368,57 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn wait_for_windows_foreground_process(
+        session: &mut TerminalSession,
+        events: &TerminalEvents,
+        expected: bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut processes = ProcessSnapshot::new();
+        let mut last_screen = String::new();
+        while Instant::now() < deadline {
+            processes.refresh();
+            if session
+                .has_foreground_process(&processes)
+                .expect("inspect Windows foreground process")
+                == expected
+            {
+                return;
+            }
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(TerminalEvent::Changed) => {
+                    let snapshot = session.snapshot().expect("snapshot terminal session");
+                    last_screen = snapshot_text(&snapshot);
+                }
+                Ok(TerminalEvent::Exited) => {
+                    panic!("shell exited while waiting for foreground process state {expected}")
+                }
+                Ok(TerminalEvent::Failed(error)) => panic!("terminal session failed: {error}"),
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    panic!("terminal event stream disconnected")
+                }
+            }
+        }
+
+        panic!(
+            "foreground process did not become {expected} before timeout; final screen:\n{last_screen}"
+        );
+    }
+
     #[test]
     fn normal_shell_exit_is_reported_as_exited() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
         #[cfg(target_os = "linux")]
         let process_id = session.process_id();
+        #[cfg(windows)]
+        let exit_command = b"echo TERMINAL_SESSION_EXIT_OUTPUT & exit\r";
+        #[cfg(not(windows))]
+        let exit_command = b"echo TERMINAL_SESSION_EXIT_OUTPUT; exit\r";
         session
-            .input(b"echo TERMINAL_SESSION_EXIT_OUTPUT; exit\r")
+            .input(exit_command)
             .expect("write shell exit command");
 
         let deadline = Instant::now() + Duration::from_secs(10);

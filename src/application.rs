@@ -26,6 +26,9 @@ struct ApplicationRuntime {
 impl Global for ApplicationRuntime {}
 
 pub(crate) fn run(development: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    crate::windows_pty::ensure_unelevated()?;
+
     let activation = if development {
         None
     } else {

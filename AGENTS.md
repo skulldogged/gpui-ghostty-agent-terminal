@@ -8,6 +8,12 @@ Issues and specs are tracked in this repository's GitHub Issues. See `docs/agent
 
 When starting, resuming, or moving implementation between development machines, follow `docs/agents/cross-machine-work.md`.
 
+### Branch names
+
+Use short descriptive kebab-case branch names, normally `agent/<topic>` (for
+example, `agent/terminal-text-selection`). Do not include issue or pull-request
+numbers unless the operator explicitly requests them.
+
 ### Native GitHub stacks
 
 Call pull requests a native GitHub stack only after GitHub has created a stack object. A compatible base/head branch chain is a prerequisite, not proof of membership. Create or link the stack with GitHub's stack UI, `gh stack`, or the Stacks REST API; then read it back with API version `2026-03-10` and verify the pull request's non-null `stack` field plus the ordered pull request list from `/repos/{owner}/{repo}/stacks/{stack_number}`. Report the stack number, position, and size when declaring the stack complete.

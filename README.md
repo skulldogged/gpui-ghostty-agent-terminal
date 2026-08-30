@@ -22,10 +22,14 @@ macOS/Linux. Windows uses a project-owned ConPTY adapter over the supported
 Windows API. Both remain internal adapters behind the same Terminal Session
 interface.
 
+The Windows Application runs as an ordinary unelevated per-user process.
+Elevated launches are rejected before activation or Terminal Session startup.
+
 ## Pinned inputs
 
 - Ghostty `4c725242b7dbe8c77c6e227ef1f9540c5ef17921`
 - GPUI `fa00dccc42311f8dc71c533105488b0dbd518138`
+- Microsoft ConPTY redistributable `1.24.260710001` on Windows x64
 - Zig `0.16.0`
 
 ## Commands

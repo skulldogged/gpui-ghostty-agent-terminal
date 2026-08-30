@@ -53,8 +53,8 @@ pub use core_model::{
 pub use terminal_session::TerminalSize;
 
 #[cfg(feature = "gui")]
-pub fn run_gui() {
-    application::run(false).expect("run application");
+pub fn run_gui() -> Result<(), String> {
+    application::run(false)
 }
 
 #[cfg(feature = "gui")]

@@ -11,7 +11,10 @@ fn main() {
             return;
         }
 
-        agent_terminal::run_gui();
+        if let Err(error) = agent_terminal::run_gui() {
+            eprintln!("Launch failed: {error}");
+            std::process::exit(1);
+        }
     }
 
     #[cfg(not(feature = "gui"))]
