@@ -2,6 +2,8 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 pub(crate) const SNAPSHOT_CELL_CAPACITY: usize = 65_536;
+// Match Ghostty's default scrollback-limit for each terminal surface.
+const DEFAULT_SCROLLBACK_BYTES: usize = 50_000_000;
 const MAX_SCROLL_OUTPUT_STEPS: usize = 16_384;
 
 #[repr(C)]
@@ -335,7 +337,7 @@ pub struct Cell {
 
 impl Terminal {
     pub fn new(cols: u16, rows: u16) -> Result<Self, String> {
-        let raw = unsafe { spike_terminal_new(cols, rows, 10_000) };
+        let raw = unsafe { spike_terminal_new(cols, rows, DEFAULT_SCROLLBACK_BYTES) };
         Ok(Self {
             raw: NonNull::new(raw).ok_or("libghostty-vt terminal allocation failed")?,
             raw_cells: (0..SNAPSHOT_CELL_CAPACITY)
@@ -946,6 +948,34 @@ mod tests {
         assert!(terminal.scroll_to_bottom().expect("scroll bottom"));
         let bottom = terminal.snapshot().expect("snapshot restored bottom");
         assert!(super::snapshot_text(&bottom).contains("five"));
+    }
+
+    #[test]
+    fn default_scrollback_retains_thousands_of_rows() {
+        assert_eq!(super::DEFAULT_SCROLLBACK_BYTES, 50_000_000);
+        let mut terminal = Terminal::new(80, 24).expect("create terminal");
+        let mut output = Vec::new();
+        for line in 0..4_000 {
+            output.extend_from_slice(format!("line-{line:04}\r\n").as_bytes());
+        }
+        terminal.feed(&output).expect("feed large history");
+
+        terminal
+            .scroll(ScrollInput {
+                delta_rows: -8_192,
+                delta_columns: 0,
+                pointer_x: 0.0,
+                pointer_y: 0.0,
+                viewport_width: 800,
+                viewport_height: 480,
+                cell_width: 10,
+                cell_height: 20,
+                modifiers: 0,
+            })
+            .expect("scroll to oldest retained row");
+
+        let oldest = terminal.snapshot().expect("snapshot oldest history");
+        assert!(super::snapshot_text(&oldest).contains("line-0000"));
     }
 
     #[test]

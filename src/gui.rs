@@ -20,12 +20,12 @@ use crate::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context,
-    Decorations, FocusHandle, Font, FontFallbacks, FontId, IntoElement, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton,
-    PromptLevel, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Task, TextRun,
-    TouchPhase, Transformation, Window, WindowControlArea, canvas, div, ease_out_quint, fill, font,
-    linear_color_stop, linear_gradient, percentage, point, prelude::*, px, relative, rgb, size,
-    svg,
+    Decorations, DispatchPhase, FocusHandle, Font, FontFallbacks, FontId, IntoElement,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, PromptButton, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, ShapedLine,
+    SharedString, Task, TextRun, TouchPhase, Transformation, Window, WindowControlArea, canvas,
+    div, ease_out_quint, fill, font, linear_color_stop, linear_gradient, percentage, point,
+    prelude::*, px, relative, rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,10 @@ const GEMINI_AGENT_ICON: &[u8] = include_bytes!("../assets/agent-icons/gemini.sv
 const CHEVRON_RIGHT_ICON: &[u8] = include_bytes!("../assets/lucide/chevron-right.svg");
 const TERMINAL_FONT_FALLBACK_CANDIDATES: [&str; 2] =
     ["Symbols Nerd Font Mono", "Symbols Nerd Font"];
+
+fn terminal_selection_should_autoscroll(pointer_y: f32, screen_height: f32) -> bool {
+    pointer_y < 0.0 || pointer_y >= screen_height
+}
 
 pub(crate) fn open_terminal_window(
     cx: &mut App,
@@ -175,6 +179,7 @@ struct TerminalSelectionDrag {
     pane_id: PaneId,
     terminal_session_id: TerminalSessionId,
     input: ghostty::SelectionInput,
+    position: Point<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1197,7 +1202,7 @@ impl MultiplexerView {
             snapshot,
         )?;
         let screen_height = f32::from(bounds.size.height).max(1.0);
-        let autoscroll = pointer_y < 0.0 || pointer_y >= screen_height;
+        let autoscroll = terminal_selection_should_autoscroll(pointer_y, screen_height);
         Some((
             terminal_session_id,
             ghostty::SelectionInput {
@@ -1249,6 +1254,7 @@ impl MultiplexerView {
             pane_id,
             terminal_session_id,
             input,
+            position: event.position,
         });
     }
 
@@ -1259,6 +1265,9 @@ impl MultiplexerView {
         let Some(drag) = self.terminal_selection_drag else {
             return;
         };
+        if position == drag.position {
+            return;
+        }
         let Some((terminal_session_id, input, autoscroll)) = self.terminal_selection_input_at(
             drag.pane_id,
             position,
@@ -1290,6 +1299,7 @@ impl MultiplexerView {
             pane_id: drag.pane_id,
             terminal_session_id,
             input,
+            position,
         });
     }
 
@@ -1306,6 +1316,34 @@ impl MultiplexerView {
             self.global_error = Some(error);
             cx.notify();
         }
+    }
+
+    fn render_terminal_selection_pointer_listener(cx: &Context<Self>) -> AnyElement {
+        let view = cx.weak_entity();
+        canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let move_view = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Capture || !event.dragging() {
+                        return;
+                    }
+                    let _ = move_view.update(cx, |view, cx| {
+                        view.update_terminal_selection_drag(event.position, cx);
+                    });
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                        let _ = view.update(cx, |view, cx| {
+                            view.finish_terminal_selection(event.position, cx);
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
     }
 
     fn selected_terminal_text(&self) -> Option<String> {
@@ -3785,12 +3823,13 @@ impl Render for MultiplexerView {
         if !self.settings_open {
             self.resize_visible_terminals(window.viewport_size());
         }
+        let terminal_selection_pointer_listener =
+            Self::render_terminal_selection_pointer_listener(cx);
         div()
             .id("multiplexer")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|view, event, window, cx| view.on_key_down(event, window, cx)))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
-                view.update_terminal_selection_drag(event.position, cx);
                 if view.sidebar_dragging {
                     let viewport = window.viewport_size().width.as_f32();
                     let max_width = (viewport - 500.)
@@ -3807,8 +3846,7 @@ impl Render for MultiplexerView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, event: &MouseUpEvent, _window, cx| {
-                    view.finish_terminal_selection(event.position, cx);
+                cx.listener(|view, _event: &MouseUpEvent, _window, cx| {
                     if view.sidebar_dragging {
                         view.sidebar_dragging = false;
                         cx.notify();
@@ -3818,8 +3856,7 @@ impl Render for MultiplexerView {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|view, event: &MouseUpEvent, _window, cx| {
-                    view.finish_terminal_selection(event.position, cx);
+                cx.listener(|view, _event: &MouseUpEvent, _window, cx| {
                     if view.sidebar_dragging {
                         view.sidebar_dragging = false;
                         cx.notify();
@@ -3832,6 +3869,7 @@ impl Render for MultiplexerView {
             .size_full()
             .overflow_hidden()
             .bg(self.shell.root_color())
+            .child(terminal_selection_pointer_listener)
             .child(if self.settings_open {
                 self.render_settings_title_bar(window, cx)
             } else {
@@ -4880,7 +4918,8 @@ mod tests {
         prioritized_agent_summary, projected_split_extent, row_cell_is_followed_by_space,
         selection_for_created, selection_for_pane, split_ratio_at, terminal_copy_shortcut_for,
         terminal_font_with_fallbacks, terminal_key_input, terminal_paste_shortcut_for,
-        terminal_sessions_for_target, windows_caption_font_for_build,
+        terminal_selection_should_autoscroll, terminal_sessions_for_target,
+        windows_caption_font_for_build,
     };
     use crate::{
         AgentProgram, AgentSnapshot, AgentState, CoreCommand, CoreModel, CreatedResource, PaneId,
@@ -4897,6 +4936,15 @@ mod tests {
         assert_eq!(normalize_page_scroll_delta(u32::MAX as f32, 24), 24.0);
         assert_eq!(normalize_page_scroll_delta(-(u32::MAX as f32), 80), -80.0);
         assert_eq!(normalize_page_scroll_delta(120.0, 24), 120.0);
+    }
+
+    #[test]
+    fn selection_autoscroll_starts_only_outside_terminal_bounds() {
+        assert!(terminal_selection_should_autoscroll(-0.1, 480.0));
+        assert!(!terminal_selection_should_autoscroll(0.0, 480.0));
+        assert!(!terminal_selection_should_autoscroll(479.9, 480.0));
+        assert!(terminal_selection_should_autoscroll(480.0, 480.0));
+        assert!(terminal_selection_should_autoscroll(500.0, 480.0));
     }
 
     #[test]
